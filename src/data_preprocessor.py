@@ -54,8 +54,12 @@ class DataPreprocessor:
         df = self._calculate_rolling_features(df)
 
         # 3. Удаляются флаги аппаратных помех: модель не должна их знать,
-        # она должна игнорировать помехи через сглаживание скользящим окном
-        df = df.drop(columns=[c for c in ['anomaly_vibration', 'anomaly_temperature']
+        # она должна игнорировать помехи через сглаживание скользящим окном.
+        # fault_type намеренно сохраняется — нужен fault_recall_analysis.py для валидации;
+        # в ML не попадёт, так как отсутствует в FEATURE_COLS.
+        df = df.drop(columns=[c for c in ['sensor_anomaly',
+                                           'anomaly_vibration', 'anomaly_temperature',
+                                           'anomaly_current']
                                if c in df.columns])
 
         # 4. Маппинг таргета и фильтрация Off/Startup — только при обучении

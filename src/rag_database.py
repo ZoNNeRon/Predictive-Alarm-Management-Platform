@@ -16,12 +16,13 @@ import pymupdf4llm
 from langchain.schema import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
+from langchain_chroma import Chroma
 import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Agg')
 import seaborn as sns
 import numpy as np
+import pandas as pd
 
 
 # Константы
@@ -32,14 +33,16 @@ DOC_TYPES = {
     'gost':     'ГОСТ / Нормативный документ',
     'sop':      'Регламент технического обслуживания (SOP)',
     'schedule': 'График технического обслуживания',
+    'diagnostics': 'Расширенная вибродиагностика (аналитическое дополнение)',
 }
 
 # Параметры чанкинга по типу документа
 CHUNK_CONFIG = {
     'manual':   {'chunk_size': 600,  'chunk_overlap': 120},
-    'gost':     {'chunk_size': 400,  'chunk_overlap': 80},   # короткие пункты ГОСТ
+    'gost':     {'chunk_size': 700,  'chunk_overlap': 150},   # короткие пункты ГОСТ
     'sop':      {'chunk_size': 500,  'chunk_overlap': 100},
     'schedule': {'chunk_size': 350,  'chunk_overlap': 50},
+    'diagnostics': {'chunk_size': 500, 'chunk_overlap': 100},  # новый тип
 }
 
 # Порог релевантности: результаты с distance > threshold отсекаются
@@ -52,9 +55,7 @@ class TextKnowledgeLoader:
     """
     Загружает .md и .txt файлы из директорий базы знаний.
 
-    Используется для вручную подготовленных выжимок из больших PDF:
-        knowledge_base/gosts/gost_extract.md   → doc_type='gost'
-        knowledge_base/manuals/mnhv_extract.md → doc_type='manual'
+    Используется для вручную подготовленных выжимок из больших PDF.
     """
 
     SUPPORTED_EXTENSIONS = {'.md', '.txt'}
@@ -84,9 +85,13 @@ class TextKnowledgeLoader:
                        doc_type_map: Dict[str, str] = None) -> List[Document]:  # type: ignore
         doc_type_map = doc_type_map or {}
         all_documents: List[Document] = []
+
+        text_names = {name for name in doc_type_map
+                      if Path(name).suffix.lower() in self.SUPPORTED_EXTENSIONS}
         text_files = sorted(
             f for ext in self.SUPPORTED_EXTENSIONS
             for f in Path(data_dir).glob(f'**/*{ext}')
+            if f.name in text_names
         )
         for file_path in text_files:
             doc_type = doc_type_map.get(file_path.name, 'manual')
@@ -166,35 +171,32 @@ class StructuredPDFLoader:
         return documents
 
     def load_directory(self, data_dir: str,
-                       doc_type_map: Dict[str, str] = None,  # type: ignore
-                       skip_pdfs: set = None) -> List[Document]:  # type: ignore
+                       doc_type_map: Dict[str, str] = None) -> List[Document]:  # type: ignore
         """
-        Загружает все PDF из директории.
+        Загружает PDF-файлы, явно перечисленные в doc_type_map.
 
         Args:
             data_dir:     Путь к директории с PDF.
-            doc_type_map: Словарь {имя_файла: doc_type}.
-                          Если файл не в словаре, используется 'manual'.
-            skip_pdfs:    Набор имён PDF-файлов, которые нужно пропустить
-                          (например, большие документы с .md-выжимкой).
+            doc_type_map: Словарь {имя_файла: doc_type} — загружаются только эти файлы.
 
         Returns:
-            Список всех Document из всех файлов.
+            Список всех Document из указанных файлов.
         """
         doc_type_map = doc_type_map or {}
-        skip_pdfs = skip_pdfs or set()
         all_documents: List[Document] = []
 
-        pdf_files = sorted(Path(data_dir).glob('**/*.pdf'))
+        pdf_names = {name for name in doc_type_map if name.lower().endswith('.pdf')}
+        pdf_files = sorted(
+            f for f in Path(data_dir).glob('**/*.pdf')
+            if f.name in pdf_names
+        )
+
         if not pdf_files:
             print(f"  [WARN] PDF-файлы не найдены в {data_dir}")
             return all_documents
 
         for pdf_path in pdf_files:
             fname = pdf_path.name
-            if fname in skip_pdfs:
-                print(f"  [SKIP] PDF пропущен (есть .md-выжимка): {fname}")
-                continue
             doc_type = doc_type_map.get(fname, 'manual')
             print(f"  Загрузка [{DOC_TYPES.get(doc_type, doc_type)}]: {fname}")
             docs = self.load(str(pdf_path), doc_type=doc_type)
@@ -213,27 +215,22 @@ class KnowledgeBaseManager:
 
     Модель эмбеддингов: intfloat/multilingual-e5-large
         Причина выбора: значительно лучше понимает технический русский
-        по сравнению с MiniLM. Размер ~2.2 GB, на M2 работает быстро
-        через MPS без GPU.
+        по сравнению с MiniLM.
     """
 
     EMBED_MODEL = "intfloat/multilingual-e5-large"
 
     def __init__(self, data_dir: str, chroma_dir: str,
-                 doc_type_map: Dict[str, str] = None,  # type: ignore
-                 skip_pdfs: set = None):  # type: ignore
+                 doc_type_map: Dict[str, str] = None):  # type: ignore
         """
         Args:
             data_dir:     Директория с документами (PDF + MD/TXT).
             chroma_dir:   Директория для хранения ChromaDB.
-            doc_type_map: {имя_файла: doc_type} — применяется и к PDF, и к .md/.txt.
-            skip_pdfs:    Набор имён PDF-файлов, которые НЕ нужно загружать
-                          (обычно это большие документы, для которых есть .md-выжимка).
+            doc_type_map: {имя_файла: doc_type} — загружаются только перечисленные файлы.
         """
         self.data_dir = data_dir
         self.chroma_dir = chroma_dir
         self.doc_type_map = doc_type_map or {}
-        self.skip_pdfs = skip_pdfs or set()
         self.loader = StructuredPDFLoader()
         self.text_loader = TextKnowledgeLoader()
 
@@ -273,9 +270,7 @@ class KnowledgeBaseManager:
         if text_docs:
             print(f"  Текстовых документов загружено: {len(text_docs)}")
 
-        # PDF загружаются с исключением файлов из skip_pdfs
-        pdf_docs = self.loader.load_directory(self.data_dir, self.doc_type_map,
-                                               skip_pdfs=self.skip_pdfs)
+        pdf_docs = self.loader.load_directory(self.data_dir, self.doc_type_map)
         documents = text_docs + pdf_docs
 
         if not documents:
@@ -398,31 +393,52 @@ class KnowledgeBaseManager:
 
     def search_by_symptoms(self, symptom_vector_dict: dict, k: int = 4) -> List[Tuple[Document, float]]:
         """
-        Специализированный поиск по симптомам из XAI-модуля.
-        Формирует поисковый запрос из SymptomVector и ищет в базе.
+        Поиск по симптомам из XAI-модуля через multi-query retrieval.
 
-        Args:
-            symptom_vector_dict: Словарь с ключами 'top_symptoms' и 'critical_probability'
-                                 (упрощённое представление SymptomVector для этого модуля).
-
-        Returns:
-            Список релевантных документов.
+        Делает ДВА запроса:
+        1. Описательный — находит пороги/нормативы (что превышено).
+        2. Прескриптивный — находит причины и действия (что делать).
+        Это устраняет проблему, когда поиск находит только уставки,
+        но не находит раздел "Действия оператора".
         """
         symptoms = symptom_vector_dict.get('top_symptoms', [])
         prob = symptom_vector_dict.get('critical_probability', 0)
         sensor_map = {'vibration': 'вибрация', 'temperature': 'температура',
-                      'current': 'ток', 'pressure': 'давление'}
+                    'current': 'ток', 'pressure': 'давление'}
 
+        # Запрос 1: описание состояния (пороги, нормативы)
         parts = [f"Вероятность аварии: {prob}%."]
         for s in symptoms:
             sensor_ru = sensor_map.get(s.get('sensor', ''), s.get('sensor', ''))
             direction = "повышена" if s.get('shap_weight', 0) > 0 else "понижена"
             parts.append(f"{sensor_ru} {direction}: значение {s.get('value', '')}")
+        query_descriptive = " ".join(parts)
 
-        query = " ".join(parts)
-        print(f"  Запрос к базе знаний: {query[:120]}...")
+        # Запрос 2: действия и причины (прескриптивный)
+        symptom_words = " ".join(
+            sensor_map.get(s.get('sensor', ''), '') for s in symptoms
+        )
+        query_prescriptive = (
+            f"причина и устранение неисправности: {symptom_words}. "
+            f"Действия оператора, диагностика отказа, рекомендации по ремонту."
+        )
 
-        return self.search(query, k=k)
+        print(f"  Запрос 1 (состояние): {query_descriptive[:90]}...")
+        print(f"  Запрос 2 (действия):  {query_prescriptive[:90]}...")
+
+        # Объединяем результаты с дедупликацией по содержимому
+        seen = set()
+        combined = []
+        for q in (query_descriptive, query_prescriptive):
+            for doc, score in self.search(q, k=k):
+                key = doc.page_content[:100]
+                if key not in seen:
+                    seen.add(key)
+                    combined.append((doc, score))
+
+        # Сортируем по релевантности и возвращаем top-k
+        combined.sort(key=lambda x: x[1])
+        return combined[:k]
 
     # Визуализация для диплома 
 
@@ -445,27 +461,31 @@ class KnowledgeBaseManager:
             dt = m.get('doc_type', 'unknown')
             type_counts[dt] = type_counts.get(dt, 0) + 1 # type: ignore
 
-        labels  = [DOC_TYPES.get(k, k) for k in type_counts.keys()]
-        sizes   = list(type_counts.values())
-        colors  = ['#4C72B0', '#55A868', '#C44E52', '#8172B2'][:len(labels)]
+        all_colors = ['#4C72B0', '#55A868', '#C44E52', '#8172B2', '#CCB974']
+        sorted_items = sorted(
+            zip(type_counts.keys(), type_counts.values()),
+            key=lambda x: x[1], reverse=True
+        )
+        labels = [DOC_TYPES.get(k, k) for k, _ in sorted_items]
+        sizes  = [v for _, v in sorted_items]
+        colors = all_colors[:len(labels)]
 
-        fig, ax = plt.subplots(figsize=(8, 6))
+        fig, ax = plt.subplots(figsize=(8, 7))
         wedges, texts, autotexts = ax.pie( # type: ignore
             sizes, labels=None, autopct='%1.1f%%',
-            colors=colors, startangle=140,
+            colors=colors, startangle=90, counterclock=False,
             pctdistance=0.82, wedgeprops={'edgecolor': 'white', 'linewidth': 1.5}
         )
         for at in autotexts:
             at.set_fontsize(11)
             at.set_fontweight('bold')
         ax.legend(wedges, [f"{l}\n({s} чанков)" for l, s in zip(labels, sizes)],
-                  loc='lower center', bbox_to_anchor=(0.5, -0.18),
+                  loc='lower center', bbox_to_anchor=(0.5, -0.22),
                   fontsize=9, framealpha=0.8)
         ax.set_title(
             f'Состав базы знаний RAG-системы\n(всего чанков: {sum(sizes)})',
-            fontsize=13, fontweight='bold', pad=15
+            fontsize=13, fontweight='bold', pad=6
         )
-        plt.tight_layout()
         path = os.path.join(save_dir, 'rag_plot1_kb_composition.png')
         plt.savefig(path, dpi=150, bbox_inches='tight')
         plt.close()
@@ -492,25 +512,39 @@ class KnowledgeBaseManager:
             dt    = meta.get('doc_type', 'unknown')
             docs_by_type.setdefault(dt, []).append(len(clean))
 
-        fig, ax = plt.subplots(figsize=(11, 5))
-        colors = ['#4C72B0', '#55A868', '#C44E52', '#8172B2']
+        fig, ax = plt.subplots(figsize=(11, 6))
+        # 6 цветов — с запасом на все типы документов (не 4!)
+        palette = ['#4C72B0', '#55A868', '#C44E52', '#8172B2', '#CCB974', '#64B5CD']
 
-        for (dt, lengths), color in zip(docs_by_type.items(), colors):
-            label = DOC_TYPES.get(dt, dt)
-            ax.hist(lengths, bins=30, alpha=0.65, color=color,
-                    label=f"{label} (μ={np.mean(lengths):.0f})", edgecolor='white', lw=0.4)
+        types_sorted = list(docs_by_type.keys())
+        data   = [docs_by_type[dt] for dt in types_sorted]
+        labels = [f"{DOC_TYPES.get(dt, dt)}\n(n={len(docs_by_type[dt])}, μ={np.mean(docs_by_type[dt]):.0f})"
+                  for dt in types_sorted]
 
-        # Вертикальные линии — целевые chunk_size
-        for dt, cfg in CHUNK_CONFIG.items():
-            if dt in docs_by_type:
-                ax.axvline(cfg['chunk_size'], color='red', lw=1.2, ls='--', alpha=0.6)
+        bp = ax.boxplot(data, vert=False, patch_artist=True,
+                        tick_labels=labels,
+                        medianprops={'color': 'black', 'lw': 1.5})
+        for patch, color in zip(bp['boxes'], palette):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.7)
+
+        # Накладываем точки (strip plot) — при малом N важно видеть каждый чанк
+        for i, dt in enumerate(types_sorted, 1):
+            y = np.random.normal(i, 0.04, size=len(docs_by_type[dt]))
+            ax.scatter(docs_by_type[dt], y, color=palette[(i-1) % len(palette)],
+                       edgecolor='black', s=22, zorder=3, alpha=0.8)
+
+        # Целевые chunk_size — вертикальные линии
+        for dt in types_sorted:
+            cfg = CHUNK_CONFIG.get(dt)
+            if cfg:
+                ax.axvline(cfg['chunk_size'], color='red', lw=1.0, ls='--', alpha=0.4)
 
         ax.set_xlabel('Длина чанка (символов)', fontsize=11)
-        ax.set_ylabel('Количество чанков', fontsize=11)
-        ax.set_title('Распределение длин текстовых фрагментов (чанков)\nпо типам документов базы знаний',
+        ax.set_title('Распределение длин текстовых фрагментов (чанков)\n'
+                     'по типам документов базы знаний (N=59)',
                      fontsize=12, fontweight='bold')
-        ax.legend(fontsize=9)
-        ax.grid(axis='y', alpha=0.35, ls='--')
+        ax.grid(axis='x', alpha=0.35, ls='--')
         plt.tight_layout()
         path = os.path.join(save_dir, 'rag_plot2_chunk_distribution.png')
         plt.savefig(path, dpi=150, bbox_inches='tight')
@@ -542,7 +576,6 @@ class KnowledgeBaseManager:
             print("[WARN] Нет результатов для визуализации качества.")
             return
 
-        import pandas as pd
         df = pd.DataFrame(results_data)
 
         fig, axes = plt.subplots(1, 2, figsize=(14, 6))
@@ -551,7 +584,7 @@ class KnowledgeBaseManager:
         query_labels = df['query_label'].unique()
         data_per_query = [df[df['query_label'] == ql]['distance'].values
                           for ql in query_labels]
-        bp = axes[0].boxplot(data_per_query, labels=query_labels, patch_artist=True,
+        bp = axes[0].boxplot(data_per_query, tick_labels=query_labels, patch_artist=True,
                              medianprops={'color': 'red', 'lw': 2})
         colors_box = ['#4C72B0', '#55A868', '#C44E52', '#8172B2',
                       '#CCB974', '#64B5CD'][:len(query_labels)]
@@ -567,9 +600,10 @@ class KnowledgeBaseManager:
         axes[0].tick_params(axis='x', rotation=25)
         axes[0].grid(axis='y', alpha=0.35, ls='--')
 
-        # Правый: доля результатов выше/ниже порога
+        # Правый: доля результатов выше/ниже порога (порядок — как на левом графике)
         df['relevant'] = df['distance'] <= RELEVANCE_THRESHOLD
         summary = df.groupby('query_label')['relevant'].mean() * 100
+        summary = summary.reindex(query_labels)
 
         bar_colors = colors_box[:len(summary)]
         bars = axes[1].bar(summary.index, summary.values, color=bar_colors, alpha=0.85,
@@ -607,31 +641,20 @@ if __name__ == "__main__":
     os.makedirs(knowledge_dir, exist_ok=True)
     os.makedirs(plots_dir,     exist_ok=True)
 
-    # Карта типов документов: применяется и к PDF, и к .md/.txt файлам
+    # Карта типов документов: загружаются только перечисленные здесь файлы.
+    # gost_32601_2013.pdf и mnhv_manual.pdf заменены .md-выжимками и не включены.
     doc_type_map = {
-        # PDF-файлы (загружаются только если НЕ в skip_pdfs)
-        'mnhv_manual.pdf':      'manual',
-        'gost_32601_2013.pdf':  'gost',
-        'tm_regulation.pdf':    'sop',
-        'tm_schedule.pdf':      'schedule',
-        # Вручную подготовленные MD-выжимки (всегда загружаются)
-        'gost_extract.md':      'gost',
-        'mnhv_extract.md':      'manual',
-    }
-
-    # PDF-файлы, которые заменены .md-выжимками:
-    # - gost_32601_2013.pdf (307 стр. → gost_extract.md, ~6 секций)
-    # - mnhv_manual.pdf (17 стр. с ЕСКД-штампами → mnhv_extract.md, очищенный)
-    skip_pdfs = {
-        'gost_32601_2013.pdf',
-        'mnhv_manual.pdf',
+        'tm_regulation.pdf': 'sop',
+        'tm_schedule.pdf':   'schedule',
+        'gost_extract.md':   'gost',
+        'mnhv_extract.md':   'manual',
+        'diagnostics_extended.md': 'diagnostics',
     }
 
     kb = KnowledgeBaseManager(
         data_dir=knowledge_dir,
         chroma_dir=chroma_db_dir,
         doc_type_map=doc_type_map,
-        skip_pdfs=skip_pdfs,
     )
 
     # Шаг 1: Построить базу

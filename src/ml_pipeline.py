@@ -15,6 +15,7 @@ import seaborn as sns
 import warnings
 warnings.filterwarnings('ignore')
 import joblib
+from fault_recall_analysis import analyze_fault_recall
 
 # Импорт препроцессора для получения FEATURE_COLS
 import sys
@@ -224,7 +225,7 @@ def plot_all(metrics_list: list, y_test: pd.Series, output_dir: str):
 
     ax.set_xticks(x)
     ax.set_xticklabels(metric_labels, color=TEXT_CLR, fontsize=11)
-    ax.set_ylim(0.55, 1.08) # Расширили верхний лимит для подписей
+    ax.set_ylim(0.35, 1.05) # Расширили верхний лимит для подписей
     ax.set_ylabel('Значение метрики', color=TEXT_CLR)
     ax.yaxis.grid(True, linestyle='--', alpha=0.7, color=GRID_CLR, zorder=0)
     ax.set_title('Сравнение качества моделей по ключевым метрикам\n'
@@ -400,3 +401,8 @@ if __name__ == "__main__":
     joblib.dump(xgb_model, model_path_xgb)
     print(f"\n{'='*50}")
     print(f"Модели успешно сохранены в:\n{models_dir}")
+
+    # 10. Анализ recall по типам отказа
+    raw_data_path = os.path.join(project_root, 'data', 'raw', 'enterprise_pump_fleet.csv')
+    analyze_fault_recall(xgb_model, df_test, FEATURE_COLS, output_dir,  # type: ignore
+                         raw_data_path=raw_data_path)

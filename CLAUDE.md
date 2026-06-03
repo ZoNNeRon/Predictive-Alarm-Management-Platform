@@ -30,14 +30,14 @@
 predictive_alarm_platform/
 │
 ├── src/
-│   ├── data_generator.py      # ГОТОВО — генератор синтетических данных (AR(1), State Machine)
-│   ├── data_preprocessor.py   # ГОТОВО — rolling features, защита от data leakage
-│   ├── ml_pipeline.py         # ГОТОВО — обучение LR / RF / XGBoost, AlarmManager
-│   ├── xai_module.py          # ГОТОВО — SHAP TreeExplainer, SymptomVector dataclass
-│   ├── rag_database.py        # ТРЕБУЮТСЯ ДОРАБОТКИ — ChromaDB + multilingual-e5-large, PDF→чанки
-│   ├── kb_text_loader.py      # НЕ НАПИСАН — загрузчик ручных текстовых файлов базы знаний
-│   ├── agent_module.py        # НЕ НАПИСАН — LLM-агент (Ollama + Phi3), сборка промпта
-│   └── app.py                 # НЕ НАПИСАН — Streamlit двухуровневый UI
+│   ├── data_generator.py        # ГОТОВО — AR(1) + State Machine + 3 типа отказа (A/Б/В)
+│   ├── data_preprocessor.py     # ГОТОВО — rolling features, защита от data leakage
+│   ├── ml_pipeline.py           # ГОТОВО — обучение LR / RF / XGBoost, AlarmManager
+│   ├── fault_recall_analysis.py # ГОТОВО — recall по типам отказа, доказательство 3 сигнатур
+│   ├── xai_module.py            # ГОТОВО — SHAP TreeExplainer, SymptomVector dataclass
+│   ├── rag_database.py          # ГОТОВО — ChromaDB + multilingual-e5-large, PDF→чанки + TextKnowledgeLoader
+│   ├── ai_agent.py              # ГОТОВО — DiagnosticAgent (Ollama), сравнение 3 моделей
+│   └── app.py                   # НЕ НАПИСАН — Streamlit двухуровневый UI
 │
 ├── data/
 │   ├── raw/
@@ -51,13 +51,17 @@ predictive_alarm_platform/
 │
 ├── knowledge_base/
 │   ├── gosts/
-│   │   └── gost_32601_2013.pdf		# ГОСТ 32601
+│   │   ├── gost_32601_2013.pdf		# ГОСТ 32601 (307 стр., НЕ загружается в БД)
+│   │   └── gost_extract.md 		# ГОТОВО — выжимка: раздел 6.9, Таблицы 8-9, пороги температуры
 │   ├── manuals/
-│   │  └── mnhv_manual.pdf 			# Мануал МНХВ (ООО «НК «Крон», 2023)
+│   │   ├── mnhv_manual.pdf 		# Мануал МНХВ (НЕ загружается — ЕСКД-штампы)
+│   │   └── mnhv_extract.md 		# ГОТОВО — очищенный мануал: параметры, Таблица 4, ТО
 │   ├── regulations/
 │   │   └── tm_regulation.pdf           # Регламент ТО (sop)
 │   ├── schedules/
-│         └── tm_schedule.pdf             # График ППР (schedule)
+│   │   └── tm_schedule.pdf             # График ППР (schedule)
+│   └── diagnostics/
+│       └── diagnostics_extended.md     # Расширенная вибродиагностика (doc_type: diagnostics)
 │
 ├── chroma_db/                          # Локальная векторная БД ChromaDB
 │
@@ -71,10 +75,15 @@ predictive_alarm_platform/
 ### 1. `data_generator.py` — Генератор данных
 - **Конечный автомат (State Machine):** 5 состояний — Off (0), Startup (1), Healthy (2), Degradation (3), Critical (4)
 - **AR(1) процесс** для каждого сенсора: `x[t] = μ + φ*(x[t-1] - μ) + ε[t]`. φ = 0.88–0.92 для Healthy, 0.80 для Critical
-- Деградация: AR(1) **поверх нарастающего linspace-тренда** — именно это XAI распознаёт как cumulative signal
-- Помехи датчиков: вероятность 0.001, флаги `anomaly_vibration` / `anomaly_temperature` изолированы от физической модели
-- **5 насосов** (`MNHV_001`–`MNHV_005`), seed через явный словарь (не умножение)
-- **432 000 строк**, 60 дней, шаг 1 минута
+- **Три типа отказа** с разными физическими сигнатурами (распределение среди аварийных циклов):
+  - `overheat` (Тип А, 55%) — температура↑ к 93+°C, ток↑ и волатильный, вибрация умеренно↑, давление норма
+  - `cavitation` (Тип Б, 30%) — вибрация↑↑ к 8+ мм/с, давление↓ и пульсирует, температура и ток норма
+  - `electrical` (Тип В, 15%) — ток скачет↑↑ (спайки 10%), вибрация и температура в зелёной зоне
+- Деградация: AR(1) **поверх нарастающего linspace-тренда** по сигнатуре типа — XAI распознаёт как cumulative signal
+- Помехи датчиков: вероятность 0.001, три отдельных флага `anomaly_vibration` / `anomaly_temperature` / `anomaly_current`
+- **5 насосов** (`MNHV_001`–`MNHV_005`), `PUMP_SEEDS` — явный словарь seed'ов (42, 137, 2025, 31415, 99991)
+- **432 000 строк**, 60 дней, шаг 1 минута; схема: `[timestamp, pump_id, state, state_name, fault_type, vibration, temperature, current, pressure, anomaly_vibration, anomaly_temperature, anomaly_current]`
+- График `plot_smart_episode` — 5 панелей (vib/temp/curr/pressure/state), фоновая подсветка по `fault_type`, точечные маркеры помех только на пострадавшем датчике
 - Выход: `data/raw/enterprise_pump_fleet.csv`
 
 ### 2. `data_preprocessor.py` — Подготовка признаков
@@ -83,10 +92,11 @@ predictive_alarm_platform/
 - **Data leakage защита:** `shift(1)` перед каждым `.rolling()` — в строке T используется только [T-W … T-1]
 - **`groupby('pump_id')`:** окна не перетекают между насосами
 - `min_periods=w` для mean/max (честный NaN), `min_periods=2` для std
-- Флаги `anomaly_*` удаляются ДО подачи в ML — модель учится игнорировать шум через сглаживание
+- Флаги `anomaly_vibration`, `anomaly_temperature`, `anomaly_current` удаляются ДО подачи в ML
+- **`fault_type` намеренно сохраняется** — не входит в `FEATURE_COLS`, но нужен `fault_recall_analysis.py` для валидации
 - **`FEATURE_COLS`** — явный контракт из 40 признаков, используется и в train, и в inference
 - Фильтрация Off (0) и Startup (1) из обучающей выборки — ими занимается `AlarmManager`
-- Выход: `data/processed/processed_features.csv`
+- Выход: `data/processed/processed_features.csv` (содержит `fault_type`, `state`, `pump_id`, `timestamp` + 40 rolling-признаков)
 
 ### 3. `ml_pipeline.py` — Обучение моделей
 - **Group Split:** train = MNHV_001–004 (321 615 строк), test = MNHV_005 (80 531 строки)
@@ -96,8 +106,17 @@ predictive_alarm_platform/
 - **Результаты XGBoost:** F1-Macro=0.97, Recall(Critical)=0.948, PR-AUC(Critical)=0.993
 - **`AlarmManager`:** если `raw_state in [0, 1]` → принудительно возвращает 0 (Alarm Shelving)
 - Три визуализации: confusion matrices heatmap, grouped bar chart, PR-кривые
+- **Шаг 10** в `__main__`: вызов `fault_recall_analysis.analyze_fault_recall(xgb_model, df_test, ...)`
 
-### 4. `xai_module.py` — Объяснимый ИИ (SHAP)
+### 4. `fault_recall_analysis.py` — Валидация по типам отказа
+- **Цель:** доказать, что модель различает три физических сценария, а не работает по «всё выросло → авария»
+- **`analyze_fault_recall(model, df_test, feature_cols, save_dir)`** — основная функция, вызывается из `ml_pipeline.py` (шаг 10) и автономно
+- **Recall(Critical):** доля строк `state=4` данного `fault_type`, предсказанных как класс 2
+- **Recall(Warning):** доля строк `state=3` данного `fault_type`, предсказанных как ≥ 1 (угроза не пропущена)
+- **Fallback:** если `fault_type` отсутствует в `processed_features.csv` — присоединяется из `enterprise_pump_fleet.csv` по `[timestamp, pump_id]`
+- **Выходы:** `plot4_fault_recall_analysis.png` (grouped bar chart + тепловая карта сигнатур датчиков), `fault_recall_table.csv`
+
+### 5. `xai_module.py` — Объяснимый ИИ (SHAP)
 - **`XAIExplainer`:** `shap.TreeExplainer` для XGBoost, `target_class_idx=2` (Авария)
 - Возвращает **`SymptomVector`** (dataclass) — строго типизированный контракт для агента
 - Сортировка по `abs(shap_weight)` — признак -0.8 важнее признака +0.1
@@ -105,41 +124,38 @@ predictive_alarm_platform/
 - **Визуализация:** `plot_waterfall()` (локальное объяснение) + `plot_summary()` (beeswarm, глобальная важность)
 - `generate_llm_prompt` **отсутствует** в этом модуле — намеренно (SRP). Промпт строит `agent_module.py`
 
-### 5. `rag_database.py` — База знаний (RAG)
+### 6. `rag_database.py` — База знаний (RAG)
 - **Стек:** LangChain + ChromaDB (локально) + `intfloat/multilingual-e5-large` (MPS, M2)
 - **`StructuredPDFLoader`:** pymupdf4llm → Markdown (сохраняет таблицы), fallback → pdfplumber
-- **Метаданные чанков:** `doc_type` (manual/gost/sop/schedule), `source`, `section`, `chunk_id`
-- **Разные chunk_size по типу:** gost=400, manual=600, sop=500, schedule=350
+- **`TextKnowledgeLoader`:** загрузка `.md`/`.txt` файлов (встроен в тот же модуль)
+- **`doc_type_map` — единственный allowlist:** загружаются только файлы, явно перечисленные в нём; `skip_pdfs` удалён — лишняя фильтрация
+- Активный `doc_type_map`: `tm_regulation.pdf` (sop), `tm_schedule.pdf` (schedule), `gost_extract.md` (gost), `mnhv_extract.md` (manual), `diagnostics_extended.md` (diagnostics)
+- **`doc_type`:** manual / gost / sop / schedule / diagnostics; метаданные: `source`, `section`, `chunk_id`
+- **Разные chunk_size по типу:** gost=700, manual=600, sop=500, schedule=350, diagnostics=500
 - **e5 prefix:** `passage:` при загрузке, `query:` при поиске — обязательно для e5-large
 - **Порог релевантности:** `RELEVANCE_THRESHOLD=1.2` (L2), нерелевантные результаты отсекаются
-- Батчевая запись по 500 чанков
-- Фильтрация по `doc_type` через `search_kwargs`
-- **Текущее состояние базы:** 1851 чанк (ГОСТ — 94% из-за проблемы с PDF, см. ниже)
-- Три визуализации для диплома: состав базы, распределение длин чанков, качество поиска
+- Батчевая запись по 500 чанков; фильтрация по `doc_type` через `search_kwargs`
+- **Текущее состояние базы:** ~59 чанков (17 gost + 17 manual + 11 sop + 10 schedule + diagnostics) — всё релевантный контент
+- Три визуализации: `rag_plot1_kb_composition.png` (пай сортирован по убыванию, `startangle=90`), `rag_plot2_chunk_distribution.png`, `rag_plot3_retrieval_quality.png` (оба графика синхронизированы по порядку меток)
+
+---
+
+## Что уже реализовано (продолжение)
+
+### 7. `ai_agent.py` — LLM-агент (ГОТОВО)
+- **`DiagnosticAgent`** — принимает `SymptomVector` + RAG-контекст, строит промпт, вызывает Ollama
+- **`AgentResponse`** dataclass: `raw_text`, `model_name`, `latency_sec`, `gen_time_sec`, `eval_count`, `tokens_per_sec`, `format_ok`, `error`
+- **`SYSTEM_PROMPT`** — строгий anti-hallucination шаблон (СТАТУС / ДИАГНОЗ / ПРЕДПИСАНИЕ / ТОиР)
+- Qwen 3.x: `think=False` через нативный Ollama-клиент отключает chain-of-thought
+- **`__main__`:** цепочка XAI → RAG → LLM с последовательным прогоном трёх моделей
+- Три тестируемые модели: `qwen3.5:9b` (default), `phi4:14b`, `second_constantine/yandex-gpt-5-lite:8b`
+- Вывод: `ОТВЕТ АГЕНТА N (модель: ..., время: ... с)` для каждой модели
 
 ---
 
 ## Что предстоит сделать
 
-### Завершить формирование базы знаний для RAG
-PDF-файлы очень плохо воспринимаются инструментами системы, необходимо подготовить ГОСТ и мануал вручную для записи в БД. Необходимо решение, которое позволит переводить такие файлы в ручной формат.
-
-### Модуль агента `agent_module.py`
-LLM-агент, который принимает `SymptomVector` из `xai_module.py` и возвращает текстовое предписание.
-
-**Логика модуля:**
-1. Получить `SymptomVector` (уже реализован в `xai_module.py`)
-2. Сформировать поисковый запрос из симптомов → `rag_database.search_by_symptoms()`
-3. Получить 3–4 релевантных чанка из ChromaDB
-4. Собрать промпт: SHAP-симптомы + пороги ГОСТ + контекст из базы знаний
-5. Передать в LLM (Ollama + Phi3 или llama3) → получить текстовую инструкцию
-6. Вернуть структурированный объект `AgentResponse` для передачи в UI
-
-**Технологии:** Ollama (локально, M2), модель Phi3 14b (уже установлена), LangChain или прямой API Ollama.
-
-**Важно:** промпт строится здесь, не в `xai_module.py`.
-
-### После агента: `app.py` — Streamlit UI
+### `app.py` — Streamlit UI
 Двухуровневый интерфейс по стандарту NAMUR NE 129:
 
 **Уровень 1 — Operator Dashboard:**
@@ -174,6 +190,9 @@ prediction = alarm_manager.predict_with_context(feature_row, raw_state)
 | Решение | Обоснование |
 |---|---|
 | AR(1) вместо i.i.d. шума | Физическая "память" сигнала необходима для rolling window и SHAP |
+| Три типа отказа A/Б/В (55/30/15%) | Реалистичные сигнатуры; Тип В (электрика) без роста вибрации и температуры — модель вынуждена учиться по токовым признакам |
+| `fault_type` сохраняется в processed CSV | В ML не попадает (нет в FEATURE_COLS), но нужен `fault_recall_analysis.py` для доказательства различения сигнатур |
+| Отдельные флаги `anomaly_vibration/temperature/current` | Точечные маркеры на пострадавшем датчике без путаницы на графике |
 | Group Split по pump_id | Доказывает обобщение на unseen equipment — строгий MLOps-стандарт |
 | `shift(1)` перед `rolling()` | Предотвращает data leakage в признаках |
 | `min_periods=w` для mean/max | Честный NaN вместо статистики по 1–2 точкам |
@@ -184,14 +203,15 @@ prediction = alarm_manager.predict_with_context(feature_row, raw_state)
 | abs(shap_weight) для сортировки | Признак -0.8 важнее +0.1 для диагностики |
 | e5-large вместо MiniLM | Технический русский требует более мощной модели |
 | FEATURE_COLS явный список | Единый контракт признаков для train и inference |
+| `doc_type_map` как единственный allowlist | Нет нужды в `skip_pdfs` — загружаются только перечисленные файлы |
 
 ---
 
 ## Критические ограничения (задокументированы в дипломе)
 
 1. Все 5 насосов имеют **идентичные номинальные параметры** — исследование разнотипного оборудования выходит за рамки работы
-2. ГОСТ 32601-2013 занимает 94% базы знаний в текущей сборке — **требует пересборки** через `kb_text_loader.py` + `gost_extract.md`
-3. LLM работает **локально на M2** (Ollama + Phi3) — зависимости от внешних API нет
+2. ГОСТ 32601-2013 (307 стр.) и мануал МНХВ **не загружаются как PDF** — заменены вручную подготовленными `gost_extract.md` и `mnhv_extract.md`
+3. LLM работает **локально на M2** (Ollama) — зависимости от внешних API нет; сравниваются три модели: `qwen3.5:9b`, `phi4:14b`, `second_constantine/yandex-gpt-5-lite:8b`
 
 ---
 
