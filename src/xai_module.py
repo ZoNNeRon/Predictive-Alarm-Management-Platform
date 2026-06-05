@@ -1,6 +1,6 @@
 """
 Модуль объяснимого ИИ (Explainable AI) на базе SHAP
-=====================================================
+===================================================
 Ответственность модуля: математическое объяснение прогнозов XGBoost.
 Модуль ничего не знает об агентах, промптах и RAG — это намеренно.
 На выходе — строго типизированный SymptomVector, который агентный
@@ -13,15 +13,17 @@ import shap
 import joblib
 import os
 import sys
-import matplotlib.pyplot as plt
-import matplotlib
-matplotlib.use('Agg') # без GUI — для серверного режима и Streamlit
 
 from dataclasses import dataclass, field
 from typing import List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+from config.settings import THRESHOLDS
 from data_preprocessor import DataPreprocessor
+from visualisation_instruments import plot_waterfall, plot_summary_by_fault_type
 
 
 # Типы данных 
@@ -48,24 +50,18 @@ class SymptomVector:
     Передаётся в агентный модуль для построения промпта и RAG-запроса.
     """
     pump_id: str
-    timestamp: Optional[str]
     predicted_class: int           # 0=Норма, 1=Предупреждение, 2=Авария
     probabilities: List[float]     # [P(Норма), P(Предупреждение), P(Авария)]
     critical_probability: float    # P(Авария) × 100, %
     top_symptoms: List[SymptomContribution]
     shap_base_value: float         # Базовое значение SHAP (до добавления признаков)
-    all_contributions: List[SymptomContribution] = field(default_factory=list)
+    inferred_fault: str = "unknown"  # Диагноз, поставленный XAI
+    true_fault: str = "unknown"      # Фактический диагноз из логов (для проверки)
 
 
 # Основной класс 
 
-# Пороги ГОСТ 32601-2013 для физических датчиков
-_GOST_THRESHOLDS = {
-    'vibration':   {'warning': 3.0,  'critical': 8.0},
-    'temperature': {'warning': 82.0, 'critical': 93.0},
-    'current':     {'warning': None, 'critical': None}, # дополнить при необходимости
-    'pressure':    {'warning': None, 'critical': None}, # дополнить при необходимости
-}
+_GOST_THRESHOLDS = THRESHOLDS  # пороги ГОСТ 32601-2013, централизованы в config/settings
 
 
 def _parse_feature_name(feature: str):
@@ -101,147 +97,94 @@ class XAIExplainer:
         self.explainer = shap.TreeExplainer(self.model)
         self.target_class_idx = 2 # класс "Авария"
 
-    def explain(self, feature_row: pd.DataFrame,
-                pump_id: str = 'MNHV_Unknown',
-                timestamp: str = None, # type: ignore
-                top_k: int = 5) -> SymptomVector:
+    def explain_prediction(self, feature_row: pd.DataFrame, pump_id: str = "Unknown", 
+                           true_fault: str = "unknown", top_k: int = 5) -> SymptomVector:
         """
-        Вычисляет SHAP-объяснение и возвращает SymptomVector.
-
-        Args:
-            feature_row: DataFrame из 1 строки (должен содержать FEATURE_COLS).
-            pump_id: идентификатор агрегата.
-            timestamp: метка времени инцидента (строка ISO).
-            top_k: число главных симптомов в SymptomVector.top_symptoms.
-
-        Returns:
-            SymptomVector — структурированный результат для агентного модуля.
+        Анализирует строку признаков, вычисляет SHAP-веса, 
+        и автоматически определяет тип физического отказа (SHAP-сигнатура).
         """
-        if len(feature_row) != 1:
-            raise ValueError(
-                f"explain() принимает ровно 1 строку, получено: {len(feature_row)}"
-            )
-
-        # 1. Прогноз вероятностей
-        proba = self.model.predict_proba(feature_row)[0].tolist()
-        pred_class = int(np.argmax(proba))
-        critical_prob = round(proba[self.target_class_idx] * 100, 1)
-
-        # 2. SHAP values
-        # shap_values_obj.values: shape (1, n_features, n_classes) для XGBoost multiclass
-        shap_obj = self.explainer(feature_row)
-        shap_vals_all = shap_obj.values[0, :, self.target_class_idx] # для класса "Авария" # type: ignore
-        base_value = float(shap_obj.base_values[0, self.target_class_idx]) # type: ignore
+        # 1. Базовые предсказания модели
+        probabilities = self.model.predict_proba(feature_row)[0]
+        predicted_class = int(np.argmax(probabilities)) # 0 (Норма), 1 (Warning), 2 (Авария)
+        critical_prob = probabilities[self.target_class_idx]
+        
+        # 2. Вычисление SHAP
+        shap_values_obj = self.explainer(feature_row)
+        
+        # Безопасное извлечение базового значения (expected_value)
+        # У XGBoost для мультикласса это обычно массив
+        if isinstance(self.explainer.expected_value, (list, np.ndarray)):
+            base_val = self.explainer.expected_value[self.target_class_idx]
+        else:
+            base_val = self.explainer.expected_value
+            
+        shap_vals_critical = shap_values_obj.values[0, :, self.target_class_idx] # type: ignore
+        
         feature_names = feature_row.columns.tolist()
         feature_values = feature_row.values[0]
-
-        # 3. Список всех вкладов
-        all_contribs: List[SymptomContribution] = []
-        for fname, fval, sw in zip(feature_names, feature_values, shap_vals_all):
-            sensor, window = _parse_feature_name(fname)
-            thresh = _GOST_THRESHOLDS.get(sensor, {})
-            all_contribs.append(SymptomContribution(
-                feature=fname,
+        
+        # 3. Сбор всех симптомов (парсинг)
+        contributions = []
+        for i in range(len(feature_names)):
+            feat_name = feature_names[i]
+            val = round(feature_values[i], 3)
+            weight = round(shap_vals_critical[i], 4)
+            
+            # Извлекаем тип датчика (первое слово до подчеркивания)
+            sensor = feat_name.split('_')[0]
+            
+            # Определяем направление влияния
+            direction = 'towards_fault' if weight > 0 else 'against_fault'
+            
+            # (Опционально) Извлечение порогов ГОСТ из вашего конфига THRESHOLDS
+            warning_thr = THRESHOLDS.get(sensor, {}).get('warning')
+            critical_thr = THRESHOLDS.get(sensor, {}).get('critical')
+            
+            contributions.append(SymptomContribution(
+                feature=feat_name,
                 sensor=sensor,
-                window=window,
-                value=round(float(fval), 3),
-                shap_weight=round(float(sw), 4),
-                direction='towards_fault' if sw > 0 else 'against_fault',
-                warning_threshold=thresh.get('warning'),
-                critical_threshold=thresh.get('critical'),
+                window='_'.join(feat_name.split('_')[1:]),
+                value=val,
+                shap_weight=weight,
+                direction=direction,
+                warning_threshold=warning_thr,
+                critical_threshold=critical_thr,
             ))
+            
+        # 4. Сортировка по МОДУЛЮ SHAP (чтобы видеть и сильные плюсы, и сильные минусы)
+        contributions.sort(key=lambda x: abs(x.shap_weight), reverse=True)
+        top_symptoms = contributions[:top_k]
+        
+        # 5. ИНТЕЛЛЕКТУАЛЬНЫЙ АНАЛИЗ СИГНАТУРЫ (Определение типа аварии)
+        inferred_fault = "unknown"
+        if top_symptoms and predicted_class == 2: # Ищем причину только если это авария
+            # Агрегируем суммарный положительный вклад по датчикам
+            sensor_impact = {'temperature': 0.0, 'vibration': 0.0, 'current': 0.0, 'pressure': 0.0}
+            for s in top_symptoms:
+                if s.shap_weight > 0:
+                    sensor_impact[s.sensor] += s.shap_weight
+                    
+            # Дерево решений (Физика процессов)
+            if sensor_impact['temperature'] > 0.3:
+                inferred_fault = 'overheat'
+            elif sensor_impact['pressure'] > 0.2:
+                inferred_fault = 'cavitation'
+            elif sensor_impact['current'] > sensor_impact['vibration']:
+                inferred_fault = 'electrical'
+            elif sensor_impact['vibration'] > 0:
+                inferred_fault = 'cavitation'
 
-        # 4. Сортируем по |shap_weight|: важность, а не знак.
-        #    КРИТИЧНО: признак с весом -0.8 информативнее, чем признак с +0.1.
-        #    Агент должен знать оба — и "что растёт к аварии", и "что аномально снижается".
-        all_contribs.sort(key=lambda c: abs(c.shap_weight), reverse=True)
-
+        # 6. Упаковка в строго типизированный контракт (dataclass)
         return SymptomVector(
             pump_id=pump_id,
-            timestamp=timestamp,
-            predicted_class=pred_class,
-            probabilities=[round(p, 4) for p in proba],
-            critical_probability=critical_prob,
-            top_symptoms=all_contribs[:top_k],
-            shap_base_value=round(base_value, 4),
-            all_contributions=all_contribs,
+            predicted_class=predicted_class,
+            probabilities=[float(p) for p in probabilities],
+            critical_probability=round(critical_prob * 100, 1),
+            shap_base_value=round(base_val, 4),     # type: ignore
+            top_symptoms=top_symptoms,
+            inferred_fault=inferred_fault,
+            true_fault=true_fault
         )
-
-    # Визуализация 
-
-    def plot_waterfall(self, feature_row: pd.DataFrame,
-                       pump_id: str = 'MNHV_Unknown',
-                       save_path: str = None) -> str: # type: ignore
-        """
-        Waterfall plot: объяснение одного конкретного предсказания.
-        Показывает, как каждый признак смещает прогноз от базового значения.
-        """
-        shap_obj = self.explainer(feature_row)
-        explanation = shap.Explanation(
-            values=shap_obj.values[0, :, self.target_class_idx], # type: ignore
-            base_values=shap_obj.base_values[0, self.target_class_idx], # type: ignore
-            data=feature_row.values[0],
-            feature_names=feature_row.columns.tolist()
-        )
-
-        fig, ax = plt.subplots(figsize=(12, 7))
-        plt.sca(ax)
-        shap.plots.waterfall(explanation, max_display=12, show=False)
-        ax.set_title(
-            f'SHAP Waterfall — Агрегат {pump_id}: объяснение прогноза «Авария»\n'
-            f'Красные увеличивают вероятность аварии, синие - уменьшают',
-            fontsize=11, pad=12
-        )
-        plt.tight_layout()
-
-        if save_path is None:
-            save_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                '..', 'data', 'graphs', f'shap_waterfall_{pump_id}.png'
-            )
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"Waterfall plot сохранён: {save_path}")
-        return save_path
-
-    def plot_summary(self, X_sample: pd.DataFrame,
-                     save_path: str = None, # type: ignore
-                     max_display: int = 15) -> str:
-        """
-        Summary (beeswarm) plot: глобальная важность признаков по всей выборке.
-        Показывает не только важность (ось X), но и направление влияния
-        (высокие значения признака → красный цвет → рост или падение прогноза).
-
-        Для диплома: демонстрирует, что модель опирается на физически осмысленные
-        признаки (temperature_mean_60, vibration_diff_30), а не на артефакты данных.
-        """
-        shap_values = self.explainer.shap_values(X_sample) # список массивов по числу классов для XGBoost
-        shap_for_critical = shap_values[self.target_class_idx] \
-            if isinstance(shap_values, list) else shap_values[:, :, self.target_class_idx]
-
-        fig, ax = plt.subplots(figsize=(12, 8))
-        plt.sca(ax)
-        shap.summary_plot(
-            shap_for_critical, X_sample,
-            max_display=max_display,
-            show=False, plot_type='dot'
-        )
-        plt.title(
-            f'SHAP Summary (Beeswarm) — Глобальная важность признаков\n'
-            f'Класс «Авария» | N={len(X_sample):,} строк тестовой выборки',
-            fontsize=11, pad=12
-        )
-        plt.tight_layout()
-
-        if save_path is None:
-            save_path = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)),
-                '..', 'data', 'graphs', 'shap_summary_beeswarm.png'
-            )
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"Summary plot сохранён: {save_path}")
-        return save_path
 
 
 # Точка входа (тестирование модуля) 
@@ -249,7 +192,7 @@ class XAIExplainer:
 if __name__ == "__main__":
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     model_path = os.path.join(project_root, 'models', 'xgboost_pump_model.joblib')
-    data_path = os.path.join(project_root, 'data', 'processed', 'processed_features.csv')
+    data_path = os.path.join(project_root, 'data', 'processed', 'preprocessed_pumps_dataset.csv')
     plots_dir = os.path.join(project_root, 'data', 'graphs')
 
     print("Инициализация XAIExplainer...")
@@ -279,10 +222,16 @@ if __name__ == "__main__":
     print(f"Анализ инцидента: {pump_id_val} @ {ts_val}")
     print(f"{'─'*55}")
 
-    sv = xai.explain(sample_row, pump_id=pump_id_val, timestamp=ts_val, top_k=5)
+    pump_id_val = critical_cases.iloc[-1]['pump_id']
+    # Извлекаем истинный тип аварии из датасета
+    true_fault_val = critical_cases.iloc[-1].get('fault_type', 'unknown')
+    
+    # Получаем математическое объяснение
+    sv = xai.explain_prediction(sample_row, pump_id=pump_id_val, true_fault=true_fault_val, top_k=5)
 
     print(f"Прогноз модели:   Класс {sv.predicted_class} "
           f"({['Норма','Warning','Авария'][sv.predicted_class]})")
+    print(f"Диагноз XAI:      {sv.inferred_fault} (Фактически: {sv.true_fault})")
     print(f"Вероятности:      Норма={sv.probabilities[0]:.3f}  "
           f"Warning={sv.probabilities[1]:.3f}  Авария={sv.probabilities[2]:.3f}")
     print(f"P(Авария):        {sv.critical_probability}%")
@@ -292,23 +241,20 @@ if __name__ == "__main__":
         sign  = '+' if s.shap_weight > 0 else ''
         arrow = '↑ к аварии' if s.direction == 'towards_fault' else '↓ от аварии'
         thresh_info = ''
-        if s.critical_threshold:
-            thresh_info = f'  [ГОСТ Critical: {s.critical_threshold}]'
+        if s.critical_threshold and s.value >= s.critical_threshold:
+            thresh_info = f'  [ПРЕВЫШЕН ГОСТ Critical: {s.critical_threshold}]'
+        elif s.critical_threshold:
+            thresh_info = f'  [порог ГОСТ: {s.critical_threshold}]'
         print(f"  {i}. [{s.sensor:12s}] {s.feature}")
         print(f"     Значение: {s.value}  SHAP: {sign}{s.shap_weight}  {arrow}{thresh_info}")
 
     # Тест 2: Waterfall plot для одного инцидента 
     print(f"\nПостроение SHAP Waterfall plot...")
-    xai.plot_waterfall(
+    plot_waterfall(xai, 
         sample_row, pump_id=pump_id_val,
-        save_path=os.path.join(plots_dir, f'shap_waterfall_{pump_id_val}.png')
+        save_path=os.path.join(plots_dir, f'shap_plot1_waterfall_{pump_id_val}.png')
     )
 
     # Тест 3: Summary/Beeswarm по всей тестовой выборке (насос 5) 
-    print("Построение SHAP Summary (Beeswarm) plot...")
-    test_pump = df[df['pump_id'] == pump_id_val][feature_cols]
-    sample_for_summary = test_pump.sample(n=min(10000, len(test_pump)), random_state=42)
-    xai.plot_summary(
-        sample_for_summary,
-        save_path=os.path.join(plots_dir, 'shap_summary_beeswarm.png')
-    )
+    print("Построение отдельных SHAP Beeswarm для каждого типа аварии...")
+    plot_summary_by_fault_type(xai, df, feature_cols, plots_dir, max_display=15)

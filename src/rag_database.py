@@ -5,11 +5,19 @@
 Платформа: macOS M2, локальный запуск без GPU (MPS-ускорение через PyTorch)
 """
 
+import sys
 import os
 import shutil
 import json
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
+
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+from config.settings import (DOC_TYPES, CHUNK_CONFIG, RELEVANCE_THRESHOLD,
+                              EMBED_MODEL, DOC_TYPE_MAP)
+from visualisation_instruments import plot_all_rag
 
 import pdfplumber
 import pymupdf4llm
@@ -17,36 +25,10 @@ from langchain.schema import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
-import matplotlib.pyplot as plt
-import matplotlib
-matplotlib.use('Agg')
-import seaborn as sns
-import numpy as np
-import pandas as pd
 
 
-# Константы
-
-# Типы документов базы знаний
-DOC_TYPES = {
-    'manual':   'Технический мануал (руководство по эксплуатации)',
-    'gost':     'ГОСТ / Нормативный документ',
-    'sop':      'Регламент технического обслуживания (SOP)',
-    'schedule': 'График технического обслуживания',
-    'diagnostics': 'Расширенная вибродиагностика (аналитическое дополнение)',
-}
-
-# Параметры чанкинга по типу документа
-CHUNK_CONFIG = {
-    'manual':   {'chunk_size': 600,  'chunk_overlap': 120},
-    'gost':     {'chunk_size': 700,  'chunk_overlap': 150},   # короткие пункты ГОСТ
-    'sop':      {'chunk_size': 500,  'chunk_overlap': 100},
-    'schedule': {'chunk_size': 350,  'chunk_overlap': 50},
-    'diagnostics': {'chunk_size': 500, 'chunk_overlap': 100},  # новый тип
-}
-
-# Порог релевантности: результаты с distance > threshold отсекаются
-RELEVANCE_THRESHOLD = 1.2   # L2-расстояние; > 1.2 = нерелевантно для e5-large
+# DOC_TYPES, CHUNK_CONFIG, RELEVANCE_THRESHOLD, EMBED_MODEL, DOC_TYPE_MAP
+# импортированы из config.settings
 
 
 # Загрузчик текстовых файлов (.md, .txt)
@@ -218,7 +200,7 @@ class KnowledgeBaseManager:
         по сравнению с MiniLM.
     """
 
-    EMBED_MODEL = "intfloat/multilingual-e5-large"
+    EMBED_MODEL = EMBED_MODEL
 
     def __init__(self, data_dir: str, chroma_dir: str,
                  doc_type_map: Dict[str, str] = None):  # type: ignore
@@ -420,7 +402,8 @@ class KnowledgeBaseManager:
         )
         query_prescriptive = (
             f"причина и устранение неисправности: {symptom_words}. "
-            f"Действия оператора, диагностика отказа, рекомендации по ремонту."
+            f"Действия оператора, диагностика отказа, связанные работы ТОиР, "
+            f"капитальный ремонт, рекомендации."
         )
 
         print(f"  Запрос 1 (состояние): {query_descriptive[:90]}...")
@@ -439,195 +422,22 @@ class KnowledgeBaseManager:
         # Сортируем по релевантности и возвращаем top-k
         combined.sort(key=lambda x: x[1])
         return combined[:k]
-
-    # Визуализация для диплома 
-
-    def plot_knowledge_base_stats(self, save_dir: str):
+    
+    def search_maintenance_schedule(self, pump_id: str, k: int = 2):
         """
-        График 1: Состав базы знаний.
-        Доля чанков по типам документов — демонстрирует покрытие базы знаний.
+        Прямой поиск графика ТО по агрегату (отдельно от поиска по симптомам).
+        График привязан к pump_id, а не к симптомам датчиков, поэтому
+        поиск по симптомам его не находит — нужен прямой запрос.
         """
-        db = Chroma(persist_directory=self.chroma_dir,
-                    embedding_function=self.embeddings)
-        all_meta = db._collection.get()['metadatas']
 
-        if not all_meta:
-            print("[WARN] База пуста — нечего визуализировать.")
-            return
-
-        # Подсчёт по типам
-        type_counts: Dict[str, int] = {}
-        for m in all_meta:
-            dt = m.get('doc_type', 'unknown')
-            type_counts[dt] = type_counts.get(dt, 0) + 1 # type: ignore
-
-        all_colors = ['#4C72B0', '#55A868', '#C44E52', '#8172B2', '#CCB974']
-        sorted_items = sorted(
-            zip(type_counts.keys(), type_counts.values()),
-            key=lambda x: x[1], reverse=True
+        SCHEDULE_THRESHOLD = 1.5 # Мягче основного threshold
+        query = f"график технического обслуживания капитальный ремонт {pump_id}"
+        db = Chroma(persist_directory=self.chroma_dir, embedding_function=self.embeddings)
+        results = db.similarity_search_with_score(
+            f"query: {query}", k=k,
+            filter={'doc_type': 'schedule'}   # фильтр только по графику ТО
         )
-        labels = [DOC_TYPES.get(k, k) for k, _ in sorted_items]
-        sizes  = [v for _, v in sorted_items]
-        colors = all_colors[:len(labels)]
-
-        fig, ax = plt.subplots(figsize=(8, 7))
-        wedges, texts, autotexts = ax.pie( # type: ignore
-            sizes, labels=None, autopct='%1.1f%%',
-            colors=colors, startangle=90, counterclock=False,
-            pctdistance=0.82, wedgeprops={'edgecolor': 'white', 'linewidth': 1.5}
-        )
-        for at in autotexts:
-            at.set_fontsize(11)
-            at.set_fontweight('bold')
-        ax.legend(wedges, [f"{l}\n({s} чанков)" for l, s in zip(labels, sizes)],
-                  loc='lower center', bbox_to_anchor=(0.5, -0.22),
-                  fontsize=9, framealpha=0.8)
-        ax.set_title(
-            f'Состав базы знаний RAG-системы\n(всего чанков: {sum(sizes)})',
-            fontsize=13, fontweight='bold', pad=6
-        )
-        path = os.path.join(save_dir, 'rag_plot1_kb_composition.png')
-        plt.savefig(path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"График 1 сохранён: {path}")
-
-    def plot_chunk_length_distribution(self, save_dir: str):
-        """
-        График 2: Распределение длин чанков по типам документов.
-        Валидирует, что chunk_size выбран правильно — чанки не слишком короткие
-        (теряется контекст) и не слишком длинные (размываются по теме).
-        """
-        db = Chroma(persist_directory=self.chroma_dir,
-                    embedding_function=self.embeddings)
-        collection = db._collection.get()
-
-        if not collection['documents']:
-            print("[WARN] База пуста.")
-            return
-
-        docs_by_type: Dict[str, List[int]] = {}
-        for doc_text, meta in zip(collection['documents'], collection['metadatas']): # type: ignore
-            # Убираем prefix 'passage: ' для подсчёта реальной длины
-            clean = doc_text.replace('passage: ', '', 1)
-            dt    = meta.get('doc_type', 'unknown')
-            docs_by_type.setdefault(dt, []).append(len(clean))
-
-        fig, ax = plt.subplots(figsize=(11, 6))
-        # 6 цветов — с запасом на все типы документов (не 4!)
-        palette = ['#4C72B0', '#55A868', '#C44E52', '#8172B2', '#CCB974', '#64B5CD']
-
-        types_sorted = list(docs_by_type.keys())
-        data   = [docs_by_type[dt] for dt in types_sorted]
-        labels = [f"{DOC_TYPES.get(dt, dt)}\n(n={len(docs_by_type[dt])}, μ={np.mean(docs_by_type[dt]):.0f})"
-                  for dt in types_sorted]
-
-        bp = ax.boxplot(data, vert=False, patch_artist=True,
-                        tick_labels=labels,
-                        medianprops={'color': 'black', 'lw': 1.5})
-        for patch, color in zip(bp['boxes'], palette):
-            patch.set_facecolor(color)
-            patch.set_alpha(0.7)
-
-        # Накладываем точки (strip plot) — при малом N важно видеть каждый чанк
-        for i, dt in enumerate(types_sorted, 1):
-            y = np.random.normal(i, 0.04, size=len(docs_by_type[dt]))
-            ax.scatter(docs_by_type[dt], y, color=palette[(i-1) % len(palette)],
-                       edgecolor='black', s=22, zorder=3, alpha=0.8)
-
-        # Целевые chunk_size — вертикальные линии
-        for dt in types_sorted:
-            cfg = CHUNK_CONFIG.get(dt)
-            if cfg:
-                ax.axvline(cfg['chunk_size'], color='red', lw=1.0, ls='--', alpha=0.4)
-
-        ax.set_xlabel('Длина чанка (символов)', fontsize=11)
-        ax.set_title('Распределение длин текстовых фрагментов (чанков)\n'
-                     'по типам документов базы знаний (N=59)',
-                     fontsize=12, fontweight='bold')
-        ax.grid(axis='x', alpha=0.35, ls='--')
-        plt.tight_layout()
-        path = os.path.join(save_dir, 'rag_plot2_chunk_distribution.png')
-        plt.savefig(path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"График 2 сохранён: {path}")
-
-    def plot_retrieval_quality(self, test_queries: List[Dict],
-                               save_dir: str):
-        """
-        График 3: Качество поиска — расстояния для набора тестовых запросов.
-        Показывает, насколько уверенно RAG-система находит релевантный контекст
-        для типичных симптомов из XAI-модуля.
-
-        Args:
-            test_queries: Список {'query': str, 'label': str} — тестовые сценарии.
-        """
-        results_data = []
-        for tq in test_queries:
-            results = self.search(tq['query'], k=3)
-            for rank, (doc, score) in enumerate(results, 1):
-                results_data.append({
-                    'query_label': tq['label'],
-                    'rank':        rank,
-                    'distance':    score,
-                    'doc_type':    doc.metadata.get('doc_type', 'unknown'),
-                })
-
-        if not results_data:
-            print("[WARN] Нет результатов для визуализации качества.")
-            return
-
-        df = pd.DataFrame(results_data)
-
-        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-
-        # Левый: boxplot расстояний по запросам
-        query_labels = df['query_label'].unique()
-        data_per_query = [df[df['query_label'] == ql]['distance'].values
-                          for ql in query_labels]
-        bp = axes[0].boxplot(data_per_query, tick_labels=query_labels, patch_artist=True,
-                             medianprops={'color': 'red', 'lw': 2})
-        colors_box = ['#4C72B0', '#55A868', '#C44E52', '#8172B2',
-                      '#CCB974', '#64B5CD'][:len(query_labels)]
-        for patch, color in zip(bp['boxes'], colors_box):
-            patch.set_facecolor(color)
-            patch.set_alpha(0.7)
-        axes[0].axhline(RELEVANCE_THRESHOLD, color='orange', ls='--', lw=1.5,
-                        label=f'Порог релевантности ({RELEVANCE_THRESHOLD})')
-        axes[0].set_ylabel('L2-расстояние (меньше = лучше)', fontsize=10)
-        axes[0].set_title('Расстояния поиска по тестовым запросам\n'
-                          '(ниже порога = релевантный результат)', fontsize=11, fontweight='bold')
-        axes[0].legend(fontsize=9)
-        axes[0].tick_params(axis='x', rotation=25)
-        axes[0].grid(axis='y', alpha=0.35, ls='--')
-
-        # Правый: доля результатов выше/ниже порога (порядок — как на левом графике)
-        df['relevant'] = df['distance'] <= RELEVANCE_THRESHOLD
-        summary = df.groupby('query_label')['relevant'].mean() * 100
-        summary = summary.reindex(query_labels)
-
-        bar_colors = colors_box[:len(summary)]
-        bars = axes[1].bar(summary.index, summary.values, color=bar_colors, alpha=0.85,
-                           edgecolor='white')
-        axes[1].axhline(100, color='green', ls='--', lw=1.2, alpha=0.5, label='100% релевантность')
-        axes[1].set_ylim(0, 115)
-        axes[1].set_ylabel('% релевантных результатов', fontsize=10)
-        axes[1].set_title('Доля релевантных результатов\nпо каждому тестовому сценарию',
-                          fontsize=11, fontweight='bold')
-        axes[1].tick_params(axis='x', rotation=25)
-        axes[1].grid(axis='y', alpha=0.35, ls='--')
-        for bar, val in zip(bars, summary.values):
-            axes[1].text(bar.get_x() + bar.get_width() / 2,
-                         bar.get_height() + 2,
-                         f'{val:.0f}%', ha='center', fontsize=10, fontweight='bold')
-
-        plt.suptitle('Оценка качества семантического поиска RAG-системы\n'
-                     f'Модель эмбеддингов: {self.EMBED_MODEL}',
-                     fontsize=12, fontweight='bold', y=1.02)
-        plt.tight_layout()
-        path = os.path.join(save_dir, 'rag_plot3_retrieval_quality.png')
-        plt.savefig(path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"График 3 сохранён: {path}")
+        return [(doc, score) for doc, score in results if score <= SCHEDULE_THRESHOLD]
 
 
 # Точка входа 
@@ -641,32 +451,17 @@ if __name__ == "__main__":
     os.makedirs(knowledge_dir, exist_ok=True)
     os.makedirs(plots_dir,     exist_ok=True)
 
-    # Карта типов документов: загружаются только перечисленные здесь файлы.
-    # gost_32601_2013.pdf и mnhv_manual.pdf заменены .md-выжимками и не включены.
-    doc_type_map = {
-        'tm_regulation.pdf': 'sop',
-        'tm_schedule.pdf':   'schedule',
-        'gost_extract.md':   'gost',
-        'mnhv_extract.md':   'manual',
-        'diagnostics_extended.md': 'diagnostics',
-    }
-
     kb = KnowledgeBaseManager(
         data_dir=knowledge_dir,
         chroma_dir=chroma_db_dir,
-        doc_type_map=doc_type_map,
+        doc_type_map=DOC_TYPE_MAP,
     )
 
     # Шаг 1: Построить базу
     db = kb.build_database(reset=True)
 
     if db is not None:
-        # Шаг 2: Визуализация состава базы
-        print("\nГенерация графиков для диплома...")
-        kb.plot_knowledge_base_stats(plots_dir)
-        kb.plot_chunk_length_distribution(plots_dir)
-
-        # Шаг 3: Тестовые запросы (симулируем вывод XAI-модуля)
+        # Шаг 2: Визуализация базы знаний
         test_queries = [
             {'query': 'вибрация подшипника превышает 8 мм/с, нарастающий тренд',
              'label': 'Вибрация >8'},
@@ -678,9 +473,9 @@ if __name__ == "__main__":
              'label': 'Уплотнение'},
         ]
 
-        kb.plot_retrieval_quality(test_queries, plots_dir)
+        plot_all_rag(kb.chroma_dir, kb.embeddings, kb.EMBED_MODEL, test_queries, plots_dir)
 
-        # Шаг 4: Демонстрация поиска в консоли
+        # Шаг 3: Демонстрация поиска в консоли
         print(f"\n{'─'*55}")
         print("Тестовый поиск (сценарий: высокая вибрация + температура):")
         print(f"{'─'*55}")

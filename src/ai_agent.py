@@ -29,6 +29,10 @@ from dataclasses import dataclass, field
 from typing import List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+from config.settings import LLM_MODELS, DEFAULT_LLM_MODEL
 
 # Импорт типов из XAI-модуля — единый контракт данных
 from xai_module import SymptomVector, SymptomContribution
@@ -58,28 +62,17 @@ class AgentResponse:
     error:              Optional[str]   = None    # текст ошибки, если была
 
 
-# Системный промпт (anti-hallucination, строгий формат) 
+# Системный промпт — загружается из config/prompts/diagnostic_agent.md
 
-SYSTEM_PROMPT = """Ты — главный инженер-диагност АСУ ТП на нефтегазовом предприятии. \
-Твоя задача — проанализировать показания датчиков насосного агрегата и выдать \
-оператору чёткое, профессиональное предписание к действию.
+def _load_system_prompt() -> str:
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(project_root, 'config', 'prompts', 'diagnostic_agent.md')
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Файл с промптом не найден: {path}.")
+    with open(path, encoding='utf-8') as f:
+        return f.read().strip()
 
-СТРОГИЕ ПРАВИЛА:
-1. Используй ТОЛЬКО предоставленный КОНТЕКСТ (выдержки из ГОСТ, руководства по \
-эксплуатации и регламентов предприятия). ЗАПРЕЩЕНО придумывать методы ремонта, \
-пороговые значения или причины, которых нет в КОНТЕКСТЕ.
-2. Если в КОНТЕКСТЕ нет решения для описанных симптомов, напиши строго: \
-"Требуется ручная инспекция оборудования".
-3. НЕ используй вводные слова и приветствия (без "Конечно", "Я помогу", "Хорошо").
-4. Точно транслируй численные показания датчиков из раздела СИМПТОМЫ — не округляй \
-и не искажай значения, полученные от аналитической модели.
-5. При ссылке на норматив указывай его источник так, как он назван в КОНТЕКСТЕ.
-
-ФОРМАТ ОТВЕТА (строго по шаблону, без отклонений):
-СТАТУС: [краткая оценка состояния на основе симптомов]
-ДИАГНОЗ И ОБОСНОВАНИЕ: [связь симптомов с вероятными причинами из КОНТЕКСТА]
-ПРЕДПИСАНИЕ (ДЕЙСТВИЯ ОПЕРАТОРА): [пошаговый нумерованный список действий из КОНТЕКСТА]
-ИНФОРМАЦИЯ ПО ТОиР: [данные о плановых ремонтах из КОНТЕКСТА, если они есть; иначе — "нет данных"]"""
+SYSTEM_PROMPT = _load_system_prompt()
 
 
 # Основной класс агента 
@@ -95,7 +88,7 @@ class DiagnosticAgent:
     """
 
     # Модель по умолчанию: лучший баланс русский язык + структурированный вывод
-    DEFAULT_MODEL = "qwen3.5:9b"
+    DEFAULT_MODEL = DEFAULT_LLM_MODEL
 
     def __init__(self, model_name: str = None,  # type: ignore
                  temperature: float = 0.1,
@@ -322,11 +315,7 @@ if __name__ == "__main__":
     print(f"  Найдено фрагментов: {len(rag_results)}")
 
     # 3. Agent: генерируем предписание для каждой модели
-    models_to_test = [
-        "qwen3.5:9b",
-        "phi4:14b",
-        "second_constantine/yandex-gpt-5-lite:8b",
-    ]
+    models_to_test = LLM_MODELS
 
     for n, model_name in enumerate(models_to_test, 1):
         print(f"\n[3.{n}/{len(models_to_test)}] LLM-агент: {model_name}...")

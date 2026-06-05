@@ -1,17 +1,22 @@
+"""
+Аналитическое ядро предиктивной диагностики (ML Pipeline)
+=========================================================
+Модуль отвечает за обучение, изоляционное тестирование (Group Split) и 
+сравнение предиктивных моделей (Logistic Regression, Random Forest, XGBoost) 
+для выявления деградации оборудования. Включает программную реализацию 
+`AlarmManager` для интеллектуального подавления ложных тревог (Alarm Shelving) 
+в пусковых и нерабочих режимах насоса.
+"""
+
 import pandas as pd
-import numpy as np
 import os
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 import xgboost as xgb
 from sklearn.metrics import (classification_report, confusion_matrix,
-                              average_precision_score, precision_recall_curve)
+                              average_precision_score)
 from sklearn.utils.class_weight import compute_sample_weight
 from sklearn.preprocessing import label_binarize
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-import matplotlib.gridspec as gridspec
-import seaborn as sns
 import warnings
 warnings.filterwarnings('ignore')
 import joblib
@@ -20,20 +25,14 @@ from fault_recall_analysis import analyze_fault_recall
 # Импорт препроцессора для получения FEATURE_COLS
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-try:
-    from data_preprocessor import DataPreprocessor
-    _preprocessor = DataPreprocessor(window_sizes=[15, 30, 60])
-    FEATURE_COLS = _preprocessor.FEATURE_COLS
-except ImportError:
-    # Fallback: если препроцессор недоступен, список выстраивается вручную
-    _sensors = ['vibration', 'temperature', 'current', 'pressure']
-    _windows = [15, 30, 60]
-    FEATURE_COLS = [
-        f'{s}_{stat}_{w}'
-        for s in _sensors
-        for w in _windows
-        for stat in ['mean', 'std', 'max']
-    ] + [f'{s}_diff_30' for s in _sensors]
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+from config.settings import TRAIN_PUMPS, TEST_PUMPS, WINDOW_SIZES
+from visualisation_instruments import plot_all
+from data_preprocessor import DataPreprocessor
+_preprocessor = DataPreprocessor(window_sizes=WINDOW_SIZES)
+FEATURE_COLS = _preprocessor.FEATURE_COLS
 
 
 # AlarmManager
@@ -71,7 +70,8 @@ class AlarmManager:
 
 # Оценка модели 
 
-def evaluate_model(name: str, short_name: str, model, X_test: pd.DataFrame, y_test: pd.Series) -> dict:
+def evaluate_model(name: str, short_name: str, model, 
+                   X_test: pd.DataFrame, y_test: pd.Series) -> dict:
     """
     Вычисляет и выводит полный набор метрик для одной модели.
 
@@ -126,168 +126,26 @@ def evaluate_model(name: str, short_name: str, model, X_test: pd.DataFrame, y_te
     print(f"Recall (Класс 'Авария'):   {recall_critical:.4f}")
 
     return {
-        'name':             name,
-        'label':            short_name, # имя для графиков
-        'f1_macro':         report['macro avg']['f1-score'], # type: ignore
-        'f1_warning':       report['1: Warning']['f1-score'], # type: ignore
-        'f1_critical':      report['2: Авария']['f1-score'], # type: ignore
-        'recall_critical':  recall_critical,
-        'pr_auc_macro':     pr_auc_macro,
-        'pr_auc_critical':  pr_auc_critical,
-        'y_pred':           y_pred,
-        'y_proba':          y_proba,
-        'cm':               confusion_matrix(y_test, y_pred),
+        'name': name,
+        'label': short_name,                            # имя для графиков
+        'f1_macro': report['macro avg']['f1-score'],    # type: ignore
+        'f1_warning': report['1: Warning']['f1-score'], # type: ignore
+        'f1_critical': report['2: Авария']['f1-score'], # type: ignore
+        'recall_critical': recall_critical,
+        'pr_auc_macro': pr_auc_macro,
+        'pr_auc_critical': pr_auc_critical,
+        'y_pred': y_pred,
+        'y_proba': y_proba,
+        'cm': confusion_matrix(y_test, y_pred),
     }
-
-# Визуализация 
-
-# Палитра и стиль
-PALETTE  = {'LogReg': '#4C72B0', 'RF': '#55A868', 'XGBoost': '#C44E52'}
-LIGHT_BG = '#FFFFFF'
-GRID_CLR = '#E5E5E5'
-TEXT_CLR = '#222222'
-
-
-def _apply_light_style(ax, title: str = ''):
-    ax.set_facecolor(LIGHT_BG)
-    ax.tick_params(colors=TEXT_CLR, labelsize=10)
-    for spine in ax.spines.values():
-        spine.set_edgecolor('#CCCCCC')
-    ax.yaxis.label.set_color(TEXT_CLR)
-    ax.xaxis.label.set_color(TEXT_CLR)
-    if title:
-        ax.set_title(title, color=TEXT_CLR, fontsize=12, fontweight='bold', pad=10)
-
-
-def plot_all(metrics_list: list, y_test: pd.Series, output_dir: str):
-    """
-    Строит и сохраняет три технических графика в светлой (академической) теме:
-      1. Тепловые карты Confusion Matrix
-      2. Grouped bar chart по метрикам
-      3. PR-кривые
-    """
-    os.makedirs(output_dir, exist_ok=True)
-    y_test_bin = label_binarize(y_test, classes=[0, 1, 2])
-
-    # График 1: Confusion Matrices 
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-    fig.patch.set_facecolor(LIGHT_BG)
-    fig.suptitle('Матрицы ошибок (тестовая выборка: насос MNHV_005)',
-                 color=TEXT_CLR, fontsize=14, fontweight='bold', y=1.05)
-
-    class_labels = ['Норма', 'Предупреждение', 'Авария']
-    for ax, m in zip(axes, metrics_list):
-        cm_norm = m['cm'].astype(float) / m['cm'].sum(axis=1, keepdims=True)
-        sns.heatmap(
-            cm_norm, annot=m['cm'], fmt='d', ax=ax,
-            cmap='Blues', linewidths=0.5, linecolor='#DDDDDD',
-            xticklabels=class_labels, yticklabels=class_labels,
-            cbar=False, annot_kws={'size': 11} # Убрали 'color': 'white', Seaborn настроит контраст
-        )
-        _apply_light_style(ax, m['label'])
-        ax.set_xlabel('Предсказано', color=TEXT_CLR)
-        ax.set_ylabel('Истинно', color=TEXT_CLR)
-        
-        # Выделяем диагональ (правильные предсказания)
-        for i in range(3):
-            ax.add_patch(plt.Rectangle((i, i), 1, 1, fill=False, # type: ignore
-                                       edgecolor='#FF8C00', lw=2)) 
-
-    plt.tight_layout()
-    p1 = os.path.join(output_dir, 'plot1_confusion_matrices.png')
-    plt.savefig(p1, dpi=150, bbox_inches='tight', facecolor=LIGHT_BG)
-    print(f"График 1 сохранён: {p1}")
-    plt.close(fig)
-
-    # График 2: Метрики — Grouped Bar Chart 
-    metric_keys   = ['f1_macro', 'f1_critical', 'recall_critical', 'pr_auc_critical']
-    metric_labels = ['F1 Macro', 'F1 (Авария)', 'Recall (Авария)', 'PR-AUC (Авария)']
-    n_models  = len(metrics_list)
-    n_metrics = len(metric_keys)
-    x = np.arange(n_metrics)
-    width = 0.22
-
-    fig, ax = plt.subplots(figsize=(13, 6))
-    fig.patch.set_facecolor(LIGHT_BG)
-    ax.set_facecolor(LIGHT_BG)
-
-    colors = list(PALETTE.values())
-    for i, m in enumerate(metrics_list):
-        vals = [m[k] for k in metric_keys]
-        offset = (i - n_models / 2 + 0.5) * width
-        bars = ax.bar(x + offset, vals, width, label=m['label'],
-                        color=colors[i], alpha=0.9, zorder=3)
-        for bar, val in zip(bars, vals):
-            ax.text(bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + 0.005,
-                    f'{val:.3f}', ha='center', va='bottom',
-                    fontsize=9, color=TEXT_CLR, fontweight='bold')
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(metric_labels, color=TEXT_CLR, fontsize=11)
-    ax.set_ylim(0.35, 1.05) # Расширили верхний лимит для подписей
-    ax.set_ylabel('Значение метрики', color=TEXT_CLR)
-    ax.yaxis.grid(True, linestyle='--', alpha=0.7, color=GRID_CLR, zorder=0)
-    ax.set_title('Сравнение качества моделей по ключевым метрикам\n'
-                 '(тестовая выборка: насос MNHV_005)',
-                 color=TEXT_CLR, fontsize=13, fontweight='bold')
-    ax.legend(framealpha=1.0, labelcolor=TEXT_CLR, fontsize=10,
-              facecolor=LIGHT_BG, edgecolor='#CCCCCC')
-    for spine in ax.spines.values():
-        spine.set_edgecolor('#CCCCCC')
-
-    plt.tight_layout()
-    p2 = os.path.join(output_dir, 'plot2_metrics_comparison.png')
-    plt.savefig(p2, dpi=150, bbox_inches='tight', facecolor=LIGHT_BG)
-    print(f"График 2 сохранён: {p2}")
-    plt.close(fig)
-
-    # График 3: PR-кривые для класса "Авария" 
-    fig, ax = plt.subplots(figsize=(9, 7))
-    fig.patch.set_facecolor(LIGHT_BG)
-    ax.set_facecolor(LIGHT_BG)
-
-    for m, color in zip(metrics_list, colors):
-        prec, rec, _ = precision_recall_curve(y_test_bin[:, 2], m['y_proba'][:, 2]) # type: ignore
-        auc_val = m['pr_auc_critical']
-        ax.plot(rec, prec, color=color, lw=2.0,
-                label=f"{m['label']}  (PR-AUC = {auc_val:.4f})", zorder=3)
-        # Точка при пороге 0.5
-        idx_50 = np.argmin(np.abs(m['y_proba'][:, 2].mean() - 0.5))
-        ax.scatter(rec[len(rec)//2], prec[len(prec)//2],
-                   color=color, s=60, zorder=5, edgecolor=LIGHT_BG)
-
-    # Базовая линия (случайный классификатор)
-    baseline = y_test_bin[:, 2].mean() # type: ignore
-    ax.axhline(baseline, color='#888888', lw=1.2, ls='--',
-               label=f'Случайный классификатор (P = {baseline:.3f})', zorder=1)
-
-    ax.set_xlabel('Recall (Полнота обнаружения аварий)', color=TEXT_CLR, fontsize=11)
-    ax.set_ylabel('Precision (Точность предупреждений)', color=TEXT_CLR, fontsize=11)
-    ax.set_title('PR-кривые для класса «Авария» (Class 2)\n'
-                 'Ключевая метрика для несбалансированных промышленных данных',
-                 color=TEXT_CLR, fontsize=12, fontweight='bold')
-    ax.legend(framealpha=1.0, labelcolor=TEXT_CLR, fontsize=10,
-              facecolor=LIGHT_BG, edgecolor='#CCCCCC')
-    ax.yaxis.grid(True, linestyle='--', alpha=0.7, color=GRID_CLR, zorder=0)
-    ax.xaxis.grid(True, linestyle='--', alpha=0.7, color=GRID_CLR, zorder=0)
-    for spine in ax.spines.values():
-        spine.set_edgecolor('#CCCCCC')
-    ax.set_xlim([-0.02, 1.02]) # type: ignore
-    ax.set_ylim([-0.02, 1.05]) # type: ignore
-
-    plt.tight_layout()
-    p3 = os.path.join(output_dir, 'plot3_pr_curves_critical.png')
-    plt.savefig(p3, dpi=150, bbox_inches='tight', facecolor=LIGHT_BG)
-    print(f"График 3 сохранён: {p3}")
-    plt.close(fig)
 
 
 # Точка входа 
 
 if __name__ == "__main__":
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    processed_data_path = os.path.join(project_root, 'data', 'processed', 'processed_features.csv')
+    processed_data_path = os.path.join(project_root, 'data', 'processed', 
+                                       'preprocessed_pumps_dataset.csv')
     output_dir = os.path.join(project_root, 'data', 'graphs')
 
     # 1. Загрузка данных
@@ -299,11 +157,8 @@ if __name__ == "__main__":
     df = pd.read_csv(processed_data_path)
 
     # 2. Group Split по оборудованию (доказывает обобщение на новый агрегат)
-    train_pumps = ['MNHV_001', 'MNHV_002', 'MNHV_003', 'MNHV_004']
-    test_pumps = ['MNHV_005']
-
-    df_train = df[df['pump_id'].isin(train_pumps)].copy()
-    df_test = df[df['pump_id'].isin(test_pumps)].copy()
+    df_train = df[df['pump_id'].isin(TRAIN_PUMPS)].copy()
+    df_test = df[df['pump_id'].isin(TEST_PUMPS)].copy()
 
     print(f"Обучающая выборка (насосы 1-4): {len(df_train):,} строк")
     print(f"Тестовая выборка  (насос 5):    {len(df_test):,} строк")
@@ -389,7 +244,7 @@ if __name__ == "__main__":
     else:
         print("В тестовой выборке аварий не найдено.")
 
-    # 9. Сохранение лучшей модели (XGBoost) для инференса и XAI
+    # 9. Сохранение моделей для инференса и XAI
     models_dir = os.path.join(project_root, 'models')
     os.makedirs(models_dir, exist_ok=True)
     
@@ -403,6 +258,6 @@ if __name__ == "__main__":
     print(f"Модели успешно сохранены в:\n{models_dir}")
 
     # 10. Анализ recall по типам отказа
-    raw_data_path = os.path.join(project_root, 'data', 'raw', 'enterprise_pump_fleet.csv')
+    raw_data_path = os.path.join(project_root, 'data', 'raw', 'industrial_pumps_dataset.csv')
     analyze_fault_recall(xgb_model, df_test, FEATURE_COLS, output_dir,  # type: ignore
                          raw_data_path=raw_data_path)

@@ -29,8 +29,14 @@
 import pandas as pd
 import numpy as np
 import os
+import sys
 from datetime import datetime, timedelta
-import matplotlib.pyplot as plt
+
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+from config.settings import THRESHOLDS, FAULT_TYPES, FAULT_WEIGHTS, PUMP_SEEDS
+from visualisation_instruments import plot_smart_episode
 
 
 class PumpDataGenerator:
@@ -38,46 +44,54 @@ class PumpDataGenerator:
     Генератор данных на основе конечного автомата (State Machine).
     Каждый физический параметр моделируется AR(1)-процессом:
         x[t] = μ + φ·(x[t-1] - μ) + ε[t]
-    где φ — инерция сигнала, μ — целевое среднее, ε — белый шум.
+    где φ — инерция сигнала, μ — целевое среднее, ε — белый шум,
+    t - текущий момент времени, t-1 - предыдущий момент времени.
     """
 
-    # Физические пороги по ГОСТ 32601-2013 и мануалу МНХВ
-    VIB_WARNING   = 3.0    # мм/с
-    VIB_CRITICAL  = 8.0    # мм/с
-    TEMP_WARNING  = 82.0   # °C
-    TEMP_CRITICAL = 93.0   # °C
+    VIB_WARNING = THRESHOLDS['vibration']['warning']
+    VIB_CRITICAL = THRESHOLDS['vibration']['critical']
+    TEMP_WARNING = THRESHOLDS['temperature']['warning']
+    TEMP_CRITICAL = THRESHOLDS['temperature']['critical']
 
-    # Типы отказа и их доли среди аварийных циклов
-    FAULT_TYPES   = ['overheat', 'cavitation', 'electrical']
-    FAULT_WEIGHTS = [0.55, 0.30, 0.15]
+    FAULT_TYPES = FAULT_TYPES
+    FAULT_WEIGHTS = FAULT_WEIGHTS
 
-    def __init__(self, pump_id, start_date='2026-04-01 00:00:00', total_days=60):
-        self.pump_id       = pump_id
-        self.start_date    = datetime.strptime(start_date, '%Y-%m-%d %H:%M:%S')
-        self.total_days    = total_days
+    def __init__(self, pump_id, start_date='2026-04-01 00:00:00', total_days=90):
+        self.pump_id = pump_id
+        self.start_date = datetime.strptime(start_date, '%Y-%m-%d %H:%M:%S')
+        self.total_days = total_days
         self.total_minutes = total_days * 24 * 60
 
-        self.project_root  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        self.raw_dir       = os.path.join(self.project_root, 'data', 'raw')
+        self.project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.raw_dir = os.path.join(self.project_root, 'data', 'raw')
         self.processed_dir = os.path.join(self.project_root, 'data', 'processed')
-        self.graph_dir     = os.path.join(self.project_root, 'data', 'graphs')
+        self.graph_dir = os.path.join(self.project_root, 'data', 'graphs')
 
-        self.ambient_temp  = 20.0
-        self.current_temp  = self.ambient_temp
+        self.ambient_temp = 20.0
+        self.current_temp = self.ambient_temp
 
-        self.data              = []
-        self.current_time      = self.start_date
+        self.data = []
+        self.current_time = self.start_date
         self.minutes_generated = 0
 
         # AR(1)-состояние: инициализация нулями для плавного старта
-        self.last_vib   = 0.0
-        self.last_curr  = 0.0
-        self.last_press = 0.0
+        self.last_vib = 0.0     # вибрация
+        self.last_curr = 0.0    # ток
+        self.last_press = 0.0   # давление
 
     # Утилиты
 
     @staticmethod
     def _get_state_name(state: int) -> str:
+        """
+        Наименование текущего режима:
+            - Off (0) - Оборудование выключено;
+            - Startup (1) - Запуск оборудования;
+            - Healthy (2) - Нормальная работа;
+            - Degradation (3) - Деградация значений, рост/падение критических показателей;
+            - Critical (4) - Работа оборудования на уровне отказа/поломки.
+        """
+
         return {0: 'Off', 1: 'Startup', 2: 'Healthy',
                 3: 'Degradation', 4: 'Critical'}.get(state, 'Unknown')
 
@@ -85,36 +99,38 @@ class PumpDataGenerator:
                     fault_type='none',
                     anomaly_vibration=0, anomaly_temperature=0, anomaly_current=0):
         """Запись одной минуты показаний в датасет."""
+
         self.data.append({
-            'timestamp':          self.current_time,
-            'pump_id':            self.pump_id,
-            'state':              state,
-            'state_name':         self._get_state_name(state),
-            'fault_type':         fault_type,
-            'vibration':          round(max(0.0, vib), 3),
-            'temperature':        round(max(self.ambient_temp, temp), 2),
-            'current':            round(max(0.0, curr), 2),
-            'pressure':           round(max(0.0, press), 3),
-            'anomaly_vibration':  anomaly_vibration,    # 1 = аппаратный сбой датчика вибрации
+            'timestamp': self.current_time,
+            'pump_id': self.pump_id,
+            'state': state,
+            'state_name': self._get_state_name(state),
+            'fault_type': fault_type,
+            'vibration': round(max(0.0, vib), 3),
+            'temperature': round(max(self.ambient_temp, temp), 2),
+            'current': round(max(0.0, curr), 2),
+            'pressure': round(max(0.0, press), 3),
+            'anomaly_vibration': anomaly_vibration,     # 1 = аппаратный сбой датчика вибрации
             'anomaly_temperature': anomaly_temperature, # 1 = аппаратный сбой термопары
-            'anomaly_current':    anomaly_current,      # 1 = аппаратный сбой датчика тока
+            'anomaly_current': anomaly_current,         # 1 = аппаратный сбой датчика тока
         })
-        self.current_time      += timedelta(minutes=1)
+        self.current_time += timedelta(minutes=1)
         self.minutes_generated += 1
 
     # Генераторы состояний
 
     def generate_off(self, duration_mins: int):
         """
-        Состояние 0 — насос выключен.
+        Состояние 0 — оборудование выключено.
         Температура экспоненциально остывает.
         Механические сигналы затухают через AR(1) с коэффициентом 0.5.
         """
+
         for _ in range(duration_mins):
             self.current_temp = (self.ambient_temp
                                  + (self.current_temp - self.ambient_temp) * 0.95)
-            self.last_vib   = self.last_vib   * 0.5 + np.random.normal(0, 0.04)
-            self.last_curr  = self.last_curr  * 0.5 + np.random.normal(0, 0.08)
+            self.last_vib = self.last_vib * 0.5 + np.random.normal(0, 0.04)
+            self.last_curr = self.last_curr * 0.5 + np.random.normal(0, 0.08)
             self.last_press = self.last_press * 0.5 + np.random.normal(0, 0.008)
             self._append_row(0, self.last_vib, self.current_temp,
                              self.last_curr, self.last_press)
@@ -125,11 +141,12 @@ class PumpDataGenerator:
         Резкий всплеск тока (~150 А, потом спадает), гидроудар давления,
         кратковременный рост вибрации до 4–5 мм/с.
         """
+
         duration = np.random.randint(2, 4)
         for i in range(duration):
-            self.current_temp  += np.random.normal(4.0, 0.8)
-            self.last_vib   = np.random.normal(4.5, 0.5)
-            self.last_curr  = np.random.normal(150 * (1 - 0.6 * i / duration), 10)
+            self.current_temp += np.random.normal(4.0, 0.8)
+            self.last_vib = np.random.normal(4.5, 0.5)
+            self.last_curr = np.random.normal(150 * (1 - 0.6 * i / duration), 10)
             self.last_press = np.random.normal(1.8, 0.12)
             self._append_row(1, self.last_vib, self.current_temp,
                              self.last_curr, self.last_press)
@@ -138,32 +155,32 @@ class PumpDataGenerator:
         """
         Состояние 2 — штатная работа.
         AR(1): x[t] = μ + φ·(x[t-1] - μ) + ε[t]
-        φ = 0.9 (сильная инерция), μ — физические set-points агрегата.
+        φ = 0.9 (сильная инерция), μ — физические базовые значения агрегата.
         С вероятностью 0.1% — аппаратный сбой одного датчика (изолированный выброс).
         """
+
         PHI = 0.9
         for _ in range(duration_mins):
-            self.current_temp = (self.current_temp * PHI
-                                 + 70.0 * (1 - PHI)
-                                 + np.random.normal(0, 0.4))
-            self.last_vib   = (self.last_vib   * 0.88 + 1.8  * 0.12
-                               + np.random.normal(0, 0.08))
-            self.last_curr  = (self.last_curr  * 0.9  + 50.0 * 0.1
-                               + np.random.normal(0, 0.8))
-            self.last_press = (self.last_press * 0.85 + 1.5  * 0.15
-                               + np.random.normal(0, 0.018))
+            self.current_temp = (self.current_temp * PHI 
+                                 + 70.0 * (1 - PHI) + np.random.normal(0, 0.4))
+            self.last_vib = (self.last_vib * 0.88 
+                             + 1.8 * 0.12 + np.random.normal(0, 0.08))
+            self.last_curr = (self.last_curr * 0.9 
+                              + 50.0 * 0.1 + np.random.normal(0, 0.8))
+            self.last_press = (self.last_press * 0.85 
+                               + 1.5  * 0.15 + np.random.normal(0, 0.018))
 
             anom_vib = anom_temp = anom_curr = 0
             vib_out  = self.last_vib
-            if np.random.rand() < 0.001:
+            if np.random.rand() <= 0.001:
                 # Разовый аппаратный сбой — один из трёх датчиков
                 sensor = np.random.choice(['vib', 'temp', 'curr'])
                 if sensor == 'vib':
-                    vib_out  = np.random.normal(9.5, 0.5);  anom_vib  = 1
+                    vib_out = np.random.normal(9.5, 0.5); anom_vib = 1
                 elif sensor == 'temp':
                     self.current_temp = np.random.normal(97.0, 1.5); anom_temp = 1
                 else:
-                    self.last_curr    = np.random.normal(90.0, 3.0); anom_curr = 1
+                    self.last_curr = np.random.normal(90.0, 3.0); anom_curr = 1
 
             self._append_row(2, vib_out, self.current_temp, self.last_curr, self.last_press,
                              anomaly_vibration=anom_vib,
@@ -176,78 +193,92 @@ class PumpDataGenerator:
         Параметры, не участвующие в данном типе отказа, удерживаются у нормы.
         Это обеспечивает разные сигнатуры, которые XAI (SHAP) должен распознать.
         """
+
         temp_start = self.current_temp
 
         if fault_type == 'overheat':
-            # Тип А: температура↑, ток↑ (волатильный), вибрация умеренно↑, давление норма
+            # Тип А: рост температуры, рост тока (волатильный), 
+            # умеренный рост вибрации, давление слабо падает по мере износа
             temp_trend = np.linspace(temp_start, 91.0, duration_mins)
             vib_trend  = np.linspace(2.0, 5.5, duration_mins)
             curr_trend = np.linspace(50.0, 66.0, duration_mins)
+            press_trend = np.linspace(1.5, 1.4, duration_mins)
             for i in range(duration_mins):
                 self.current_temp = temp_trend[i] + np.random.normal(0, 0.5)
-                self.last_vib   = vib_trend[i]  + np.random.normal(0, 0.18)
-                self.last_curr  = curr_trend[i] + np.random.normal(0, 2.0)   # высокая волатильность
-                self.last_press = 1.5 + np.random.normal(0, 0.03)
+                self.last_vib = vib_trend[i] + np.random.normal(0, 0.18)
+                self.last_curr = curr_trend[i] + np.random.normal(0, 2.0)   # высокая волатильность
+                self.last_press = (self.last_press * 0.85 
+                                   + press_trend[i] * 0.15 + np.random.normal(0, 0.03))
                 self._append_row(3, self.last_vib, self.current_temp,
                                  self.last_curr, self.last_press, fault_type='overheat')
 
         elif fault_type == 'cavitation':
-            # Тип Б: вибрация↑↑, давление↓ (пульсация), температура и ток В НОРМЕ
-            vib_trend   = np.linspace(2.5, 7.5, duration_mins)
-            press_trend = np.linspace(1.5, 0.9, duration_mins)   # падение напора
+            # Тип Б: сильный рост вибрации, падение давления (пульсация), 
+            # температура и ток в норме
+            vib_trend = np.linspace(2.5, 7.5, duration_mins)
+            press_trend = np.linspace(1.5, 0.9, duration_mins)  # падение напора
             for i in range(duration_mins):
                 self.current_temp = (self.current_temp * 0.9
-                                     + 70.0 * 0.1
-                                     + np.random.normal(0, 0.5))
-                self.last_vib   = vib_trend[i]   + np.random.normal(0, 0.3)
-                self.last_curr  = (self.last_curr * 0.9
-                                   + 50.0 * 0.1
-                                   + np.random.normal(0, 1.0))
+                                     + 70.0 * 0.1 + np.random.normal(0, 0.5))
+                self.last_vib = vib_trend[i] + np.random.normal(0, 0.3)
+                self.last_curr = (self.last_curr * 0.9
+                                  + 50.0 * 0.1 + np.random.normal(0, 1.0))
                 # Пульсация давления — высокая дисперсия на падающем тренде
                 self.last_press = press_trend[i] + np.random.normal(0, 0.08)
                 self._append_row(3, self.last_vib, self.current_temp,
                                  self.last_curr, self.last_press, fault_type='cavitation')
 
         elif fault_type == 'electrical':
-            # Тип В: ток↑↑ + скачки (spike 10%), вибрация и температура В ЗЕЛЁНОЙ ЗОНЕ
+            # Тип В: сильный рост тока + скачки (10%), 
+            # вибрация, температура и давление в норме
             curr_trend = np.linspace(50.0, 72.0, duration_mins)
             for i in range(duration_mins):
                 self.current_temp = (self.current_temp * 0.9
-                                     + 72.0 * 0.1
-                                     + np.random.normal(0, 0.6))
-                self.last_vib   = (self.last_vib * 0.88
-                                   + 2.0 * 0.12
-                                   + np.random.normal(0, 0.15))
-                spike           = np.random.normal(0, 6.0) if np.random.rand() < 0.1 else 0.0
-                self.last_curr  = curr_trend[i] + np.random.normal(0, 3.0) + spike
+                                     + 72.0 * 0.1 + np.random.normal(0, 0.6))
+                self.last_vib = (self.last_vib * 0.88
+                                 + 2.0 * 0.12 + np.random.normal(0, 0.15))
+                spike = np.random.normal(0, 6.0) if np.random.rand() < 0.1 else 0.0
+                self.last_curr = curr_trend[i] + np.random.normal(0, 3.0) + spike
                 self.last_press = (self.last_press * 0.85
-                                   + 1.45 * 0.15
-                                   + np.random.normal(0, 0.04))
+                                   + 1.45 * 0.15 + np.random.normal(0, 0.04))
                 self._append_row(3, self.last_vib, self.current_temp,
                                  self.last_curr, self.last_press, fault_type='electrical')
 
     def generate_critical(self, duration_mins, fault_type):
         """Критический отказ — устойчивое нарушение порогов с сохранением AR(1)-памяти."""
+
         PHI = 0.8   # память сигнала и в аварии: значения инерционны, не скачут случайно
         for _ in range(duration_mins):
+            # AR(1) с привязкой к типу аварии
             if fault_type == 'overheat':
-                # AR(1) вокруг аварийных уровней (а не независимый normal)
-                self.current_temp = self.current_temp * PHI + 96.0 * (1-PHI) + np.random.normal(0, 0.8)
-                self.last_vib   = self.last_vib  * PHI + 8.5  * (1-PHI) + np.random.normal(0, 0.4)
-                self.last_curr  = self.last_curr * PHI + 78.0 * (1-PHI) + np.random.normal(0, 2.0)
-                self.last_press = self.last_press * PHI + 1.3 * (1-PHI) + np.random.normal(0, 0.05)
+                self.current_temp = (self.current_temp * PHI 
+                                     + 96.0 * (1-PHI) + np.random.normal(0, 0.8))
+                self.last_vib = (self.last_vib * PHI 
+                                 + 8.5 * (1-PHI) + np.random.normal(0, 0.4))
+                self.last_curr = (self.last_curr * PHI 
+                                  + 78.0 * (1-PHI) + np.random.normal(0, 2.0))
+                self.last_press = (self.last_press * PHI 
+                                   + 1.3 * (1-PHI) + np.random.normal(0, 0.05))
 
             elif fault_type == 'cavitation':
-                self.current_temp = self.current_temp * 0.9 + 74.0 * 0.1 + np.random.normal(0, 0.8)  # норма
-                self.last_vib   = self.last_vib  * PHI + 9.0  * (1-PHI) + np.random.normal(0, 0.5)
-                self.last_curr  = self.last_curr * 0.9 + 52.0 * 0.1 + np.random.normal(0, 1.0)        # норма
-                self.last_press = self.last_press * PHI + 0.7 * (1-PHI) + np.random.normal(0, 0.06)
+                self.current_temp = (self.current_temp * 0.9 
+                                     + 74.0 * 0.1 + np.random.normal(0, 0.8))   # норма
+                self.last_vib = (self.last_vib * PHI 
+                                 + 9.0 * (1-PHI) + np.random.normal(0, 0.5))
+                self.last_curr = (self.last_curr * 0.9 
+                                  + 52.0 * 0.1 + np.random.normal(0, 1.0))      # норма
+                self.last_press = (self.last_press * PHI 
+                                   + 0.7 * (1-PHI) + np.random.normal(0, 0.06))
 
             elif fault_type == 'electrical':
-                self.current_temp = self.current_temp * 0.9 + 75.0 * 0.1 + np.random.normal(0, 0.8)   # норма
-                self.last_vib   = self.last_vib  * 0.85 + 2.2 * 0.15 + np.random.normal(0, 0.2)        # норма
-                self.last_curr  = self.last_curr * PHI + 95.0 * (1-PHI) + np.random.normal(0, 3.5)
-                self.last_press = self.last_press * 0.85 + 1.4 * 0.15 + np.random.normal(0, 0.05)
+                self.current_temp = (self.current_temp * 0.9 
+                                     + 75.0 * 0.1 + np.random.normal(0, 0.8))   # норма
+                self.last_vib = (self.last_vib * 0.85 
+                                 + 2.2 * 0.15 + np.random.normal(0, 0.2))       # норма
+                self.last_curr = (self.last_curr * PHI 
+                                  + 95.0 * (1-PHI) + np.random.normal(0, 3.5))
+                self.last_press = (self.last_press * 0.85 
+                                   + 1.4 * 0.15 + np.random.normal(0, 0.05))
 
             self._append_row(4, self.last_vib, self.current_temp,
                              self.last_curr, self.last_press, fault_type=fault_type)
@@ -255,7 +286,7 @@ class PumpDataGenerator:
     # Основной метод генерации
 
     def generate_dataset(self) -> pd.DataFrame:
-        print(f"Генерация данных: {self.total_days} дней, "
+        print(f"Генерация данных: {self.total_days} дней,"
               f"шаг 1 мин → {self.total_minutes:,} строк")
 
         while self.minutes_generated < self.total_minutes:
@@ -272,7 +303,7 @@ class PumpDataGenerator:
             if cycle_type == 'normal':
                 self.generate_healthy(np.random.randint(12 * 60, 48 * 60))
             else:
-                # Выбираем тип отказа по реалистичному распределению A/Б/В
+                # Тип отказа по реалистичному распределению A/Б/В
                 fault = np.random.choice(self.FAULT_TYPES, p=self.FAULT_WEIGHTS)
                 self.generate_healthy(np.random.randint(12 * 60, 24 * 60))
                 if self.minutes_generated >= self.total_minutes:
@@ -282,158 +313,31 @@ class PumpDataGenerator:
                     break
                 self.generate_critical(np.random.randint(10, 60), fault)
 
-        df: pd.DataFrame = pd.DataFrame(self.data).iloc[:self.total_minutes]  # type: ignore[assignment]
+        df: pd.DataFrame = pd.DataFrame(self.data).iloc[:self.total_minutes] # type: ignore[assignment]
         self._print_state_distribution(df)
         return df
 
     @staticmethod
     def _print_state_distribution(df: pd.DataFrame):
         """Статистика по состояниям и типам отказа."""
+
         print("\nРаспределение состояний:")
         counts = df['state_name'].value_counts()
-        total  = len(df)
+        total = len(df)
         for name, cnt in counts.items():
-            print(f"  {name:<12}: {cnt:>7,} мин  ({100 * cnt / total:5.1f}%)")
+            print(f"  {name:<12}: {cnt:>7,} мин. ({100 * cnt / total:5.1f}%)")
 
         fault_rows = df[df['fault_type'] != 'none']
         if not fault_rows.empty:
             print("\nРаспределение типов отказа (Degradation + Critical):")
             for ft, cnt in fault_rows['fault_type'].value_counts().items():
                 pct = 100 * cnt / len(fault_rows)
-                print(f"  {ft:<12}: {cnt:>7,} мин  ({pct:5.1f}%)")
-
-    # Визуализация
-
-    def plot_smart_episode(self, df: pd.DataFrame, hours: int = 30):
-        """
-        Строит 5-панельный график окна вокруг последнего зафиксированного отказа.
-        Показывает переход Healthy → Degradation → Critical с аннотацией типа отказа
-        и фоновой подсветкой по fault_type.
-
-        Панели: Вибрация | Температура | Ток | Давление | Состояние
-        """
-        critical_indices = df[df['state'] == 4].index
-        if len(critical_indices) > 0:
-            last_idx  = critical_indices[-1]
-            end_idx   = min(len(df), last_idx + 60)
-            start_idx = max(0, end_idx - hours * 60)
-            sample    = df.iloc[start_idx:end_idx]
-            print(f"График: окно вокруг отказа (индекс {last_idx})")
-        else:
-            sample = df.iloc[-hours * 60:]
-            print("Отказов не найдено. Построен график последних часов.")
-
-        # Определяем тип отказа в окне для заголовка
-        fault_mode   = sample[sample['fault_type'] != 'none']['fault_type'].mode()
-        fault_label  = fault_mode.iloc[0] if not fault_mode.empty else 'none'
-        fault_display = {
-            'overheat':   'Тип А - перегрев (износ подшипника)',
-            'cavitation': 'Тип Б — кавитация (повреждение колеса)',
-            'electrical': 'Тип В — аномалия тока (электрика)',
-        }.get(fault_label, 'нет отказа')
-
-        fig, axs = plt.subplots(5, 1, figsize=(14, 15), sharex=True)
-        fig.suptitle(
-            f'Имитационная модель МНХВ: окно развития дефекта\n'
-            f'{fault_display}  |  AR(1)-процессы с типизированными сигнатурами',
-            fontsize=13, fontweight='bold'
-        )
-
-        # Фоновая подсветка по типу отказа
-        fault_shade = {
-            'overheat':   '#FFD0D0',
-            'cavitation': '#D0E4FF',
-            'electrical': '#EDD0FF',
-        }
-        for ft, fc in fault_shade.items():
-            mask = (sample['fault_type'] == ft).values.astype(int)
-            diffs = np.diff(mask, prepend=0, append=0)
-            for s, e in zip(np.where(diffs == 1)[0], np.where(diffs == -1)[0]):
-                ts_s = sample['timestamp'].iloc[min(s,   len(sample) - 1)]
-                ts_e = sample['timestamp'].iloc[min(e,   len(sample) - 1)]
-                for ax in axs:
-                    ax.axvspan(ts_s, ts_e, color=fc, alpha=0.28, zorder=0)
-
-        anom_vib  = sample[sample['anomaly_vibration']  == 1]
-        anom_temp = sample[sample['anomaly_temperature'] == 1]
-        anom_curr = sample[sample['anomaly_current']    == 1]
-
-        # Панель 0 — Вибрация
-        axs[0].plot(sample['timestamp'], sample['vibration'], color='steelblue', lw=0.8)
-        axs[0].axhline(self.VIB_WARNING,  color='orange', ls='--', lw=1.2,
-                       label=f'Warning ({self.VIB_WARNING} мм/с)')
-        axs[0].axhline(self.VIB_CRITICAL, color='red',    ls='--', lw=1.2,
-                       label=f'Critical ({self.VIB_CRITICAL} мм/с)')
-        if not anom_vib.empty:
-            axs[0].scatter(anom_vib['timestamp'], anom_vib['vibration'],
-                           color='purple', zorder=5, s=30, label='Помеха датчика')
-        axs[0].set_ylabel('Вибрация (мм/с)')
-        axs[0].legend(fontsize=8)
-        axs[0].grid(True, alpha=0.4)
-
-        # Панель 1 — Температура
-        axs[1].plot(sample['timestamp'], sample['temperature'], color='tomato', lw=0.8)
-        axs[1].axhline(self.TEMP_WARNING,  color='orange',  ls='--', lw=1.2,
-                       label=f'Warning ({self.TEMP_WARNING} °C)')
-        axs[1].axhline(self.TEMP_CRITICAL, color='darkred', ls='--', lw=1.2,
-                       label=f'Critical ({self.TEMP_CRITICAL} °C)')
-        if not anom_temp.empty:
-            axs[1].scatter(anom_temp['timestamp'], anom_temp['temperature'],
-                           color='purple', zorder=5, s=30, label='Помеха датчика')
-        axs[1].set_ylabel('Температура (°C)')
-        axs[1].legend(fontsize=8)
-        axs[1].grid(True, alpha=0.4)
-
-        # Панель 2 — Ток
-        axs[2].plot(sample['timestamp'], sample['current'], color='darkorange', lw=0.8)
-        if not anom_curr.empty:
-            axs[2].scatter(anom_curr['timestamp'], anom_curr['current'],
-                           color='purple', zorder=5, s=30, label='Помеха датчика')
-        axs[2].set_ylabel('Ток (А)')
-        axs[2].legend(fontsize=8)
-        axs[2].grid(True, alpha=0.4)
-
-        # Панель 3 — Давление (ключевой сигнал для Типа Б)
-        axs[3].plot(sample['timestamp'], sample['pressure'], color='seagreen', lw=0.8)
-        axs[3].axhline(1.5, color='grey', ls=':', lw=1.0, label='Норма (1.5 МПа)')
-        axs[3].set_ylabel('Давление (МПа)')
-        axs[3].legend(fontsize=8)
-        axs[3].grid(True, alpha=0.4)
-
-        # Панель 4 — Состояние конечного автомата
-        color_map = {0: 'grey', 1: 'blue', 2: 'green', 3: 'orange', 4: 'red'}
-        for _, row in sample.iterrows():
-            axs[4].axvline(row['timestamp'],
-                           color=color_map.get(row['state'], 'black'),
-                           alpha=0.15, lw=1)
-        axs[4].plot(sample['timestamp'], sample['state'],
-                    color='black', drawstyle='steps-post', lw=1.5)
-        axs[4].set_yticks([0, 1, 2, 3, 4])
-        axs[4].set_yticklabels(['Off', 'Startup', 'Healthy', 'Degradation', 'Critical'])
-        axs[4].set_ylabel('Состояние')
-        axs[4].grid(True, alpha=0.4)
-
-        plt.tight_layout()
-
-        os.makedirs(self.graph_dir, exist_ok=True)
-        plot_path = os.path.join(self.graph_dir, 'simulation_plot_targeted.png')
-        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        print(f"График сохранён: {plot_path}")
+                print(f"  {ft:<12}: {cnt:>7,} мин. ({pct:5.1f}%)")
 
 
 # Точка входа
 
 if __name__ == "__main__":
-    # Явные seed'ы для каждого насоса — воспроизводимость независима от порядка итерации
-    PUMP_SEEDS = {
-        'MNHV_001': 42,
-        'MNHV_002': 137,
-        'MNHV_003': 2025,
-        'MNHV_004': 31415,
-        'MNHV_005': 99991,
-    }
-
     fleet_dfs = []
 
     for pump_id, seed in PUMP_SEEDS.items():
@@ -441,25 +345,25 @@ if __name__ == "__main__":
         print(f"\n--- Генерация данных для {pump_id} (seed={seed}) ---")
         generator = PumpDataGenerator(pump_id=pump_id,
                                       start_date='2026-04-01 00:00:00',
-                                      total_days=60)
+                                      total_days=90)
         df = generator.generate_dataset()
 
         # Демонстрационный график — только для первого насоса
         if pump_id == 'MNHV_001':
             print(f"Построение демонстрационного графика для {pump_id}...")
-            generator.plot_smart_episode(df, hours=30)
+            plot_smart_episode(df, hours=60)
 
         fleet_dfs.append(df)
 
-    print("\nСборка единого датасета предприятия...")
+    print("\nСборка единого датасета имитированного предприятия...")
     enterprise_df = pd.concat(fleet_dfs, ignore_index=True)
 
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     os.makedirs(os.path.join(project_root, 'data', 'raw'), exist_ok=True)
-    enterprise_path = os.path.join(project_root, 'data', 'raw', 'enterprise_pump_fleet.csv')
+    enterprise_path = os.path.join(project_root, 'data', 'raw', 'industrial_pumps_dataset.csv')
     enterprise_df.to_csv(enterprise_path, index=False)
 
-    print(f"\nПарк оборудования успешно сгенерирован!")
+    print(f"\nПарк оборудования сгенерирован.")
     print(f"Всего насосов: {len(PUMP_SEEDS)} | Всего строк: {len(enterprise_df)}")
 
     # Валидация: средние значения по типам отказа в Critical-состоянии
