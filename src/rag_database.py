@@ -85,6 +85,7 @@ class TextKnowledgeLoader:
 
 
 # Загрузчик PDF с сохранением структуры
+# Оставлен в качестве расширения возможностей, в текущей версии не используется
 
 class StructuredPDFLoader:
     """
@@ -164,6 +165,7 @@ class StructuredPDFLoader:
         Returns:
             Список всех Document из указанных файлов.
         """
+
         doc_type_map = doc_type_map or {}
         all_documents: List[Document] = []
 
@@ -174,7 +176,8 @@ class StructuredPDFLoader:
         )
 
         if not pdf_files:
-            print(f"  [WARN] PDF-файлы не найдены в {data_dir}")
+            print("  [INFO] PDF к загрузке нет (база использует .md); "
+                "StructuredPDFLoader с починкой лигатур доступен для будущих PDF.")
             return all_documents
 
         for pdf_path in pdf_files:
@@ -383,10 +386,14 @@ class KnowledgeBaseManager:
         Это устраняет проблему, когда поиск находит только уставки,
         но не находит раздел "Действия оператора".
         """
+
         symptoms = symptom_vector_dict.get('top_symptoms', [])
         prob = symptom_vector_dict.get('critical_probability', 0)
         sensor_map = {'vibration': 'вибрация', 'temperature': 'температура',
                     'current': 'ток', 'pressure': 'давление'}
+        inferred_fault = symptom_vector_dict.get('inferred_fault')
+        fault_ru = {'overheat': 'перегрев', 'cavitation': 'кавитация',
+                    'electrical': 'электрическая неисправность'}.get(inferred_fault, '') # type: ignore
 
         # Запрос 1: описание состояния (пороги, нормативы)
         parts = [f"Вероятность аварии: {prob}%."]
@@ -401,7 +408,7 @@ class KnowledgeBaseManager:
             sensor_map.get(s.get('sensor', ''), '') for s in symptoms
         )
         query_prescriptive = (
-            f"причина и устранение неисправности: {symptom_words}. "
+            f"причина и устранение неисправности: {symptom_words} {fault_ru}. "
             f"Действия оператора, диагностика отказа, связанные работы ТОиР, "
             f"капитальный ремонт, рекомендации."
         )
@@ -438,6 +445,38 @@ class KnowledgeBaseManager:
             filter={'doc_type': 'schedule'}   # фильтр только по графику ТО
         )
         return [(doc, score) for doc, score in results if score <= SCHEDULE_THRESHOLD]
+    
+    def search_repair_works(self, fault_type: str, k: int = 2):
+        """
+        Прямой поиск «Связанных работ ТОиР» по типу отказа в регламенте (doc_type='sop').
+        Отделён от поиска по симптомам: работы ремонтной бригады по дистанции
+        проигрывают уставкам в общем top-k и не доходят до контекста.
+        """
+        
+        fault_ru = {'overheat': 'перегрев', 'cavitation': 'кавитация',
+                    'electrical': 'электрическая неисправность'}.get(fault_type, '')
+        if not fault_ru:
+            return []
+        query = (f"связанные работы ТОиР при {fault_ru}: капитальный ремонт, "
+                f"дефектоскопия, замена, центровка, балансировка, ТО-1, ТО-2")
+        
+        return self.search(query, k=k, doc_type_filter='sop')
+    
+    def search_operator_actions(self, fault_type: str, k: int = 2):
+        """
+        Прямой поиск «Действий оператора» сценария в регламенте (doc_type='sop').
+        Отделяет авторитетный источник предписаний (регламент) от справочного
+        мануала МНХВ, чтобы действия оператора не смешивались из двух документов.
+        """
+
+        fault_ru = {'overheat': 'перегрев', 'cavitation': 'кавитация',
+                    'electrical': 'электрическая неисправность'}.get(fault_type, '')
+        if not fault_ru:
+            return []
+        query = (f"действия оператора при {fault_ru}: останов агрегата, изоляция, "
+                f"снижение оборотов, прикрыть задвижку, аварийный останов")
+        
+        return self.search(query, k=k, doc_type_filter='sop')
 
 
 # Точка входа 
@@ -481,15 +520,33 @@ if __name__ == "__main__":
         print(f"{'─'*55}")
         symptom_vec = {
             'critical_probability': 87.3,
+            'inferred_fault': 'overheat',
             'top_symptoms': [
-                {'sensor': 'vibration',   'value': 8.7, 'shap_weight':  0.42},
-                {'sensor': 'temperature', 'value': 94.1,'shap_weight':  0.31},
-                {'sensor': 'pressure',    'value': 1.1, 'shap_weight': -0.18},
+                {'sensor': 'vibration',   'value': 8.1, 'shap_weight':  0.31},
+                {'sensor': 'temperature', 'value': 94.1,'shap_weight':  0.42},
+                {'sensor': 'pressure',    'value': 1.3, 'shap_weight': -0.18},
             ]
         }
-        results = kb.search_by_symptoms(symptom_vec, k=3)
+        results_symptoms = kb.search_by_symptoms(symptom_vec, k=3)
 
-        for i, (doc, score) in enumerate(results, 1):
+        for i, (doc, score) in enumerate(results_symptoms, 1):
+            print(f"\n[{i}] Distance: {score:.4f} | "
+                  f"Тип: {doc.metadata.get('doc_type')} | "
+                  f"Источник: {doc.metadata.get('source')}")
+            # Убираем prefix перед выводом
+            clean_text = doc.page_content.replace('passage: ', '', 1)
+            print(f"    {clean_text[:250]}...")
+
+        # Шаг 4: Проверка поиска в графике обслуживания
+        scheduled_maintenance = 'MNHV_005'
+
+        print(f"\n{'─'*55}")
+        print(f"Тестовый поиск (плановое обслуживание насоса {scheduled_maintenance}):")
+        print(f"{'─'*55}")
+
+        results_schedule = kb.search_maintenance_schedule(scheduled_maintenance)
+
+        for i, (doc, score) in enumerate(results_schedule, 1):
             print(f"\n[{i}] Distance: {score:.4f} | "
                   f"Тип: {doc.metadata.get('doc_type')} | "
                   f"Источник: {doc.metadata.get('source')}")

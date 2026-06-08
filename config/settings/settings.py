@@ -67,8 +67,8 @@ CHUNK_CONFIG = {
 # RAG: карта загружаемых файлов (явный allowlist) 
 # Только эти файлы попадают в ChromaDB; остальные игнорируются.
 DOC_TYPE_MAP = {
-    'tm_regulation.pdf': 'sop',
-    'tm_schedule.pdf': 'schedule',
+    'tm_regulation.md': 'sop',
+    'tm_schedule.md': 'schedule',
     'gost_extract.md': 'gost',
     'mnhv_extract.md': 'manual',
     'diagnostics_extended.md': 'diagnostics',
@@ -81,3 +81,27 @@ LLM_MODELS = [
     'second_constantine/yandex-gpt-5-lite:8b',
 ]
 DEFAULT_LLM_MODEL = LLM_MODELS[0]
+
+MODEL_LABELS = {
+    'qwen3.5:9b':                              'Qwen 3.5 9B',
+    'phi4:14b':                                'Phi-4 14B',
+    'second_constantine/yandex-gpt-5-lite:8b': 'YandexGPT-5 8B',
+}
+
+# Обязательные разделы для проверки формата
+REQUIRED_SECTIONS = ['СТАТУС', 'ДИАГНОЗ', 'ПРЕДПИСАНИЕ', 'ТОиР']
+
+# Маркеры явной атрибуции источника (модель ссылается на документ, а не на "Сценарий А")
+SOURCE_MARKERS = ['регламент', 'tm_regulation', 'гост', 'мануал',
+                  'руководств', 'источник', 'документ',
+                  'mnhv_extract', 'tm_regulation']
+
+# Ключевые слова ремонтных работ (а не даты планового ремонта)
+TOIR_WORK_MARKERS = ['дефектоскоп', 'балансиров', 'замена', 'центров', 'изоляц',
+                     'подшипник', 'смазк', 'то-1', 'то-2', 'фильтр', 'уплотнен']
+
+# Для ai_agent_benchmark heatmap графика
+DIRECTIONS = {'Время_с':'lower', 'Токен_с':'higher', 'Токенов':'lower', 
+              'Формат':'higher', 'Атрибуция':'higher'}
+FMT = {'Время_с':'{:.1f}с','Токен_с':'{:.1f}','Формат':'{:.0%}',
+       'Атрибуция':'{:.0%}','ТОиР_работы':'{:.0%}'}

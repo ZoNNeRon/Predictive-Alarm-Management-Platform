@@ -146,7 +146,8 @@ if __name__ == "__main__":
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     processed_data_path = os.path.join(project_root, 'data', 'processed', 
                                        'preprocessed_pumps_dataset.csv')
-    output_dir = os.path.join(project_root, 'data', 'graphs')
+    save_graps_dir = os.path.join(project_root, 'data', 'graphs')
+    save_tables_dir = os.path.join(project_root, 'data', 'tables')
 
     # 1. Загрузка данных
     print("Загрузка обработанных данных...")
@@ -219,7 +220,7 @@ if __name__ == "__main__":
     ]
 
     # 7. Три технических графика
-    plot_all(metrics, y_test, output_dir)
+    plot_all(metrics, y_test, save_graps_dir)
 
     # 8. Демонстрация AlarmManager (Alarm Shelving)
     print(f"\n{'='*50}")
@@ -259,5 +260,5 @@ if __name__ == "__main__":
 
     # 10. Анализ recall по типам отказа
     raw_data_path = os.path.join(project_root, 'data', 'raw', 'industrial_pumps_dataset.csv')
-    analyze_fault_recall(xgb_model, df_test, FEATURE_COLS, output_dir,  # type: ignore
-                         raw_data_path=raw_data_path)
+    analyze_fault_recall(xgb_model, df_test, FEATURE_COLS, save_graps_dir,  # type: ignore
+                         save_tables_dir, raw_data_path=raw_data_path)

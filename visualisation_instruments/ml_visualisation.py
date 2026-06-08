@@ -257,3 +257,126 @@ def recall_plot(results: list, signatures, save_dir: str):
     plt.savefig(path, dpi=150, bbox_inches='tight', facecolor='#FFFFFF')
     plt.close()
     print(f"График 4 сохранён: {path}")
+
+def plot_fault_classifier(metrics_list: list, output_dir: str, best_label: str = None):  # type: ignore
+    """
+    Графики классификатора ТИПА отказа (вторая модель). Три фигуры:
+      1. Матрицы ошибок 3x3 по моделям (overheat / cavitation / electrical).
+      2. Сравнение моделей по macro-F1 и balanced accuracy (выбор модели для диплома).
+      3. Раздельная точность по стадии: Recall @ Warning vs Recall @ Critical
+         для лучшей модели — честно показывает, что раннее распознавание (Warning)
+         менее уверенное, чем на аварии (Critical).
+
+    Ожидает metrics_list из fault_classifier_pipeline.evaluate_fault_model():
+      каждый элемент содержит 'label', 'cm', 'macro_f1', 'balanced_acc' и 'stage_recall'.
+    """
+
+    os.makedirs(output_dir, exist_ok=True)
+    short_names = ['Перегрев', 'Кавитация', 'Электрика']  # компактные подписи осей
+
+    # График 1: матрицы ошибок (нормировка по строкам, аннотация — абсолют)
+    fig, axes = plt.subplots(1, len(metrics_list), figsize=(6 * len(metrics_list), 5))
+    if len(metrics_list) == 1:
+        axes = [axes]
+    fig.patch.set_facecolor(LIGHT_BG)
+    fig.suptitle('Матрицы ошибок классификатора типа отказа (тест: MNHV_005)',
+                 color=TEXT_CLR, fontsize=14, fontweight='bold', y=1.05)
+    for ax, m in zip(axes, metrics_list):
+        cm = m['cm'].astype(float)
+        cm_norm = cm / cm.sum(axis=1, keepdims=True).clip(min=1)
+        sns.heatmap(cm_norm, annot=m['cm'], fmt='d', ax=ax, cmap='Blues',
+                    linewidths=0.5, linecolor='#DDDDDD',
+                    xticklabels=short_names, yticklabels=short_names,
+                    cbar=False, annot_kws={'size': 11})
+        _apply_light_style(ax, m['label'])
+        ax.set_xlabel('Предсказано', color=TEXT_CLR)
+        ax.set_ylabel('Истинно', color=TEXT_CLR)
+        for i in range(3):
+            ax.add_patch(plt.Rectangle((i, i), 1, 1, fill=False,  # type: ignore
+                                       edgecolor='#FF8C00', lw=2))
+    plt.tight_layout()
+    p1 = os.path.join(output_dir, 'ML_fault_plot1_confusion_matrix.png')
+    plt.savefig(p1, dpi=150, bbox_inches='tight', facecolor=LIGHT_BG)
+    plt.close(fig)
+    print(f"График 1 (матрицы ошибок типа) сохранён: {p1}")
+
+    # График 2: сравнение моделей (macro-F1, balanced accuracy)
+    metric_keys = ['macro_f1', 'balanced_acc']
+    metric_labels = ['macro-F1', 'Balanced Accuracy']
+    x = np.arange(len(metric_keys))
+    width = 0.8 / len(metrics_list)
+    colors = list(PALETTE.values())
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    fig.patch.set_facecolor(LIGHT_BG)
+    ax.set_facecolor(LIGHT_BG)
+    for i, m in enumerate(metrics_list):
+        vals = [m[k] for k in metric_keys]
+        offset = (i - len(metrics_list) / 2 + 0.5) * width
+        bars = ax.bar(x + offset, vals, width, label=m['label'],
+                      color=colors[i % len(colors)], alpha=0.9, zorder=3)
+        for b, v in zip(bars, vals):
+            ax.text(b.get_x() + b.get_width() / 2, v + 0.005, f'{v:.3f}',
+                    ha='center', va='bottom', fontsize=9, fontweight='bold', color=TEXT_CLR)
+    ax.set_xticks(x)
+    ax.set_xticklabels(metric_labels, color=TEXT_CLR, fontsize=11)
+    ax.set_ylim(0, 1.05)
+    ax.set_ylabel('Значение метрики', color=TEXT_CLR)
+    ax.yaxis.grid(True, linestyle='--', alpha=0.7, color=GRID_CLR, zorder=0)
+    ax.set_title('Сравнение моделей классификации типа отказа\n(тест: насос MNHV_005)',
+                 color=TEXT_CLR, fontsize=13, fontweight='bold')
+    ax.legend(framealpha=1.0, labelcolor=TEXT_CLR, facecolor=LIGHT_BG, edgecolor='#CCCCCC')
+    for sp in ax.spines.values():
+        sp.set_edgecolor('#CCCCCC')
+    plt.tight_layout()
+    p2 = os.path.join(output_dir, 'ML_fault_plot2_model_comparison.png')
+    plt.savefig(p2, dpi=150, bbox_inches='tight', facecolor=LIGHT_BG)
+    plt.close(fig)
+    print(f"График 2 (сравнение моделей) сохранён: {p2}")
+
+    # График 3: раздельно Warning vs Critical (лучшая модель по macro-F1)
+    if best_label is None:
+        best = max(metrics_list, key=lambda m: m['macro_f1'])
+    else:
+        best = next((m for m in metrics_list if m['label'] == best_label), metrics_list[0])
+
+    sr = best.get('stage_recall')
+    if not sr:
+        return
+    x = np.arange(len(FAULT_TYPES))
+    width = 0.38
+    colors = [FAULT_COLORS[ft] for ft in FAULT_TYPES]
+    warn_vals = [sr['warning'][ft] for ft in FAULT_TYPES]
+    crit_vals = [sr['critical'][ft] for ft in FAULT_TYPES]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    fig.patch.set_facecolor(LIGHT_BG)
+    ax.set_facecolor(LIGHT_BG)
+    b1 = ax.bar(x - width / 2, warn_vals, width, color=colors, alpha=0.45, hatch='//',
+                edgecolor='white', label='Recall @ Warning (раннее предупреждение)')
+    b2 = ax.bar(x + width / 2, crit_vals, width, color=colors, alpha=0.90,
+                edgecolor='white', label='Recall @ Critical (авария)')
+    for bars in (b1, b2):
+        for b in bars:
+            h = b.get_height()
+            if not np.isnan(h):
+                ax.text(b.get_x() + b.get_width() / 2, h + 0.012, f'{h:.3f}',
+                        ha='center', va='bottom', fontsize=9, fontweight='bold', color=TEXT_CLR)
+    ax.set_xticks(x)
+    ax.set_xticklabels([FAULT_LABELS[ft] for ft in FAULT_TYPES], fontsize=10, color=TEXT_CLR)
+    ax.set_ylim(0, 1.22)
+    ax.set_ylabel('Recall', color=TEXT_CLR)
+    ax.axhline(1.0, color='green', ls='--', lw=1.0, alpha=0.5, label='100% Recall')
+    ax.set_title(f'Точность распознавания типа по стадии — {best["label"]}\n'
+                 'Раннее предупреждение (Warning) против аварии (Critical)',
+                 color=TEXT_CLR, fontsize=13, fontweight='bold')
+    ax.legend(framealpha=1.0, labelcolor=TEXT_CLR, facecolor=LIGHT_BG,
+              edgecolor='#CCCCCC', fontsize=9)
+    ax.yaxis.grid(True, linestyle='--', alpha=0.7, color=GRID_CLR, zorder=0)
+    for sp in ax.spines.values():
+        sp.set_edgecolor('#CCCCCC')
+    plt.tight_layout()
+    p3 = os.path.join(output_dir, 'ML_fault_plot3_stage_split.png')
+    plt.savefig(p3, dpi=150, bbox_inches='tight', facecolor=LIGHT_BG)
+    plt.close(fig)
+    print(f"График 3 (стадии Warning/Critical) сохранён: {p3}")

@@ -37,7 +37,8 @@ from visualisation_instruments import recall_plot
 # Основная функция
 
 def analyze_fault_recall(model, df_test: pd.DataFrame, feature_cols: list,
-                         save_dir: str, raw_data_path: Optional[str] = None) -> pd.DataFrame:
+                         save_graphs_dir: str, save_tables_dir: str,
+                         raw_data_path: Optional[str] = None) -> pd.DataFrame:
     """
     Считает recall модели отдельно для каждого типа отказа.
 
@@ -126,10 +127,11 @@ def analyze_fault_recall(model, df_test: pd.DataFrame, feature_cols: list,
                       .mean()
                       .reindex(FAULT_TYPES))
 
-    os.makedirs(save_dir, exist_ok=True)
-    recall_plot(results, signatures, save_dir)
+    os.makedirs(save_graphs_dir, exist_ok=True)
+    os.makedirs(save_tables_dir, exist_ok=True)
+    recall_plot(results, signatures, save_graphs_dir)
 
-    res_df.to_csv(os.path.join(save_dir, 'ML_fault_recall_table.csv'), index=False)
+    res_df.to_csv(os.path.join(save_tables_dir, 'ML_fault_recall_table.csv'), index=False)
     return res_df
 
 
@@ -140,13 +142,15 @@ if __name__ == "__main__":
     model_path = os.path.join(project_root, 'models', 'xgboost_pump_model.joblib')
     data_path = os.path.join(project_root, 'data', 'processed', 'preprocessed_pumps_dataset.csv')
     raw_path = os.path.join(project_root, 'data', 'raw', 'industrial_pumps_dataset.csv')
-    save_dir = os.path.join(project_root, 'data', 'graphs')
-    os.makedirs(save_dir, exist_ok=True)
+    save_graphs_dir = os.path.join(project_root, 'data', 'graphs')
+    save_tables_dir = os.path.join(project_root, 'data', 'tables')
+    os.makedirs(save_graphs_dir, exist_ok=True)
+    os.makedirs(save_tables_dir, exist_ok=True)
 
     pre = DataPreprocessor(window_sizes=[15, 30, 60])
     df = pd.read_csv(data_path)
     df_test = df[df['pump_id'] == 'MNHV_005'].copy()
     model = joblib.load(model_path)
 
-    analyze_fault_recall(model, df_test, pre.FEATURE_COLS, save_dir,    # type: ignore
-                         raw_data_path=raw_path)
+    analyze_fault_recall(model, df_test, pre.FEATURE_COLS, save_graphs_dir,    # type: ignore
+                         save_tables_dir, raw_data_path=raw_path)

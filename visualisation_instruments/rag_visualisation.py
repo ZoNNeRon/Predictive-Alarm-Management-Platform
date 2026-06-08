@@ -116,8 +116,7 @@ def plot_chunk_length_distribution(chroma_dir: str, embeddings, save_dir: str):
     types_sorted = list(docs_by_type.keys())
     data = [docs_by_type[dt] for dt in types_sorted]
     labels = [
-        f"{DOC_TYPES.get(dt, dt)}\n(n={len(docs_by_type[dt])}, \
-            μ={np.mean(docs_by_type[dt]):.0f})"
+        f"{DOC_TYPES.get(dt, dt)}\n(n={len(docs_by_type[dt])}, μ={np.mean(docs_by_type[dt]):.0f})"
         for dt in types_sorted
     ]
 
@@ -262,7 +261,7 @@ def plot_fault_coverage_heatmap(chroma_dir: str, embeddings, save_dir: str):
     for fault, queries in fault_queries.items():
         for q in queries:
             # Извлечение топ-3 фрагмента для каждого запроса
-            docs = db.similarity_search(q, k=3)
+            docs = db.similarity_search(f"query: {q}", k=3)
             for doc in docs:
                 # Если метаданных нет, 'Unknown'
                 doc_type = doc.metadata.get('doc_type', 'Unknown')

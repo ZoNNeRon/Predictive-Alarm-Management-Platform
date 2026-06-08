@@ -21,6 +21,10 @@
     0 - Норма (включает штатную работу)
     1 - Предупреждение (ранняя деградация характеристик)
     2 - Авария (критическое нарушение порогов ГОСТ)
+
+Производный датасет (классификатор ТИПА отказа):
+    build_fault_dataset() формирует выборку для второй модели из аварийных строк.
+    Таргет fault_target — индекс в FAULT_TYPES (0=overheat, 1=cavitation, 2=electrical).
 """
 
 
@@ -33,7 +37,7 @@ from typing import Optional
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
-from config.settings import THRESHOLDS, WINDOW_SIZES
+from config.settings import THRESHOLDS, WINDOW_SIZES, FAULT_TYPES
 
 
 class DataPreprocessor:
@@ -90,7 +94,8 @@ class DataPreprocessor:
         # 3. Удаляются флаги аппаратных помех: модель не должна их знать,
         # она должна игнорировать помехи через сглаживание скользящим окном.
         # fault_type намеренно сохраняется — нужен fault_recall_analysis.py для валидации;
-        # в ML не попадёт, так как отсутствует в FEATURE_COLS
+        # и build_fault_dataset() для классификатора типа; в ML тяжести не попадёт,
+        # так как отсутствует в FEATURE_COLS
         df = df.drop(columns=[c for c in ['sensor_anomaly',
                                            'anomaly_vibration', 'anomaly_temperature',
                                            'anomaly_current']
@@ -105,6 +110,50 @@ class DataPreprocessor:
             df = df.dropna(subset=self.FEATURE_COLS).reset_index(drop=True)
 
         return df
+
+    # Производный датасет: классификатор типа отказа
+
+    def build_fault_dataset(self, df_processed: pd.DataFrame) -> pd.DataFrame:
+        """
+        Формирует выборку для классификатора типа отказа из обработанного датасета.
+
+        Принципы:
+          - Только предупреждающие и аварийные строки (target == 2 & == 1). Тип отказа 
+            определяется на предупреждении и аварии, и агент вызывает классификатор 
+            лишь при predicted_class == 2 или == 1 — это согласует распределение обучения 
+            с распределением инференса.
+          - Признаки те же (self.FEATURE_COLS): никакого пересчёта rolling-фич,
+            гарантия отсутствия дрейфа признаков между моделью тяжести и моделью типа.
+          - Таргет fault_target — индекс в FAULT_TYPES (0=overheat, 1=cavitation,
+            2=electrical), без магических чисел.
+
+        Args:
+            df_processed: результат process(is_training=True) либо
+                          загруженный preprocessed_pumps_dataset.csv.
+
+        Returns:
+            DataFrame с колонками [pump_id, fault_type, fault_target, *FEATURE_COLS].
+        """
+
+        if 'fault_type' not in df_processed.columns:
+            raise KeyError(
+                "В датасете нет 'fault_type'. Перезапустите data_preprocessor.py "
+                "(process() не должен удалять fault_type)."
+            )
+
+        problem = df_processed[df_processed['target'] != 0].copy()
+        problem = problem[problem['fault_type'].isin(FAULT_TYPES)]
+        problem = problem.dropna(subset=self.FEATURE_COLS + ['fault_type'])
+
+        fault_to_idx = {ft: i for i, ft in enumerate(FAULT_TYPES)}
+        problem['fault_target'] = problem['fault_type'].map(fault_to_idx).astype(int)
+
+        # Стадия тяжести (1=Warning, 2=Critical) — НЕ признак, а колонка для
+        # стратификации отчёта; в X не попадёт, т.к. её нет в FEATURE_COLS.
+        problem = problem.rename(columns={'target': 'severity_stage'})
+
+        keep = ['pump_id', 'fault_type', 'fault_target', 'severity_stage'] + self.FEATURE_COLS
+        return problem[keep].reset_index(drop=True)
 
     # Приватные методы
 
@@ -165,8 +214,9 @@ class DataPreprocessor:
 if __name__ == "__main__":
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     raw_data_path = os.path.join(project_root, 'data', 'raw', 'industrial_pumps_dataset.csv')
-    processed_data_path = os.path.join(project_root, 'data', 
-                                       'processed', 'preprocessed_pumps_dataset.csv')
+    processed_dir = os.path.join(project_root, 'data', 'processed')
+    processed_data_path = os.path.join(processed_dir, 'preprocessed_pumps_dataset.csv')
+    fault_data_path = os.path.join(processed_dir, 'fault_type_pumps_dataset.csv')
 
     print("Загрузка сырых данных предприятия...")
     if not os.path.exists(raw_data_path):
@@ -185,9 +235,18 @@ if __name__ == "__main__":
     os.makedirs(os.path.dirname(processed_data_path), exist_ok=True)
     df_processed.to_csv(processed_data_path, index=False)
 
-    print(f"\nПредобработка завершена, датасет сохранён:\n  {processed_data_path}")
+    print(f"\nПредобработка завершена, основной датасет сохранён:\n  {processed_data_path}")
     print(f"Форма: {df_processed.shape} (строк x колонок)")
     print(f"\nПризнаки для ML ({len(preprocessor.FEATURE_COLS)} шт.):")
     print(preprocessor.FEATURE_COLS)
-    print(f"\nБаланс классов (0 = Норма, 1 = Предупреждение, 2 = Авария):")
+    print(f"\nБаланс классов тяжести (0 = Норма, 1 = Предупреждение, 2 = Авария):")
     print(df_processed['target'].value_counts().sort_index())
+
+    # Производный датасет для классификатора ТИПА отказа (вторая модель)
+    print("\nФормирование датасета для классификатора типа отказа...")
+    fault_df = preprocessor.build_fault_dataset(df_processed)
+    fault_df.to_csv(fault_data_path, index=False)
+    print(f"Дополнительный датасет типа отказа сохранён:\n  {fault_data_path}")
+    print(f"Форма: {fault_df.shape} (только предупредительные/аварийные строки, target==1 & ==2)")
+    print(f"\nБаланс типов отказа:")
+    print(fault_df['fault_type'].value_counts())

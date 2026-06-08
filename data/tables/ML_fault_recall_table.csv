@@ -1,0 +1,4 @@
+fault_type,label,recall_critical,n_critical,recall_warning,n_warning
+overheat,Тип А: Перегрев,0.9452054794520548,146,0.9696557971014492,2208
+cavitation,Тип Б: Кавитация,0.9444444444444444,126,0.9952413324269205,1471
+electrical,Тип В: Электрика,0.96875,64,0.982532751091703,916
