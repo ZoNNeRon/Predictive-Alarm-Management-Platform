@@ -42,7 +42,8 @@ predictive_alarm_platform/
 │
 ├── scripts/
 │   ├── xgboost_benchmark.py        # ГОТОВО — LOGO CV (5 фолдов), доказательство обобщения
-│   ├── ai_agent_benchmark.py       # ГОТОВО — многосценарный бенчмарк 3 LLM-моделей
+│   ├── ai_agent_benchmark.py       # ГОТОВО — бенчмарк 3 LLM: 6 сценариев (fault×stage), 5 метрик
+│   ├── rag_regression_guard_test.py# ГОТОВО — регрессионный guard: fault_type+stage привязка SOP
 │   └── permutation_test.py         # ГОТОВО — sanity check: метки перемешаны → accuracy ~1/3
 │
 ├── visualisation_instruments/
@@ -84,12 +85,22 @@ predictive_alarm_platform/
 │   │   ├── shap_fault_plot2_beeswarm_overheat.png  # Fault-классификатор: beeswarm
 │   │   ├── shap_fault_plot3_beeswarm_cavitation.png
 │   │   ├── shap_fault_plot4_beeswarm_electrical.png
-│   │   ├── rag_plot1-4_*.png
-│   │   ├── agent_plot1-3_*.png
-│   │   └── agent_benchmark_*.csv
+│   │   ├── rag_plot1_kb_composition.png         # Состав БД (pie chart)
+│   │   ├── rag_plot2_chunk_distribution.png     # Распределение длин чанков
+│   │   ├── rag_plot3_retrieval_quality.png      # Качество поиска (L2 + % релевантных)
+│   │   ├── rag_plot4_fault_coverage_heatmap.png # 4-канальное покрытие: Fault × Doc Type
+│   │   ├── rag_plot5_section_sourcing.png       # Источники по разделам ответа агента
+│   │   ├── agent_plot1_performance.png          # Производительность (время + токены/с)
+│   │   ├── agent_plot2_quality_auto.png         # Профиль качества (дискриминирующие метрики)
+│   │   ├── agent_plot3_summary_heatmap.png      # Сводный хитмап (relative quality)
+│   │   ├── agent_plot4_expert_radar.png         # Радар экспертных оценок
+│   │   └── agent_plot5_stage_breakdown.png      # Стадийный разрез (Warning vs Авария)
 │   └── tables/                                  # CSV-таблицы результатов
 │       ├── ML_fault_recall_table.csv
-│       └── ML_fault_classifier_summary.csv
+│       ├── ML_fault_classifier_summary.csv
+│       ├── agent_benchmark_multi.csv            # Все прогоны бенчмарка (сырые данные)
+│       ├── agent_summary_table.csv              # Сводка по моделям (index=model)
+│       └── agent_summary_by_stage.csv           # Сводка model × stage
 │
 ├── models/
 │   ├── lr_pump_model.joblib                     # Модель тяжести: LR
@@ -194,27 +205,58 @@ predictive_alarm_platform/
 
 ### 7. `rag_database.py` — База знаний (RAG)
 - **Стек:** LangChain + ChromaDB (локально) + `intfloat/multilingual-e5-large` (MPS, M2)
-- **`StructuredPDFLoader`:** pymupdf4llm → Markdown (сохраняет таблицы), fallback → pdfplumber
+- **`StructuredPDFLoader`:** pymupdf4llm → Markdown (сохраняет таблицы), fallback → pdfplumber; оставлен как расширение — в текущей версии не используется
 - **`TextKnowledgeLoader`:** загрузка `.md`/`.txt` файлов
 - **`doc_type_map` — единственный allowlist:** загружаются только файлы, явно перечисленные в нём (из `config/settings`)
-- Активный `doc_type_map` (все файлы — `.md`): `tm_regulation.md` (sop), `tm_schedule.md` (schedule), `gost_extract.md` (gost), `mnhv_extract.md` (manual), `diagnostics_extended.md` (diagnostics); PDF-версии в `knowledge_base/` хранятся как исходники, но в ChromaDB не загружаются
-- **`StructuredPDFLoader`** оставлен как расширение для будущих PDF; в текущей версии не используется
-- **`doc_type`:** manual / gost / sop / schedule / diagnostics; метаданные: `source`, `section`, `chunk_id`
+- Активный `doc_type_map` (все файлы — `.md`): `tm_regulation.md` (sop), `tm_schedule.md` (schedule), `gost_extract.md` (gost), `mnhv_extract.md` (manual), `diagnostics_extended.md` (diagnostics)
+- **`doc_type`:** manual / gost / sop / schedule / diagnostics; метаданные чанков: `source`, `section`, `chunk_id`, `doc_type`
 - **Разные chunk_size по типу:** gost=700, manual=600, sop=550, schedule=350, diagnostics=500
 - **e5 prefix:** `passage:` при загрузке, `query:` при поиске — обязательно для e5-large
-- **Порог релевантности:** `RELEVANCE_THRESHOLD=1.2` (L2) из `config/settings`
-- Батчевая запись по 500 чанков; `DOC_TYPES`, `CHUNK_CONFIG`, `RELEVANCE_THRESHOLD`, `EMBED_MODEL`, `DOC_TYPE_MAP` импортируются из `config/settings/settings.py`
-- Визуализация вынесена в `visualisation_instruments/rag_visualisation.py`; вызов: `plot_all_rag(kb.chroma_dir, kb.embeddings, kb.EMBED_MODEL, test_queries, plots_dir)` в `__main__`
-- **Выходы:** `rag_plot1_kb_composition.png`, `rag_plot2_chunk_distribution.png`, `rag_plot3_retrieval_quality.png`, `rag_plot4_fault_coverage_heatmap.png`
+- **Порог релевантности:** `RELEVANCE_THRESHOLD=1.2` (L2) из `config/settings`; для графика ТО — `1.5`
+- Батчевая запись по 500 чанков
+
+**Структурированный чанкинг регламента SOP (`_chunk_sop_document`):**
+- Регламент `tm_regulation.md` содержит сценарии по типам отказа с двумя стадийными блоками оператора
+- Заголовки `### Сценарий ... [fault_type: overheat/cavitation/electrical]` — тег типа
+- Каждый сценарий режется на подразделы: `operator` (Действия оператора), `repair` (Работы ТОиР), `reference` (Симптоматика/Причины)
+- Operator-блоки несут тег `stage`: `warning` или `critical` (из заголовка подраздела)
+- `fault_type` carry-forward: если чанк потерял заголовок при сплите — наследует тип предыдущего
+
+**Функция `resolve_stage(symptom_vector)`** (единый резолвер для агента и бенчмарка):
+- Возвращает `'warning'` / `'critical'` / `'unknown'`
+- `'unknown'` — если класс ∉ {1,2} или `fault_confidence < FAULT_CONFIDENCE_THRESHOLD (0.5)`
+
+**Методы поиска:**
+- `search(query, k, doc_type_filter, metadata_filter, apply_threshold)` — базовый с `$and`-фильтром; `apply_threshold=False` для фолбэков
+- `search_by_symptoms(symptom_dict, k)` — multi-query: два запроса (описательный + прескриптивный), дедупликация по содержимому; из результатов фильтруются `sop_part in ('operator', 'repair')` — они идут в отдельные каналы
+- `search_operator_actions(fault_type, stage, k)` — строго по `fault_type + sop_part='operator' + stage`; лестница из 4 фолбэков (ослабляет фильтр по шагам)
+- `search_repair_works(fault_type, k)` — строго по `fault_type + sop_part='repair'`; лестница из 3 фолбэков
+- `search_maintenance_schedule(pump_id, k)` — по `doc_type='schedule'`, threshold=1.5
+
+- Визуализация: `plot_all_rag(kb, test_queries, plots_dir)` в `__main__` (принимает объект `kb`, не отдельные параметры)
+- **Выходы:** `rag_plot1–5_*.png`
 
 ### 8. `ai_agent.py` — LLM-агент
-- **`DiagnosticAgent`** — принимает `SymptomVector` + RAG-контекст, строит промпт, вызывает Ollama
-- **`AgentResponse`** dataclass: `raw_text`, `model_name`, `latency_sec`, `gen_time_sec`, `eval_count`, `tokens_per_sec`, `format_ok`, `error`
-- **`SYSTEM_PROMPT`** загружается из `config/prompts/diagnostic_agent.md` (anti-hallucination, строгий формат: СТАТУС / ДИАГНОЗ / ПРЕДПИСАНИЕ / ТОиР)
+- **`DiagnosticAgent`** — принимает `SymptomVector` + 4 канала RAG-контекста, строит промпт, вызывает Ollama
+- **`AgentResponse`** dataclass: `pump_id`, `raw_text`, `model_name`, `used_context`, `sources`, `latency_sec`, `gen_time_sec`, `eval_count`, `prompt_eval_count`, `tokens_per_sec`, `format_ok`, `error`
+- **`SYSTEM_PROMPT`** загружается из `config/prompts/diagnostic_agent.md` (anti-hallucination, строгий формат 5 разделов: СТАТУС / ДИАГНОЗ / ПРЕДПИСАНИЕ / РЕКОМЕНДАЦИИ ТОиР / ПЛАНОВЫЙ РЕМОНТ)
 - Qwen 3.x: `think=False` через нативный Ollama-клиент отключает chain-of-thought
-- **`__main__`:** цепочка XAI → RAG → LLM с последовательным прогоном трёх моделей
+
+**4-канальная архитектура промпта (`_build_full_prompt`):**
+- `rag_results` → блок СПРАВОЧНЫЙ КОНТЕКСТ (мануал/ГОСТ/диагностика) — только для ДИАГНОЗА
+- `operator_results` → блок ДЕЙСТВИЯ ОПЕРАТОРА (регламент) — единственный источник ПРЕДПИСАНИЯ
+- `repair_results` → блок РАБОТЫ ТОиР — для РЕКОМЕНДАЦИЙ ТОиР
+- `schedule_results` → блок ГРАФИК ТОиР — для ПЛАНОВОГО РЕМОНТА
+- Детерминированный **вердикт по внеплановому выводу** (P(аварии) ≥ 80% → вывод, иначе нет) вставляется в промпт перед блоком графика, модель переписывает его дословно
+
+**Дополнительные методы:**
+- `_event_header(sv)` — детерминированная шапка `АГРЕГАТ: ... | ВРЕМЯ: ...`, всегда в начале ответа (не доверяется LLM)
+- `_unknown_response(sv)` — детерминированный ответ при `resolve_stage == 'unknown'`; LLM не вызывается
+- `generate_prescription_stream(...)` — потоковый генератор (Ollama `stream=True`) для `st.write_stream()` в Streamlit; сначала отдаёт шапку, затем стримит токены
+- `_display_source(filename)` — имя файла → читаемое имя документа (из `DOC_DISPLAY_NAMES`)
+
+- **`__main__`:** цепочка XAI → RAG (4 канала) → LLM с последовательным прогоном трёх моделей
 - Три тестируемые модели: `qwen3.5:9b` (default), `phi4:14b`, `second_constantine/yandex-gpt-5-lite:8b`
-- Вывод: `ОТВЕТ АГЕНТА N (модель: ..., время: ... с)` для каждой модели
 
 ### 9. `scripts/xgboost_benchmark.py` — LOGO CV бенчмарк
 - **Leave-One-Group-Out Cross-Validation:** 5 фолдов, каждый раз один насос — тест, остальные 4 — обучение
@@ -224,12 +266,28 @@ predictive_alarm_platform/
 - Импортирует из `src.ml_pipeline` (функция `evaluate_model`)
 
 ### 10. `scripts/ai_agent_benchmark.py` — Бенчмарк LLM-агента
-- **Три диагностических сценария:** Тип А (перегрев), Тип Б (кавитация), Тип В (электрика) — проверяет, различает ли LLM типы отказов
-- **Метрики:** скорость генерации (tokens/sec), соответствие формату, атрибуция источника, автоматическая оценка качества
-- Усреднение по 3 сценариям × 3 повтора = 9 прогонов на модель
-- **Выходы:** `agent_benchmark_raw.csv`, `agent_benchmark_multi.csv`, `agent_summary_table.csv`, `agent_plot1-3_*.png`
+- **6 сценариев:** 3 типа отказа × 2 стадии (Предупреждение / Авария) — строит `build_scenarios(xai, df, preprocessor, kb)`
+- Каждый сценарий получает полный 4-канальный вход (rag, operator, repair, schedule)
+- **5 автометрик:**
+  - `format_ok` — все 4 обязательных раздела (из `REQUIRED_SECTIONS`)
+  - `attribution_ok` — явная ссылка на норматив (из `SOURCE_MARKERS`)
+  - `action_steps` — число нумерованных пунктов в ПРЕДПИСАНИИ
+  - `toir_is_works` — в разделе ТОиР ремонтные работы, а не даты (из `TOIR_WORK_MARKERS`)
+  - `stage_appropriate` — стадийная уместность: на Предупреждение нет команды аварийного останова (`EMERGENCY_MARKERS`), на Аварию есть решительное действие (`DECISIVE_MARKERS`)
+- Прогрев модели перед замером (первый сценарий)
+- Усреднение по 6 сценариям × 3 повтора = 18 прогонов на модель
+- **Выходы:** `agent_benchmark_multi.csv`, `agent_summary_table.csv` (index=model), `agent_summary_by_stage.csv` (model × stage), `agent_plot1-5_*.png`
 
-### 11. `scripts/permutation_test.py` — Sanity check классификатора типа
+### 11. `scripts/rag_regression_guard_test.py` — Регрессионный guard RAG
+- **Цель:** защита от регрессии в стадийной и сценарной привязке SOP-чанков после перестройки базы
+- **3 теста:**
+  1. `test_sop_chunks_tagged_with_fault_and_stage` — все 3 типа размечены `fault_type`; у operator-чанков есть `stage`; оба стадийных блока (warning + critical) присутствуют для каждого типа
+  2. `test_operator_actions_locked_by_fault_and_stage` — `search_operator_actions(fault, stage)` возвращает чанки строго своего типа и стадии; позитивная и негативная лексическая проверка по `STAGE_OPERATOR_KW`
+  3. `test_repair_works_locked_by_fault` — `search_repair_works(fault)` не смешивает сценарии
+- Запуск: `pytest scripts/rag_regression_guard_test.py -v` или `python scripts/rag_regression_guard_test.py`
+- Предусловие: база собрана с актуальной разметкой (`kb.build_database(reset=True)`)
+
+### 12. `scripts/permutation_test.py` — Sanity check классификатора типа
 - Загружает `fault_type_pumps_dataset.csv`, перемешивает `fault_target` случайным образом (`rng(42)`)
 - Обучает XGBoost на перемешанных метках, проверяет balanced accuracy на тесте — должна упасть к ~1/3
 - **Цель:** доказать, что модель учится реальным сигнатурам, а не паразитным паттернам в данных
@@ -253,11 +311,22 @@ predictive_alarm_platform/
 | `EMBED_MODEL` | `intfloat/multilingual-e5-large` |
 | `RELEVANCE_THRESHOLD` | `1.2` — порог L2-расстояния для RAG |
 | `DOC_TYPES`, `CHUNK_CONFIG`, `DOC_TYPE_MAP` | Конфигурация базы знаний; `DOC_TYPE_MAP` содержит только `.md`-файлы |
+| `DOC_DISPLAY_NAMES` | Читаемые имена документов для атрибуции в ответах агента |
+| `FAULT_CONFIDENCE_THRESHOLD` | `0.5` — порог уверенности классификатора типа; ниже → `stage='unknown'` |
 | `LLM_MODELS`, `DEFAULT_LLM_MODEL` | Список тестируемых Ollama-моделей |
+| `MODEL_LABELS` | Читаемые названия моделей для графиков (`{model_id: label}`) |
+| `REQUIRED_SECTIONS` | 4 обязательных раздела ответа агента для проверки формата |
+| `SOURCE_MARKERS` | Ключевые слова атрибуции источника (для `check_attribution()`) |
+| `TOIR_WORK_MARKERS` | Маркеры ремонтных работ в разделе ТОиР (для `check_toir_is_works()`) |
+| `EMERGENCY_MARKERS` | Маркеры аварийного останова — недопустимы на стадии Предупреждение |
+| `DECISIVE_MARKERS` | Маркеры решительного действия — обязательны на стадии Авария |
+| `DIRECTIONS`, `FMT` | Направления метрик и форматы для хитмапа бенчмарка |
 
 ### `config/prompts/diagnostic_agent.md`
-Системный промпт `DiagnosticAgent`. Загружается при импорте `ai_agent.py`.
-Редактируется без изменения Python-кода.
+Системный промпт `DiagnosticAgent`. Загружается при импорте `ai_agent.py`. Редактируется без изменения Python-кода.
+- 8 строгих правил: только из КОНТЕКСТА, источник по имени, разделение 4 каналов (справочный/оператор/ТОиР/график), стадийный тон (Авария vs Предупреждение), краткость
+- Вердикт по внеплановому выводу в ремонт вставляется в промпт детерминированно агентом, модель переписывает его дословно
+- Формат ответа: 5 разделов — СТАТУС / ДИАГНОЗ И ОБОСНОВАНИЕ / ПРЕДПИСАНИЕ (ДЕЙСТВИЯ ОПЕРАТОРА) / РЕКОМЕНДАЦИИ ТОиР (РЕМОНТНОЙ БРИГАДЕ) / ПЛАНОВЫЙ РЕМОНТ
 
 ---
 
@@ -269,8 +338,9 @@ predictive_alarm_platform/
 |---|---|---|
 | `simulation_visualisation.py` | `plot_smart_episode(df, hours, save_dir)` | `data_generator.py` |
 | `ml_visualisation.py` | `plot_all(metrics, y_test, output_dir)`, `recall_plot(results, signatures, save_dir)`, `plot_fault_classifier(metrics, output_dir)` | `ml_pipeline.py`, `fault_recall_analysis.py`, `fault_classifier_pipeline.py` |
-| `rag_visualisation.py` | `plot_all_rag(chroma_dir, embeddings, model, queries, save_dir)` | `rag_database.py` |
+| `rag_visualisation.py` | `plot_all_rag(kb, test_queries, save_dir)` → 5 графиков: `plot_knowledge_base_stats`, `plot_chunk_length_distribution`, `plot_retrieval_quality`, `plot_fault_coverage_heatmap`, `plot_fault_section_sourcing` | `rag_database.py` |
 | `xai_visualisation.py` | `plot_waterfall()`, `plot_summary_by_fault_type()` — severity; `plot_fault_waterfall()`, `plot_fault_summary_by_type()` — fault classifier | `xai_module.py` |
+| `ai_visualisation.py` | `plot_performance(df, save_dir)`, `plot_quality_auto(df, save_dir)`, `plot_summary_heatmap(summary_df, directions, fmt, save_dir)`, `plot_expert_radar(expert_scores, save_dir)`, `plot_stage_breakdown(df, save_dir)` | `scripts/ai_agent_benchmark.py`, автономно |
 
 ---
 
@@ -328,6 +398,16 @@ prediction = alarm_manager.predict_with_context(feature_row, raw_state)
 | `config/settings/settings.py` как единственный источник констант | Исключает дублирование порогов, seeds, имён файлов по модулям |
 | Визуализация в `visualisation_instruments/` | SRP: модули данных не зависят от matplotlib; графики редактируются независимо |
 | Промпт в `config/prompts/diagnostic_agent.md` | Редактируется без изменения Python-кода; читается при импорте |
+| 4-канальный промпт (справочный/оператор/ТОиР/график) | Разделение источников по назначению: модель не смешивает диагноз и предписание |
+| Детерминированный вердикт о внеплановом выводе | P(аварии) считается агентом; модель переписывает готовую фразу — не принимает решение сама |
+| `_unknown_response()` при `stage='unknown'` | LLM не вызывается при низкой уверенности типа — нет галлюцинаций на неопределённых состояниях |
+| `generate_prescription_stream()` для Streamlit | Потоковая отдача токенов: оператор видит ответ по мере генерации, не ждёт полного завершения |
+| SOP-чанкинг с fault_type + stage | Позволяет детерминированно фильтровать operator-блоки по типу отказа И стадии |
+| `resolve_stage()` в `rag_database.py` (не в `ai_agent.py`) | Единый резолвер стадии; импортируется и агентом, и бенчмарком |
+| 6 сценариев в бенчмарке (fault × stage) | Доказывает стадийную дифференциацию, а не только различение типов |
+| `stage_appropriate` как метрика | Автоматически проверяет, что на Предупреждение нет останова, на Аварию есть решительное действие |
+| `rag_regression_guard_test.py` | Защита от регрессии при перестройке базы; тест запускается перед любым изменением разметки SOP |
+| `agent_summary_table.csv` читается с `index_col=0` | `model` — индекс DataFrame; без этого хитмап показывает 0,1,2 вместо имён |
 
 ---
 

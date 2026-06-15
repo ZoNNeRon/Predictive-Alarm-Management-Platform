@@ -9,6 +9,7 @@ import sys
 import os
 import shutil
 import json
+import re
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
@@ -16,7 +17,8 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 from config.settings import (DOC_TYPES, CHUNK_CONFIG, RELEVANCE_THRESHOLD,
-                              EMBED_MODEL, DOC_TYPE_MAP)
+                              EMBED_MODEL, DOC_TYPE_MAP, FAULT_TYPES, 
+                              FAULT_CONFIDENCE_THRESHOLD)
 from visualisation_instruments import plot_all_rag
 
 import pdfplumber
@@ -26,10 +28,111 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 
+_FAULT_KEYS = set(FAULT_TYPES)
+_FAULT_RU = {'overheat': 'перегрев', 'cavitation': 'кавитация',
+             'electrical': 'электрическая неисправность'}
+# Явный тег в заголовке сценария — самый надёжный путь.
+_FAULT_TAG_RE = re.compile(r'\[fault_type:\s*([a-z_]+)\s*\]', re.I)
+# Строка-заголовок сценария (для carry-forward по чанкам).
+_SCENARIO_HEADER_RE = re.compile(r'(?:^|\n)#{2,3}\s+Сценари[йяе][^\n]*', re.I)
+# Фолбэк-определение типа по русским словам в заголовке (если тега нет).
+_HEADER_FAULT_KEYWORDS = (
+    ('кавитац', 'cavitation'),
+    ('перегрев', 'overheat'),
+    ('электрическ', 'electrical'),
+    ('электрик', 'electrical'),
+)
 
-# DOC_TYPES, CHUNK_CONFIG, RELEVANCE_THRESHOLD, EMBED_MODEL, DOC_TYPE_MAP
-# импортированы из config.settings
+# Подразделы сценария. Операторный заголовок дополнительно несёт СТАДИЮ.
+_OPERATOR_RE = re.compile(
+    r'Действия\s+оператора(?:\s*\(\s*стади[яи]\s*[«"]?\s*(Предупреждени\w*|Авари\w*))?', 
+    re.I)
+_REPAIR_RE = re.compile(r'(?:Связанные\s+)?работы\s+ТОиР', re.I)
+_REF_RES = (
+    re.compile(r'Симптоматика', re.I),
+    re.compile(r'вероятные\s+причины', re.I),
+    re.compile(r'Рекомендаци\w*\s+по\s+графику', re.I)
+    )
 
+
+def _stage_from(word):
+    """Слово из заголовка → метка стадии. Без явной метки = 'critical'."""
+
+    if not word:    # Вывод по умолчанию
+        return 'critical'
+    
+    w = word.lower()
+    if w.startswith('предупрежд'):
+        return 'warning'
+    
+    if w.startswith('авари'):
+        return 'critical'
+    
+    return 'critical'   # Вывод при отсутствии тегов
+
+
+def resolve_stage(symptom_vector, conf_threshold: float = FAULT_CONFIDENCE_THRESHOLD) -> str:
+    """
+    Единый резолвер стадии для агента и бенчмарка. Возвращает:
+      'warning'  — класс 1 и тип уверенно определён;
+      'critical' — класс 2 и тип уверенно определён;
+      'unknown'  — класс вне {1,2} ЛИБО уверенность типа ниже порога.
+    """
+
+    pc = getattr(symptom_vector, 'predicted_class', None)
+    if pc not in (1, 2):
+        return 'unknown'
+    
+    fc = getattr(symptom_vector, 'fault_confidence', 1.0)
+    fc = 1.0 if fc is None else (fc if fc <= 1.0 else fc / 100.0)  # доля или проценты
+
+    if fc < conf_threshold:
+        return 'unknown'
+    
+    return 'warning' if pc == 1 else 'critical'
+
+
+def _header_fault(line: str):
+    """Тип отказа из заголовка сценария: тег [fault_type:X] или ключевое слово."""
+
+    tag = _FAULT_TAG_RE.search(line)
+    if tag and tag.group(1).lower() in _FAULT_KEYS:
+        return tag.group(1).lower()
+    
+    low = line.lower()
+    for kw, key in _HEADER_FAULT_KEYWORDS:
+        if kw in low:
+            return key
+    return None
+
+
+def _subsection_segments(scenario_text) -> List:
+    """
+    Режет сценарий на подразделы. Для operator-блоков извлекает СТАДИЮ из
+    заголовка; для repair/reference стадия = None (стадийно-независимы).
+    """
+
+    marks = []  # (pos, sop_part, stage)
+    for m in _OPERATOR_RE.finditer(scenario_text):
+        marks.append((m.start(), 'operator', _stage_from(m.group(1))))
+    for m in _REPAIR_RE.finditer(scenario_text):
+        marks.append((m.start(), 'repair', None))
+    for rgx in _REF_RES:
+        for m in rgx.finditer(scenario_text):
+            marks.append((m.start(), 'reference', None))
+    marks.sort(key=lambda x: x[0])
+ 
+    if not marks:
+        return [('reference', None, scenario_text)]
+    
+    segs = []
+    if marks[0][0] > 0: # заголовок сценария → reference
+        segs.append(('reference', None, scenario_text[:marks[0][0]]))
+    for i, (pos, part, stage) in enumerate(marks):
+        end = marks[i + 1][0] if i + 1 < len(marks) else len(scenario_text)
+        segs.append((part, stage, scenario_text[pos:end]))
+
+    return segs
 
 # Загрузчик текстовых файлов (.md, .txt)
 
@@ -279,16 +382,41 @@ class KnowledgeBaseManager:
         print(f"\nБаза знаний готова: {self.chroma_dir}")
         print(f"Всего документов в ChromaDB: {db._collection.count()}")
         return db
+    
+    # Хелпер: определение типа отказа чанка SOP (метод класса) 
+    def _detect_chunk_fault(self, raw_text: str, current):
+        """
+        Определяет fault_type для чанка SOP по заголовкам сценариев в нём.
+        carry-forward: если в чанке нет заголовка — наследуется тип предыдущего
+        (под-чанки длинного сценария теряют заголовок при сплите, но не привязку).
+        Берёт последний заголовок в чанке — корректно для границы сценариев.
+        """
 
-    def _split_documents(self, documents: List[Document]) -> List[Document]:
+        found = current
+        for m in _SCENARIO_HEADER_RE.finditer(raw_text):
+            line = m.group(0)
+            tag = _FAULT_TAG_RE.search(line)
+            if tag and tag.group(1).lower() in _FAULT_KEYS:
+                found = tag.group(1).lower()
+                continue
+            low = line.lower()
+            for kw, key in _HEADER_FAULT_KEYWORDS:
+                if kw in low:
+                    found = key
+                    break
+        return found
+
+    def _split_documents(self, documents):
         """
         Разбивает документы на чанки с параметрами под каждый тип документа.
         Добавляет метаданные секции (первые 80 символов чанка как заголовок).
-        """
-        all_chunks: List[Document] = []
 
-        # Группируем по doc_type для применения разных настроек
-        by_type: Dict[str, List[Document]] = {}
+        Для doc_type='sop' навешивает fault_type (carry-forward),
+        чтобы сценарные поиски можно было детерминированно фильтровать по типу.
+        """
+
+        all_chunks = []
+        by_type = {}
         for doc in documents:
             dt = doc.metadata.get('doc_type', 'manual')
             by_type.setdefault(dt, []).append(doc)
@@ -296,25 +424,83 @@ class KnowledgeBaseManager:
         for doc_type, docs in by_type.items():
             cfg = CHUNK_CONFIG.get(doc_type, CHUNK_CONFIG['manual'])
             splitter = RecursiveCharacterTextSplitter(
-                chunk_size=cfg['chunk_size'],
-                chunk_overlap=cfg['chunk_overlap'],
+                chunk_size=cfg['chunk_size'], chunk_overlap=cfg['chunk_overlap'],
                 length_function=len,
-                separators=['\n## ', '\n### ', '\n\n', '\n', ' ', ''],
-            )
-            chunks = splitter.split_documents(docs)
+                separators=['\n## ', '\n### ', '\n\n', '\n', ' ', ''])
 
-            # Добавляем метаданные: порядковый номер и первые слова как section
+            if doc_type == 'sop':
+                chunks = []
+                for d in docs:
+                    chunks.extend(self._chunk_sop_document(d, splitter))
+            else:
+                chunks = splitter.split_documents(docs)   # путь прочих типов не меняется
+
+            tagged = 0
             for i, chunk in enumerate(chunks):
                 chunk.metadata['chunk_id'] = i
                 chunk.metadata['section'] = chunk.page_content[:80].replace('\n', ' ')
-                # e5 требует prefix для passage (при поиске — prefix 'query:')
                 chunk.page_content = f"passage: {chunk.page_content}"
+                if doc_type == 'sop' and chunk.metadata.get('fault_type'):
+                    tagged += 1
 
             all_chunks.extend(chunks)
+            extra = (f", сценарных чанков с fault_type: {tagged}, sop_part размечен"
+                    if doc_type == 'sop' else "")
             print(f"  [{doc_type:8s}] {len(docs)} блок(ов) → {len(chunks)} чанков "
-                  f"(size={cfg['chunk_size']}, overlap={cfg['chunk_overlap']})")
-
+                f"(size={cfg['chunk_size']}, overlap={cfg['chunk_overlap']}{extra})")
+            if doc_type == 'sop' and tagged == 0:
+                print("  [WARN] Сценарии SOP не размечены fault_type — проверьте заголовки "
+                    "'### Сценарий ... [fault_type: ...]'.")
         return all_chunks
+    
+    def _chunk_sop_document(self, doc, splitter):
+        """
+        Режет регламент на регионы → подразделы → чанки с метаданными 
+        fault_type / sop_part / stage.
+        Возвращает list[Document] (без passage-префикса — он добавится в _split_documents).
+        """
+        
+        text = doc.page_content
+        base = dict(doc.metadata)
+
+        # 1) Регионы: '### Сценарий ...' → сценарий с типом; '## ...' → общий (fault=None).
+        regions, cur_fault, buf = [], None, []
+
+        def _flush():
+            if buf and any(l.strip() for l in buf):
+                regions.append((cur_fault, '\n'.join(buf)))
+
+        for line in text.split('\n'):
+            s = line.strip()
+            if s.startswith('### ') and 'Сценари' in s:
+                _flush()
+                buf = [line]
+                cur_fault = _header_fault(s)
+            elif s.startswith('## ') and not s.startswith('### '):
+                _flush()
+                buf = [line]
+                cur_fault = None
+            else:
+                buf.append(line)
+        _flush()
+
+        # 2) Подразделы (для сценариев) / целиком (для общих секций) → чанки с метаданными.
+        out = []
+        for fault, region in regions:
+            segs = _subsection_segments(region) if fault else [('reference', None, region)]
+            for sop_part, stage, seg in segs:
+                for ch in splitter.split_text(seg):
+                    if not ch.strip():
+                        continue
+                    meta = dict(base)
+                    meta['sop_part'] = sop_part
+                    if stage: 
+                        meta['stage'] = stage   # тег стадии — только на operator-чанках
+                    if fault:
+                        meta['fault_type'] = fault
+                    out.append(Document(page_content=ch, metadata=meta))
+
+        return out
 
     def _build_chroma_batched(self, chunks: List[Document],
                                batch_size: int = 500) -> Chroma:
@@ -339,41 +525,43 @@ class KnowledgeBaseManager:
 
     # Поиск 
 
-    def search(self, query: str, k: int = 4,
-               doc_type_filter: str = None) -> List[Tuple[Document, float]]: # type: ignore
+    def search(self, query, k=4, doc_type_filter=None,
+           metadata_filter=None, apply_threshold=True):
         """
-        Семантический поиск по базе знаний.
-
-        Args:
-            query:           Поисковый запрос (симптомы от XAI-модуля).
-            k:               Число результатов.
-            doc_type_filter: Фильтр по типу документа (например 'manual').
-
-        Returns:
-            Список (Document, distance); отфильтровано по RELEVANCE_THRESHOLD.
+        Семантический поиск. Добавлены:
+        metadata_filter: доп. условия по метаданным (например {'fault_type': 'cavitation'});
+        apply_threshold: отключаемая отсечка по RELEVANCE_THRESHOLD — нужна для
+                        сценарного фолбэка (тип уже гарантирован метаданными,
+                        дистанция вторична).
+        Обратная совместимость: старые вызовы search(q, k, doc_type_filter) не меняются.
         """
-        db = Chroma(
-            persist_directory=self.chroma_dir,
-            embedding_function=self.embeddings
-        )
 
-        # e5 требует prefix 'query:' для поисковых запросов
-        prefixed_query = f"query: {query}"
+        db = Chroma(persist_directory=self.chroma_dir,
+                    embedding_function=self.embeddings)
+        prefixed_query = f"query: {query}"           # e5: prefix для запроса
+
+        conds = []
+        if doc_type_filter:
+            conds.append({'doc_type': doc_type_filter})
+        if metadata_filter:
+            for kk, vv in metadata_filter.items():
+                conds.append({kk: vv})
 
         search_kwargs = {'k': k}
-        if doc_type_filter:
-            search_kwargs['filter'] = {'doc_type': doc_type_filter} # type: ignore
+        if len(conds) == 1:
+            search_kwargs['filter'] = conds[0]
+        elif len(conds) > 1:
+            search_kwargs['filter'] = {'$and': conds} # type: ignore
 
         results = db.similarity_search_with_score(prefixed_query, **search_kwargs) # type: ignore
-
-        # Фильтрация нерелевантных результатов
+        
+        if not apply_threshold:
+            return results
         relevant = [(doc, score) for doc, score in results
                     if score <= RELEVANCE_THRESHOLD]
-
         if len(relevant) < len(results):
-            print(f"  [INFO] Отфильтровано {len(results) - len(relevant)} нерелевантных результатов "
-                  f"(distance > {RELEVANCE_THRESHOLD})")
-
+            print(f"  [INFO] Отфильтровано {len(results) - len(relevant)} нерелевантных "
+                f"(distance > {RELEVANCE_THRESHOLD})")
         return relevant
 
     def search_by_symptoms(self, symptom_vector_dict: dict, k: int = 4) -> List[Tuple[Document, float]]:
@@ -426,8 +614,14 @@ class KnowledgeBaseManager:
                     seen.add(key)
                     combined.append((doc, score))
 
-        # Сортируем по релевантности и возвращаем top-k
+        # Справочный контекст — ТОЛЬКО для обоснования диагноза: убираем из него
+        # подразделы «действия оператора» и «работы ТОиР» любого сценария, чтобы
+        # модель не перенесла их в ПРЕДПИСАНИЕ/ТОиР (замечание №5). Фильтр стоит
+        # ИМЕННО здесь, а не в общем search(), иначе ломаются operator/repair-поиски.
+        combined = [(d, s) for (d, s) in combined
+                    if d.metadata.get('sop_part') not in ('operator', 'repair')]
         combined.sort(key=lambda x: x[1])
+
         return combined[:k]
     
     def search_maintenance_schedule(self, pump_id: str, k: int = 2):
@@ -446,36 +640,67 @@ class KnowledgeBaseManager:
         )
         return [(doc, score) for doc, score in results if score <= SCHEDULE_THRESHOLD]
     
-    def search_repair_works(self, fault_type: str, k: int = 2):
-        """
-        Прямой поиск «Связанных работ ТОиР» по типу отказа в регламенте (doc_type='sop').
-        Отделён от поиска по симптомам: работы ремонтной бригады по дистанции
-        проигрывают уставкам в общем top-k и не доходят до контекста.
-        """
-        
-        fault_ru = {'overheat': 'перегрев', 'cavitation': 'кавитация',
-                    'electrical': 'электрическая неисправность'}.get(fault_type, '')
+    def search_repair_works(self, fault_type, k=2):
+        """«Связанные работы ТОиР» — ТОЛЬКО из сценария верного типа отказа."""
+        fault_ru = _FAULT_RU.get(fault_type, '')
         if not fault_ru:
             return []
-        query = (f"связанные работы ТОиР при {fault_ru}: капитальный ремонт, "
+        query = (f"связанные работы ТОиР при отказе типа {fault_ru}: "
                 f"дефектоскопия, замена, центровка, балансировка, ТО-1, ТО-2")
-        
+        exact = {'fault_type': fault_type, 'sop_part': 'repair'}
+
+        res = self.search(query, k=k, doc_type_filter='sop', metadata_filter=exact)
+        if res:
+            return res
+        res = self.search(query, k=k, doc_type_filter='sop', metadata_filter=exact,
+                        apply_threshold=False)
+        if res:
+            return res
+        res = self.search(query, k=k, doc_type_filter='sop',
+                        metadata_filter={'fault_type': fault_type})
+        if res:
+            return res
         return self.search(query, k=k, doc_type_filter='sop')
     
-    def search_operator_actions(self, fault_type: str, k: int = 2):
+    def search_operator_actions(self, fault_type, stage='critical', k=2):
         """
-        Прямой поиск «Действий оператора» сценария в регламенте (doc_type='sop').
-        Отделяет авторитетный источник предписаний (регламент) от справочного
-        мануала МНХВ, чтобы действия оператора не смешивались из двух документов.
+        «Действия оператора» строго из нужного сценария И нужной СТАДИИ.
+        stage: 'warning' (Предупреждение) | 'critical' (Авария).
+
+        Лестница фолбэков ослабляет фильтр постепенно: стадия → любой operator-блок
+        сценария → любой чанк сценария → весь SOP.
         """
 
-        fault_ru = {'overheat': 'перегрев', 'cavitation': 'кавитация',
-                    'electrical': 'электрическая неисправность'}.get(fault_type, '')
+        if str(stage).lower() == 'unknown':
+            return [] 
+
+        fault_ru = _FAULT_RU.get(fault_type, '')
         if not fault_ru:
             return []
-        query = (f"действия оператора при {fault_ru}: останов агрегата, изоляция, "
-                f"снижение оборотов, прикрыть задвижку, аварийный останов")
-        
+        stage = ('warning' if str(stage).lower() in ('warning', 'предупреждение', '1') 
+                 else 'critical')
+        tone = ('упреждающие действия оператора' if stage == 'warning'
+                else 'действия оператора при аварии')
+        query = f"{tone} при отказе типа {fault_ru}"
+    
+        exact = {'fault_type': fault_type, 'sop_part': 'operator', 'stage': stage}
+        res = self.search(query, k=k, doc_type_filter='sop', metadata_filter=exact)
+
+        # Постепенно ослабляет соответствие контексту для однозначной выдачи результата
+        if res:
+            return res
+        res = self.search(query, k=k, doc_type_filter='sop', metadata_filter=exact,
+                        apply_threshold=False)
+        if res:
+            return res
+        res = self.search(query, k=k, doc_type_filter='sop',
+                        metadata_filter={'fault_type': fault_type, 'sop_part': 'operator'})
+        if res:
+            return res
+        res = self.search(query, k=k, doc_type_filter='sop',
+                        metadata_filter={'fault_type': fault_type})
+        if res:
+            return res
         return self.search(query, k=k, doc_type_filter='sop')
 
 
@@ -502,17 +727,15 @@ if __name__ == "__main__":
     if db is not None:
         # Шаг 2: Визуализация базы знаний
         test_queries = [
-            {'query': 'вибрация подшипника превышает 8 мм/с, нарастающий тренд',
-             'label': 'Вибрация >8'},
             {'query': 'температура подшипника выше 93 градусов, перегрев',
              'label': 'Темп. >93°C'},
-            {'query': 'падение давления нагнетания при росте тока двигателя',
-             'label': 'Давление↓ / Ток↑'},
+            {'query': 'падение давления нагнетания',
+             'label': 'Давление↓'},
             {'query': 'износ торцевого уплотнения утечка рабочей жидкости',
              'label': 'Уплотнение'},
         ]
 
-        plot_all_rag(kb.chroma_dir, kb.embeddings, kb.EMBED_MODEL, test_queries, plots_dir)
+        plot_all_rag(kb, test_queries, plots_dir)
 
         # Шаг 3: Демонстрация поиска в консоли
         print(f"\n{'─'*55}")
@@ -522,9 +745,8 @@ if __name__ == "__main__":
             'critical_probability': 87.3,
             'inferred_fault': 'overheat',
             'top_symptoms': [
-                {'sensor': 'vibration',   'value': 8.1, 'shap_weight':  0.31},
-                {'sensor': 'temperature', 'value': 94.1,'shap_weight':  0.42},
-                {'sensor': 'pressure',    'value': 1.3, 'shap_weight': -0.18},
+                {'sensor': 'temperature', 'value': 94.1,'shap_weight': 3.4},
+                {'sensor': 'pressure', 'value': 1.3, 'shap_weight': 2.2},
             ]
         }
         results_symptoms = kb.search_by_symptoms(symptom_vec, k=3)

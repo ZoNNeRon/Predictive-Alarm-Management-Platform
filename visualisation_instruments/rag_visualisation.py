@@ -226,107 +226,189 @@ def plot_retrieval_quality(chroma_dir: str, embeddings,
     print(f"График 3 сохранён: {path}")
 
 
-def plot_fault_coverage_heatmap(chroma_dir: str, embeddings, save_dir: str):
+def plot_fault_coverage_heatmap(kb, save_dir: str):
     """
-    Матрица: строки = типы отказов, столбцы = типы документов.
-    Значение = кол-во попаданий в топ-3 по 3 запросам на тип отказа.
+    Матрица: строки = типы отказов, столбцы = типы документов (doc_type).
+    Значение = число чанков данного doc_type, извлечённых РЕАЛЬНЫМ пайплайном
+    (справочный контекст + действия оператора + работы ТОиР + график ТО) для
+    репрезентативного входа по каждому типу отказа.
+ 
+    В отличие от прежней версии (3 обобщённых запроса), здесь heatmap отражает
+    фактическое покрытие всех четырёх частей ответа агента.
     """
-
-    fault_queries = {
-        'Перегрев': [
-            'температура подшипника выше 93 градусов',
-            'перегрев двигателя нарастающий тренд',
-            'действия оператора при превышении температуры',
-        ],
-        'Кавитация': [
-            'кавитация насоса падение давления',
-            'кавитационный износ рабочего колеса',
-            'устранение кавитации регламент',
-        ],
-        'Электрика': [
-            'скачок тока двигателя при нормальной вибрации',
-            'электрическая неисправность привода насоса',
-            'проверка обмоток двигателя ТОиР',
-        ],
+    # Репрезентативные входы по типам отказа (сигнатуры из tm_regulation.md).
+    FAULT_PROBES = {
+        'Перегрев': {
+            'fault': 'overheat',
+            'symptoms': {
+                'critical_probability': 95, 'inferred_fault': 'overheat',
+                'top_symptoms': [
+                    {'sensor': 'temperature', 'value': 94.5, 'shap_weight':  0.42},
+                    {'sensor': 'current',     'value': 95.0, 'shap_weight':  0.30},
+                ],
+            },
+        },
+        'Кавитация': {
+            'fault': 'cavitation',
+            'symptoms': {
+                'critical_probability': 100, 'inferred_fault': 'cavitation',
+                'top_symptoms': [
+                    {'sensor': 'vibration', 'value': 9.11, 'shap_weight':  0.50},
+                    {'sensor': 'pressure',  'value': 0.71, 'shap_weight': -0.28},
+                ],
+            },
+        },
+        'Электрика': {
+            'fault': 'electrical',
+            'symptoms': {
+                'critical_probability': 90, 'inferred_fault': 'electrical',
+                'top_symptoms': [
+                    {'sensor': 'current',   'value': 93.0, 'shap_weight':  0.48},
+                    {'sensor': 'vibration', 'value': 2.41, 'shap_weight':  0.10},
+                ],
+            },
+        },
     }
-    
-    # 1. Подключение к локальной векторной базе
-    db = Chroma(persist_directory=chroma_dir, embedding_function=embeddings)
-    
-    # Словарь для сбора статистики
-    coverage_data = {fault: {} for fault in fault_queries.keys()}
-    all_found_doc_types = set()
-
-    # 2. Выполнение запросов и сбор метаданных (doc_type)
-    for fault, queries in fault_queries.items():
-        for q in queries:
-            # Извлечение топ-3 фрагмента для каждого запроса
-            docs = db.similarity_search(f"query: {q}", k=3)
-            for doc in docs:
-                # Если метаданных нет, 'Unknown'
-                doc_type = doc.metadata.get('doc_type', 'Unknown')
-                all_found_doc_types.add(doc_type)
-                coverage_data[fault][doc_type] = coverage_data[fault].get(doc_type, 0) + 1
-
-    # 3. Формирование DataFrame для тепловой карты
-    df_heatmap = pd.DataFrame(coverage_data).T
-    # Заполняем пустоты нулями и приводим к целым числам (счетчик документов)
-    df_heatmap = df_heatmap.fillna(0).astype(int)
-
-    # 4. Визуализация (светлая академическая тема)
-    LIGHT_BG = '#FFFFFF'
-    TEXT_CLR = '#222222'
-
+    # График ТО извлекается lookup'ом по pump_id и не зависит от типа отказа —
+    # берём представительный агрегат с ближайшим предиктивным риском.
+    PROBE_PUMP_ID = 'MNHV_005'
+ 
+    # Фиксированный порядок столбцов: gost и schedule присутствуют всегда.
+    _PREFERRED = ['manual', 'gost', 'diagnostics', 'sop', 'schedule']
+    doc_type_order = ([d for d in _PREFERRED if d in DOC_TYPES] +
+                      [d for d in DOC_TYPES if d not in _PREFERRED])
+ 
+    coverage = {fault: {dt: 0 for dt in doc_type_order} for fault in FAULT_PROBES}
+ 
+    for fault_label, probe in FAULT_PROBES.items():
+        f = probe['fault']
+        # Реальные 4 канала пайплайна (как в ai_agent_benchmark.build_scenarios).
+        retrieved = []
+        retrieved += kb.search_by_symptoms(probe['symptoms'], k=4)        # справочный
+        retrieved += kb.search_operator_actions(f, k=2)                   # предписание
+        retrieved += kb.search_repair_works(f, k=2)                       # ТОиР
+        retrieved += kb.search_maintenance_schedule(PROBE_PUMP_ID, k=2)   # график
+ 
+        for doc, _score in retrieved:
+            dt = doc.metadata.get('doc_type', 'unknown')
+            coverage[fault_label][dt] = coverage[fault_label].get(dt, 0) + 1
+ 
+    df_heatmap = (pd.DataFrame(coverage).T
+                  .reindex(columns=doc_type_order)
+                  .fillna(0).astype(int))
+ 
+    # Визуализация (светлая академическая тема, как в исходнике).
+    LIGHT_BG, TEXT_CLR = '#FFFFFF', '#222222'
     fig, ax = plt.subplots(figsize=(10, 6))
     fig.patch.set_facecolor(LIGHT_BG)
     ax.set_facecolor(LIGHT_BG)
-
-    # Отрисовка тепловой карты
+ 
     sns.heatmap(
-        df_heatmap,
-        annot=True,
-        fmt='d',
-        cmap='Blues',
-        linewidths=1,
-        linecolor='#DDDDDD',
-        cbar_kws={'label': 'Количество извлеченных чанков в Топ-3'},
-        ax=ax,
-        annot_kws={'size': 12, 'weight': 'bold'}
+        df_heatmap, annot=True, fmt='d', cmap='Blues',
+        linewidths=1, linecolor='#DDDDDD',
+        cbar_kws={'label': 'Кол-во чанков, извлечённых пайплайном'},
+        ax=ax, annot_kws={'size': 12, 'weight': 'bold'},
     )
-
-    # Стилизация текста и заголовков
     ax.set_title('Матрица покрытия базы знаний (Fault Type × Doc Type)\n'
-                 'Сбалансированность извлечения релевантного контекста (RAG)',
+                 'Реальный 4-канальный пайплайн: контекст + предписание + ТОиР + график',
                  color=TEXT_CLR, fontsize=14, fontweight='bold', pad=15)
-    ax.set_ylabel('Категория отказа (Симптомы)', color=TEXT_CLR, 
-                  fontsize=12, fontweight='bold')
-    ax.set_xlabel('Тип нормативного документа (doc_type)', color=TEXT_CLR, 
-                  fontsize=12, fontweight='bold')
-
+    ax.set_ylabel('Категория отказа', color=TEXT_CLR, fontsize=12, fontweight='bold')
+    ax.set_xlabel('Тип нормативного документа (doc_type)',
+                  color=TEXT_CLR, fontsize=12, fontweight='bold')
     ax.tick_params(colors=TEXT_CLR, labelsize=11)
-
+    plt.yticks(rotation=0)
     plt.tight_layout()
-
-    # 5. Сохранение графика
+ 
     os.makedirs(save_dir, exist_ok=True)
     plot_path = os.path.join(save_dir, 'rag_plot4_fault_coverage_heatmap.png')
     plt.savefig(plot_path, dpi=150, bbox_inches='tight', facecolor=LIGHT_BG)
-    print(f"График 4 сохранён: {plot_path}")
     plt.close(fig)
+    print(f"График 4 сохранён: {plot_path}")
+
+def plot_fault_section_sourcing(kb, save_dir: str):
+    """
+    Строки = типы отказов; столбцы = 4 раздела ответа агента.
+    В ячейке — какой(ие) doc_type извлечены реальным каналом пайплайна и сколько
+    чанков. Цвет — число чанков. Демонстрирует разделение источников по разделам.
+    """
+
+    FAULT_PROBES = {
+        'Перегрев': {
+            'fault': 'overheat',
+            'symptoms': {'critical_probability': 95, 'inferred_fault': 'overheat',
+                         'top_symptoms': [
+                             {'sensor': 'temperature', 'value': 94.5, 'shap_weight': 0.42},
+                             {'sensor': 'current',     'value': 95.0, 'shap_weight': 0.30}]},
+        },
+        'Кавитация': {
+            'fault': 'cavitation',
+            'symptoms': {'critical_probability': 100, 'inferred_fault': 'cavitation',
+                         'top_symptoms': [
+                             {'sensor': 'vibration', 'value': 9.11, 'shap_weight':  0.50},
+                             {'sensor': 'pressure',  'value': 0.71, 'shap_weight': -0.28}]},
+        },
+        'Электрика': {
+            'fault': 'electrical',
+            'symptoms': {'critical_probability': 90, 'inferred_fault': 'electrical',
+                         'top_symptoms': [
+                             {'sensor': 'current',   'value': 93.0, 'shap_weight': 0.48},
+                             {'sensor': 'vibration', 'value': 2.41, 'shap_weight': 0.10}]},
+        },
+    }
+    PROBE_PUMP_ID = 'MNHV_005'   # для канала «График ТО» (lookup по pump_id)
+    SECTIONS = ['Справочный\nконтекст', 'Действия\nоператора',
+                'Работы\nТОиР', 'График\nТО']
+ 
+    counts = pd.DataFrame(0, index=list(FAULT_PROBES), columns=SECTIONS, dtype=int)
+    annot = pd.DataFrame('', index=list(FAULT_PROBES), columns=SECTIONS, dtype=object)
+ 
+    for fault, probe in FAULT_PROBES.items():
+        f = probe['fault']
+        channels = {
+            'Справочный\nконтекст': kb.search_by_symptoms(probe['symptoms'], k=4),
+            'Действия\nоператора':  kb.search_operator_actions(f, k=2),
+            'Работы\nТОиР':         kb.search_repair_works(f, k=2),
+            'График\nТО':           kb.search_maintenance_schedule(PROBE_PUMP_ID, k=2),
+        }
+        for sec, res in channels.items():
+            dts = [d.metadata.get('doc_type', 'unknown') for d, _ in res]
+            counts.loc[fault, sec] = len(dts)
+            uniq = sorted(set(dts))
+            # Каждый doc_type — на своей строке (чтобы подпись не выходила за ячейку).
+            annot.loc[fault, sec] = ('\n'.join(uniq) + f"\n({len(dts)} чанк.)"
+                                     if dts else '—')
+ 
+    LIGHT_BG, TEXT_CLR = '#FFFFFF', '#222222'
+    fig, ax = plt.subplots(figsize=(11, 6))
+    fig.patch.set_facecolor(LIGHT_BG)
+    ax.set_facecolor(LIGHT_BG)
+    sns.heatmap(counts, annot=annot.values, fmt='', cmap='Blues', vmin=0,
+                linewidths=1, linecolor='#DDDDDD',
+                cbar_kws={'label': 'Число извлечённых чанков'},
+                annot_kws={'size': 10, 'weight': 'bold'}, ax=ax)
+    ax.set_title('Источники по разделам предписания (Fault Type x Раздел ответа)\n'
+                 'Разделение источников: предписание/ТОиР — регламент, график — расписание',
+                 color=TEXT_CLR, fontsize=13, fontweight='bold', pad=14)
+    ax.set_ylabel('Категория отказа', color=TEXT_CLR, fontsize=12, fontweight='bold')
+    ax.set_xlabel('Раздел ответа агента', color=TEXT_CLR, fontsize=12, fontweight='bold')
+    ax.tick_params(colors=TEXT_CLR, labelsize=11)
+    plt.yticks(rotation=0)
+    plt.tight_layout()
+    os.makedirs(save_dir, exist_ok=True)
+    p = os.path.join(save_dir, 'rag_plot5_section_sourcing.png')
+    plt.savefig(p, dpi=150, bbox_inches='tight', facecolor=LIGHT_BG)
+    plt.close(fig)
+    print(f"График 5 сохранён: {p}")
 
 
 # Точка входа (все три графика за один вызов)
 
-def plot_all_rag(chroma_dir: str, embeddings,
-                 embed_model_name: str,
-                 test_queries: List[Dict],
-                 save_dir: str):
-    """
-    Строит все три графика RAG-визуализации.
-    Аналог analyze_fault_recall в fault_recall_analysis.py.
-    """
+def plot_all_rag(kb, test_queries, save_dir: str):
+    """Строит все пять графиков RAG-визуализации. Принимает kb (KnowledgeBaseManager)."""
     print("\nГенерация графиков RAG-системы...")
-    plot_knowledge_base_stats(chroma_dir, embeddings, save_dir)
-    plot_chunk_length_distribution(chroma_dir, embeddings, save_dir)
-    plot_retrieval_quality(chroma_dir, embeddings, embed_model_name, test_queries, save_dir)
-    plot_fault_coverage_heatmap(chroma_dir, embeddings, save_dir)
+    plot_knowledge_base_stats(kb.chroma_dir, kb.embeddings, save_dir)
+    plot_chunk_length_distribution(kb.chroma_dir, kb.embeddings, save_dir)
+    plot_retrieval_quality(kb.chroma_dir, kb.embeddings, kb.EMBED_MODEL,
+                           test_queries, save_dir)
+    plot_fault_coverage_heatmap(kb, save_dir)
+    plot_fault_section_sourcing(kb, save_dir)     

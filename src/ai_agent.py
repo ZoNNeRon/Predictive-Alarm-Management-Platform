@@ -32,12 +32,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
-from config.settings import LLM_MODELS, DEFAULT_LLM_MODEL, FAULT_LABELS, WINDOW_SIZES
+from config.settings import (LLM_MODELS, DEFAULT_LLM_MODEL, FAULT_LABELS, 
+                             WINDOW_SIZES, DOC_DISPLAY_NAMES)
 
 # Импорт типов из XAI-модуля — единый контракт данных
 from xai_module import SymptomVector, XAIExplainer
 from data_preprocessor import DataPreprocessor
-from rag_database import KnowledgeBaseManager
+from rag_database import KnowledgeBaseManager, resolve_stage
 
 
 # Структура ответа агента 
@@ -69,6 +70,10 @@ def _load_system_prompt() -> str:
         return f.read().strip()
 
 SYSTEM_PROMPT = _load_system_prompt()
+
+def _display_source(source: str) -> str:
+    """Имя файла → читаемое имя норматива (для атрибуции, понятной оператору)."""
+    return DOC_DISPLAY_NAMES.get(source, source)
 
 
 # Основной класс агента 
@@ -182,10 +187,22 @@ class DiagnosticAgent:
                 )
 
         return "\n".join(lines)
+    
+    def _event_header(self, symptom_vector) -> str:
+        """
+        ПРАВКА №1+2: детерминированная шапка с тегом агрегата и временем события.
+        Эти факты НЕ доверяются модели — оператор должен видеть их гарантированно.
+        Относительную «давность» («2 минуты назад») вычисляет UI по реальным часам.
+        """
+        return (f"АГРЕГАТ: {symptom_vector.pump_id}   |   "
+                f"ВРЕМЯ СОБЫТИЯ: {symptom_vector.timestamp}")
 
     def _format_context(self, rag_results: list) -> tuple:
         """
         Преобразует результаты RAG в блок КОНТЕКСТ.
+        Фрагменты помечаются ЧИТАЕМЫМ именем источника, а не filename
+        и не бессмысленным для оператора «[Фрагмент N]». Возвращает (text, sources),
+        где sources — список читаемых имён (для AgentResponse.sources).
 
         Args:
             rag_results: список (Document, distance) из 
@@ -198,21 +215,118 @@ class DiagnosticAgent:
 
         if not rag_results:
             return "", []
-
-        blocks = []
-        sources = []
-        for i, item in enumerate(rag_results, 1):
+        blocks, sources = [], []
+        for item in rag_results:
             doc = item[0] if isinstance(item, tuple) else item
             text = doc.page_content.replace('passage: ', '', 1)
-            source = doc.metadata.get('source', 'неизвестный источник')
-            blocks.append(f"[Фрагмент {i}] (источник: {source})\n{text}")
-            if source not in sources:
-                sources.append(source)
-
+            display = _display_source(doc.metadata.get('source', 'неизвестный источник'))
+            blocks.append(f"[Источник: {display}]\n{text}")
+            if display not in sources:
+                sources.append(display)
         return "\n\n".join(blocks), sources
+    
+    def _unknown_response(self, symptom_vector):
+        """Детерминированный ответ для неопределённого состояния (LLM не вызывается)."""
+        
+        fc = getattr(symptom_vector, 'fault_confidence', None)
+        if fc is not None:
+            fc_pct = fc * 100.0 if fc <= 1.0 else fc
+            conf_str = f" (уверенность типа {fc_pct:.0f} %)"
+        else:
+            conf_str = ""
 
+        text = (
+            f"{self._event_header(symptom_vector)}\n"
+            f"СТАТУС: НЕОПРЕДЕЛЁННОЕ СОСТОЯНИЕ — зафиксирована аномалия параметров, "
+            f"однако тип и стадия отказа не классифицированы уверенно{conf_str}.\n"
+            f"ДИАГНОЗ И ОБОСНОВАНИЕ: однозначное сопоставление со сценарием регламента "
+            f"по текущим данным невозможно.\n"
+            f"РЕКОМЕНДАЦИЯ: Требуется ручная инспекция оборудования. До подтверждения "
+            f"диагноза усилить контроль ключевых параметров (вибрация, температура, ток, "
+            f"давление); автоматическое предписание действий НЕ формируется."
+        )
+        return AgentResponse(
+            pump_id=symptom_vector.pump_id,
+            raw_text=text,
+            model_name=self.model_name,
+            used_context=False,
+            sources=[],
+            latency_sec=0.0,
+            gen_time_sec=0.0,
+            eval_count=0,
+            prompt_eval_count=0,
+            tokens_per_sec=0.0,
+            format_ok=False,
+            error=None,
+        )
+    
     # Главный метод 
 
+    def _build_full_prompt(self, symptom_vector, rag_results, schedule_results,
+                       repair_results, operator_results):
+        """Сборка промпта со стадийной меткой и детерминированным вердиктом по ремонту."""
+
+        # Стадия и вероятность аварии (из аналитического ядра) 
+        pc = getattr(symptom_vector, 'predicted_class', 2)
+        stage = resolve_stage(symptom_vector)
+        stage_ru = 'Предупреждение' if stage == 'warning' else 'Авария'
+        raw_p = getattr(symptom_vector, 'critical_probability', 0.0) or 0.0
+        pct = raw_p * 100.0 if raw_p <= 1.0 else raw_p   # принимает и долю, и проценты
+    
+        # Детерминированный вердикт по внеплановому выводу в ремонт 
+        if stage == 'warning':
+            verdict = ("Стадия «Предупреждение»: досрочный (внеплановый) вывод в ремонт "
+                    "на текущий момент не требуется.")
+        elif pct >= 80:
+            verdict = (f"Вероятность аварии {pct:.0f}% превышает порог 80% — ТРЕБУЕТСЯ "
+                    f"внеплановый вывод по техническому состоянию (Repair-on-condition).")
+        else:
+            verdict = (f"Вероятность аварии {pct:.0f}% ниже порога 80% — внеплановый вывод "
+                    f"по техническому состоянию не требуется.")
+            
+        # ── Блоки контекста ──
+        symptoms_block = self._format_symptoms(symptom_vector)
+        symptoms_block = f"СТАДИЯ: {stage_ru} (P(аварии) = {pct:.1f}%)\n{symptoms_block}"
+    
+        operator_block, _ = self._format_context(operator_results or [])
+        context_block, ctx_src = self._format_context(rag_results or [])
+        repair_block, rep_src = self._format_context(repair_results or [])
+        schedule_block, _ = self._format_context(schedule_results or [])
+    
+        sources = []
+        for s in ctx_src + rep_src:
+            if s not in sources:
+                sources.append(s)
+    
+        operator_section = (
+            f"ДЕЙСТВИЯ ОПЕРАТОРА (регламент — ЕДИНСТВЕННЫЙ источник раздела ПРЕДПИСАНИЕ):\n{operator_block}"
+            if operator_block else "ДЕЙСТВИЯ ОПЕРАТОРА: в регламенте не найдены.")
+        reference_section = (
+            f"СПРАВОЧНЫЙ КОНТЕКСТ (мануал/ГОСТ/диагностика — ТОЛЬКО для обоснования диагноза):\n{context_block}"
+            if context_block else "СПРАВОЧНЫЙ КОНТЕКСТ: не найден.")
+        repair_section = (
+            f"РАБОТЫ ТОиР (из регламента — для ремонтной бригады):\n{repair_block}"
+            if repair_block else "РАБОТЫ ТОиР: связанные работы в регламенте не найдены.")
+        
+        # Вердикт кладётся ПЕРЕД датами графика — модель перепишет его дословно.
+        if schedule_block:
+            schedule_section = (
+                f"ГРАФИК ТОиР (плановый ремонт {symptom_vector.pump_id}):\n"
+                f"ВЕРДИКТ ПО ВЫВОДУ В РЕМОНТ: {verdict}\n{schedule_block}")
+        else:
+            schedule_section = (f"ГРАФИК ТОиР: данные о плановом ремонте не найдены.\n"
+                                f"ВЕРДИКТ ПО ВЫВОДУ В РЕМОНТ: {verdict}")
+    
+        user_prompt = (
+            f"СИМПТОМЫ (данные от аналитических моделей):\n{symptoms_block}\n\n"
+            f"{operator_section}\n\n{reference_section}\n\n"
+            f"{repair_section}\n\n{schedule_section}\n\n"
+            f"Сформируй предписание строго по заданному формату."
+        )
+        full_prompt = f"{SYSTEM_PROMPT}\n\n{'='*60}\n\n{user_prompt}"
+
+        return full_prompt, sources, bool(context_block or operator_block)
+    
     def generate_prescription(self, symptom_vector: SymptomVector,
                               rag_results: list,
                               schedule_results=None,
@@ -234,10 +348,12 @@ class DiagnosticAgent:
             repair_results:   rag_database.search_repair_works(inferred_fault)
         """
 
+        if resolve_stage(symptom_vector) == 'unknown':
+            return self._unknown_response(symptom_vector)
         symptoms_block = self._format_symptoms(symptom_vector)
         context_block, sources = self._format_context(rag_results)              # справочный
         operator_block, op_src = self._format_context(operator_results or [])   # действия оператора
-        repair_block, rep_src   = self._format_context(repair_results or [])
+        repair_block, rep_src = self._format_context(repair_results or [])
         schedule_block, sch_src = self._format_context(schedule_results or [])
         for s in op_src + rep_src + sch_src:
             if s not in sources:
@@ -271,7 +387,9 @@ class DiagnosticAgent:
             f"Сформируй предписание строго по заданному формату."
         )
 
-        full_prompt = f"{SYSTEM_PROMPT}\n\n{'='*60}\n\n{user_prompt}"
+        full_prompt, sources, used_ctx = self._build_full_prompt(
+            symptom_vector, rag_results, schedule_results, 
+            repair_results, operator_results)
 
         chat_kwargs = {
             'model': self.model_name,
@@ -294,6 +412,7 @@ class DiagnosticAgent:
         latency = round(time.time() - start, 2)
 
         raw_text = resp['message']['content'].strip()
+        raw_text = f"{self._event_header(symptom_vector)}\n{raw_text}"
         eval_count = resp.get('eval_count', 0)
         prompt_eval_count = resp.get('prompt_eval_count', 0)
         eval_duration = resp.get('eval_duration', 0) / 1e9
@@ -311,6 +430,38 @@ class DiagnosticAgent:
             eval_count=eval_count, prompt_eval_count=prompt_eval_count,
             tokens_per_sec=tps, format_ok=format_ok,
         )
+    
+    def generate_prescription_stream(self, symptom_vector, rag_results,
+                                 schedule_results=None, repair_results=None,
+                                 operator_results=None):
+        """
+        Генератор: сначала отдаёт детерминированную шапку, затем стримит ответ модели
+        по мере генерации (ollama stream=True). В Streamlit — st.write_stream(gen).
+        Метрики (eval_count и т.п.) приходят в последнем чанке (chunk.get('done')).
+        """
+
+        if resolve_stage(symptom_vector) == 'unknown':
+            yield self._unknown_response(symptom_vector).raw_text
+            return
+        
+        full_prompt, _sources, _used = self._build_full_prompt(
+            symptom_vector, rag_results, schedule_results, repair_results, operator_results)
+    
+        yield self._event_header(symptom_vector) + "\n"   # шапка сразу, до модели
+    
+        chat_kwargs = {
+            'model': self.model_name,
+            'messages': [{'role': 'user', 'content': full_prompt}],
+            'options': self.options,
+            'stream': True,                                # ← потоковая отдача
+        }
+        if 'qwen3' in self.model_name.lower():
+            chat_kwargs['think'] = False
+    
+        for chunk in self.client.chat(**chat_kwargs):
+            piece = chunk.get('message', {}).get('content', '')
+            if piece:
+                yield piece
 
 
 # Точка входа (тестирование модуля) 
@@ -371,7 +522,7 @@ if __name__ == "__main__":
     models_to_test = LLM_MODELS
 
     for n, model_name in enumerate(LLM_MODELS, 1):
-        print(f"\n[3.{n}/{len(LLM_MODELS)}] LLM-агент: {model_name}...")
+        print(f"\n[3({n}/{len(LLM_MODELS)})] LLM-агент: {model_name}...")
         agent = DiagnosticAgent(model_name=model_name)
         response = agent.generate_prescription(sv, rag_results, schedule_results, 
                                                repair_results, operator_results)
