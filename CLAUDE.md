@@ -26,32 +26,52 @@
 
 ## Структура репозитория
 
+> **Важно:** репозиторий реструктурирован в пакетную раскладку. Код вынесен в
+> доменные подпакеты `src/<domain>/`, эксперименты — в `experiments/`, все
+> артефакты прогона (графики, таблицы, векторная БД) — в `artifacts/`.
+
 ```
 predictive_alarm_platform/
 │
 ├── src/
-│   ├── data_generator.py           # ГОТОВО — AR(1) + State Machine + 3 типа отказа (A/Б/В)
-│   ├── data_preprocessor.py        # ГОТОВО — rolling features, build_fault_dataset()
-│   ├── ml_pipeline.py              # ГОТОВО — модель ТЯЖЕСТИ: LR / RF / XGBoost, AlarmManager
-│   ├── fault_classifier_pipeline.py# ГОТОВО — модель ТИПА отказа: overheat/cavitation/electrical
-│   ├── fault_recall_analysis.py    # ГОТОВО — recall по типам отказа, доказательство 3 сигнатур
-│   ├── xai_module.py               # ГОТОВО — SHAP TreeExplainer, SymptomVector, SHAP-эвристика
-│   ├── rag_database.py             # ГОТОВО — ChromaDB + multilingual-e5-large, PDF→чанки
-│   ├── ai_agent.py                 # ГОТОВО — DiagnosticAgent (Ollama), сравнение 3 моделей
-│   └── app.py                      # НЕ НАПИСАН — Streamlit двухуровневый UI
+│   ├── __init__.py
+│   ├── data/
+│   │   ├── data_generator.py        # ГОТОВО — AR(1) + State Machine + 3 типа отказа (A/Б/В)
+│   │   └── data_preprocessor.py     # ГОТОВО — rolling features, build_fault_dataset()
+│   ├── ml/
+│   │   ├── severity_classifier_pipeline.py # ГОТОВО — модель ТЯЖЕСТИ: LR/RF/XGBoost, AlarmManager (бывш. ml_pipeline.py)
+│   │   ├── fault_classifier_pipeline.py    # ГОТОВО — модель ТИПА отказа: overheat/cavitation/electrical
+│   │   └── fault_recall_analysis.py        # ГОТОВО — recall по типам отказа, доказательство 3 сигнатур
+│   ├── xai/
+│   │   └── xai_module.py            # ГОТОВО — SHAP TreeExplainer, SymptomVector, SHAP-эвристика
+│   ├── rag/
+│   │   └── rag_database.py          # ГОТОВО — ChromaDB + multilingual-e5-large, структурный чанкинг SOP
+│   ├── agent/
+│   │   └── ai_agent.py              # ГОТОВО — DiagnosticAgent (Ollama), 4-канальный промпт, стриминг
+│   ├── runtime/                     # ГОТОВО — слой реального времени между UI и ядром
+│   │   ├── platform_backend.py      # Адаптер UI↔ядро: PlatformBackend (боевой) + ProtoBackend (отладка)
+│   │   ├── alarm_runtime.py         # FSM тревог с дебаунсом, Incident, AlarmJournal (гейтинг LLM)
+│   │   └── online_preprocessor.py   # Потоковый stateful-препроцессор (паритет с offline FEATURE_COLS)
+│   ├── app/
+│   │   └── app.py                   # ГОТОВО — Streamlit двухуровневый UI (оператор + инженер)
+│   └── visualisation/               # (бывш. visualisation_instruments/)
+│       ├── __init__.py              # Реэкспорт всех функций визуализации
+│       ├── simulation_visualisation.py  # Графики генератора (plot_smart_episode)
+│       ├── ml_visualisation.py          # Графики ML (confusion, metrics, PR, recall, fault classifier)
+│       ├── rag_visualisation.py         # Графики RAG (состав базы, чанки, качество поиска)
+│       ├── xai_visualisation.py         # Графики XAI (waterfall, beeswarm — severity + fault)
+│       └── ai_visualisation.py          # Графики бенчмарка LLM-агента
 │
-├── scripts/
-│   ├── xgboost_benchmark.py        # ГОТОВО — LOGO CV (5 фолдов), доказательство обобщения
-│   ├── ai_agent_benchmark.py       # ГОТОВО — бенчмарк 3 LLM: 6 сценариев (fault×stage), 5 метрик
-│   ├── rag_regression_guard_test.py# ГОТОВО — регрессионный guard: fault_type+stage привязка SOP
-│   └── permutation_test.py         # ГОТОВО — sanity check: метки перемешаны → accuracy ~1/3
-│
-├── visualisation_instruments/
-│   ├── __init__.py              # Реэкспорт всех функций визуализации
-│   ├── simulation_visualisation.py  # Графики генератора (plot_smart_episode)
-│   ├── ml_visualisation.py          # Графики ML (confusion, metrics, PR, recall)
-│   ├── rag_visualisation.py         # Графики RAG (состав базы, чанки, качество поиска)
-│   └── xai_visualisation.py         # Графики XAI (waterfall, beeswarm по типам отказа)
+├── experiments/                     # (бывш. scripts/) — исследования и регрессионные тесты
+│   ├── data_stream/
+│   │   └── demo_stream.py           # ГОТОВО — детерминированный демо-сценарий из датасета + ScenarioPlayer
+│   ├── logo_cv/
+│   │   └── xgboost_benchmark.py     # ГОТОВО — LOGO CV (5 фолдов), доказательство обобщения
+│   ├── llm_benchmark/
+│   │   └── ai_agent_benchmark.py    # ГОТОВО — бенчмарк 3 LLM: 6 сценариев (fault×stage), 5 метрик
+│   └── validation/
+│       ├── rag_regression_guard_test.py # ГОТОВО — guard: fault_type+stage привязка SOP
+│       └── permutation_test.py          # ГОТОВО — sanity check: метки перемешаны → accuracy ~1/3
 │
 ├── config/
 │   ├── __init__.py
@@ -64,9 +84,12 @@ predictive_alarm_platform/
 ├── data/
 │   ├── raw/
 │   │   └── industrial_pumps_dataset.csv        # 648 000 строк, 5 насосов, 90 дней, шаг 1 мин
-│   ├── processed/
-│   │   ├── preprocessed_pumps_dataset.csv      # 40 rolling-признаков, target 0/1/2, fault_type
-│   │   └── fault_type_pumps_dataset.csv        # выборка для классификатора типа (target=1&2)
+│   └── processed/
+│       ├── preprocessed_pumps_dataset.csv      # 40 rolling-признаков, target 0/1/2, fault_type
+│       └── fault_type_pumps_dataset.csv        # выборка для классификатора типа (target=1&2)
+│
+├── artifacts/                                   # (бывш. data/graphs + data/tables + chroma_db) — всё, что генерится прогоном
+│   ├── chroma_db/                               # Локальная векторная БД ChromaDB
 │   ├── graphs/                                  # Графики (PNG)
 │   │   ├── DG_plot_alarm_detection.png          # Симуляция: окно вокруг отказа (5 панелей)
 │   │   ├── ML_plot1_confusion_matrices.png      # Модель тяжести: confusion matrix (3 модели)
@@ -77,10 +100,10 @@ predictive_alarm_platform/
 │   │   ├── ML_fault_plot1_confusion_matrix.png  # Классификатор типа: confusion matrix
 │   │   ├── ML_fault_plot2_model_comparison.png
 │   │   ├── ML_fault_plot3_stage_split.png       # Recall по стадии (Warning vs Critical)
-│   │   ├── shap_plot1_waterfall_MNHV_005.png         # Severity-модель: waterfall
-│   │   ├── shap_plot2_beeswarm_overheat.png        # Severity-модель: beeswarm
-│   │   ├── shap_plot3_beeswarm_cavitation.png
-│   │   ├── shap_plot4_beeswarm_electrical.png
+│   │   ├── shap_severity_plot1_waterfall_MNHV_005.png  # Severity-модель: waterfall
+│   │   ├── shap_severity_plot2_beeswarm_overheat.png   # Severity-модель: beeswarm
+│   │   ├── shap_severity_plot3_beeswarm_cavitation.png
+│   │   ├── shap_severity_plot4_beeswarm_electrical.png
 │   │   ├── shap_fault_plot1_waterfall_MNHV_005.png # Fault-классификатор: waterfall
 │   │   ├── shap_fault_plot2_beeswarm_overheat.png  # Fault-классификатор: beeswarm
 │   │   ├── shap_fault_plot3_beeswarm_cavitation.png
@@ -94,7 +117,9 @@ predictive_alarm_platform/
 │   │   ├── agent_plot2_quality_auto.png         # Профиль качества (дискриминирующие метрики)
 │   │   ├── agent_plot3_summary_heatmap.png      # Сводный хитмап (relative quality)
 │   │   ├── agent_plot4_expert_radar.png         # Радар экспертных оценок
-│   │   └── agent_plot5_stage_breakdown.png      # Стадийный разрез (Warning vs Авария)
+│   │   ├── agent_plot5_stage_breakdown.png      # Стадийный разрез (Warning vs Авария)
+│   │   ├── ui_waterfall_sev_MNHV_005.png        # SHAP waterfall тяжести для инженерной вкладки UI (runtime)
+│   │   └── ui_waterfall_fault_MNHV_005.png      # SHAP waterfall типа отказа для инженерной вкладки UI (runtime)
 │   └── tables/                                  # CSV-таблицы результатов
 │       ├── ML_fault_recall_table.csv
 │       ├── ML_fault_classifier_summary.csv
@@ -103,12 +128,14 @@ predictive_alarm_platform/
 │       └── agent_summary_by_stage.csv           # Сводка model × stage
 │
 ├── models/
-│   ├── lr_pump_model.joblib                     # Модель тяжести: LR
-│   ├── rf_pump_model.joblib                     # Модель тяжести: RF
-│   ├── xgboost_pump_model.joblib                # Модель тяжести: XGBoost (основная)
-│   ├── fault_lr_model.joblib                    # Классификатор типа: LR
-│   ├── fault_rf_model.joblib                    # Классификатор типа: RF
-│   └── fault_xgboost_model.joblib               # Классификатор типа: XGBoost
+│   ├── severity/                                # Модель ТЯЖЕСТИ
+│   │   ├── severity_lr_model.joblib             # LR
+│   │   ├── severity_rf_model.joblib             # RF
+│   │   └── severity_xgboost_model.joblib        # XGBoost (основная)
+│   └── fault_type/                              # Классификатор ТИПА отказа
+│       ├── fault_lr_model.joblib                # LR
+│       ├── fault_rf_model.joblib                # RF
+│       └── fault_xgboost_model.joblib           # XGBoost
 │
 ├── knowledge_base/
 │   ├── gosts/
@@ -126,16 +153,22 @@ predictive_alarm_platform/
 │   └── diagnostics/
 │       └── diagnostics_extended.md    # Расширенная вибродиагностика (diagnostics)
 │
-├── chroma_db/                         # Локальная векторная БД ChromaDB
 ├── requirements.txt
 └── CLAUDE.md                          # ← этот файл
 ```
+
+> **Пути в коде.** Запуск модулей как `python -m src.<domain>.<module>` из корня
+> репозитория; `__main__`-блоки сами добавляют корень и `src/` в `sys.path`.
+> Модели грузятся из `models/severity/severity_xgboost_model.joblib` и
+> `models/fault_type/fault_xgboost_model.joblib`; ChromaDB — из `artifacts/chroma_db`;
+> графики/таблицы пишутся в `artifacts/graphs` и `artifacts/tables`. Эти же пути
+> использует боевой `PlatformBackend` (`src/runtime/platform_backend.py`).
 
 ---
 
 ## Что уже реализовано (детально)
 
-### 1. `data_generator.py` — Генератор данных
+### 1. `src/data/data_generator.py` — Генератор данных
 - **Конечный автомат (State Machine):** 5 состояний — Off (0), Startup (1), Healthy (2), Degradation (3), Critical (4)
 - **AR(1) процесс** для каждого сенсора: `x[t] = μ + φ*(x[t-1] - μ) + ε[t]`. φ = 0.88–0.92 для Healthy, 0.80 для Critical
 - **Три типа отказа** с разными физическими сигнатурами (распределение среди аварийных циклов):
@@ -146,10 +179,10 @@ predictive_alarm_platform/
 - Помехи датчиков: вероятность 0.001, три отдельных флага `anomaly_vibration` / `anomaly_temperature` / `anomaly_current`
 - **5 насосов** (`MNHV_001`–`MNHV_005`), `PUMP_SEEDS` из `config/settings/settings.py` (42, 137, 2026, 54321, 99999)
 - **648 000 строк**, 90 дней, шаг 1 минута; схема: `[timestamp, pump_id, state, state_name, fault_type, vibration, temperature, current, pressure, anomaly_vibration, anomaly_temperature, anomaly_current]`
-- Визуализация вынесена в `visualisation_instruments/simulation_visualisation.py`; вызов: `plot_smart_episode(df, ...)` через импорт из `visualisation_instruments`
+- Визуализация вынесена в `src/visualisation/simulation_visualisation.py`; вызов: `plot_smart_episode(df, ...)` через импорт из `src.visualisation`
 - Выход: `data/raw/industrial_pumps_dataset.csv`
 
-### 2. `data_preprocessor.py` — Подготовка признаков
+### 2. `src/data/data_preprocessor.py` — Подготовка признаков
 - **Rolling features** (15, 30, 60 мин): mean, std, max для каждого из 4 сенсоров
 - **Gradient:** `shift(1) - shift(31)` — ровно 30 шагов, консистентно с rolling(30)
 - **Data leakage защита:** `shift(1)` перед каждым `.rolling()` — в строке T используется только [T-W … T-1]
@@ -160,50 +193,51 @@ predictive_alarm_platform/
 - **`build_fault_dataset(df_processed)`** — новый метод: формирует выборку для классификатора типа из строк `target==1` и `target==2`; добавляет `fault_target` (0=overheat, 1=cavitation, 2=electrical) и `severity_stage`; те же `FEATURE_COLS` без пересчёта
 - Выходы: `preprocessed_pumps_dataset.csv` + `fault_type_pumps_dataset.csv`
 
-### 3. `ml_pipeline.py` — Обучение моделей
+### 3. `src/ml/severity_classifier_pipeline.py` — Модель тяжести (бывш. `ml_pipeline.py`)
 - **Group Split:** train = MNHV_001–004, test = MNHV_005 (из `config/settings`: `TRAIN_PUMPS`, `TEST_PUMPS`)
 - Три модели: Logistic Regression (baseline), Random Forest (n=300), XGBoost (n=300, lr=0.1, depth=6)
 - Балансировка: `class_weight='balanced'` + `sample_weight` через `compute_sample_weight`
 - **Метрики:** Confusion Matrix, F1-Macro, Recall(Авария) как KPI, PR-AUC
 - **Результаты XGBoost:** F1-Macro=0.97, Recall(Critical)=0.949, PR-AUC(Critical)=0.990
 - **`AlarmManager`:** если `raw_state in [0, 1]` → принудительно возвращает 0 (Alarm Shelving)
-- Визуализация вынесена в `visualisation_instruments/ml_visualisation.py`; вызов `plot_all(metrics, y_test, output_dir)` — графики сохраняются с префиксом `ML_`
+- Визуализация вынесена в `src/visualisation/ml_visualisation.py`; вызов `plot_all(metrics, y_test, output_dir)` — графики сохраняются с префиксом `ML_`
+- **Сохранение моделей:** `models/severity/severity_{lr,rf,xgboost}_model.joblib`
 - **Шаг 10** в `__main__`: вызов `fault_recall_analysis.analyze_fault_recall(xgb_model, df_test, ...)`
 
-### 4. `fault_recall_analysis.py` — Валидация по типам отказа
+### 4. `src/ml/fault_recall_analysis.py` — Валидация по типам отказа
 - **Цель:** доказать, что модель ТЯЖЕСТИ различает три физических сценария, а не работает по «всё выросло → авария»
-- **`analyze_fault_recall(model, df_test, feature_cols, save_graphs_dir, save_tables_dir)`** — вызывается из `ml_pipeline.py` (шаг 10) и автономно
+- **`analyze_fault_recall(model, df_test, feature_cols, save_graphs_dir, save_tables_dir)`** — вызывается из `severity_classifier_pipeline.py` (шаг 10) и автономно
 - **Recall(Critical):** доля строк `state=4` данного `fault_type`, предсказанных как класс 2
 - **Recall(Warning):** доля строк `state=3` данного `fault_type`, предсказанных как ≥ 1 (угроза не пропущена)
 - **Fallback:** если `fault_type` отсутствует в processed CSV — присоединяется из raw по `[timestamp, pump_id]`
-- Визуализация вынесена в `visualisation_instruments/ml_visualisation.py` (функция `recall_plot`)
-- **Выходы:** `data/graphs/ML_plot4_fault_recall_analysis.png`, `data/tables/ML_fault_recall_table.csv`
+- Визуализация вынесена в `src/visualisation/ml_visualisation.py` (функция `recall_plot`)
+- **Выходы:** `artifacts/graphs/ML_plot4_fault_recall_analysis.png`, `artifacts/tables/ML_fault_recall_table.csv`
 
-### 5. `fault_classifier_pipeline.py` — Классификатор типа отказа (вторая модель)
-- **Второй этап иерархической классификации:** `ml_pipeline.py` определяет ТЯЖЕСТЬ (0/1/2); этот модуль определяет ФИЗИЧЕСКИЙ ТИП (overheat / cavitation / electrical)
+### 5. `src/ml/fault_classifier_pipeline.py` — Классификатор типа отказа (вторая модель)
+- **Второй этап иерархической классификации:** `severity_classifier_pipeline.py` определяет ТЯЖЕСТЬ (0/1/2); этот модуль определяет ФИЗИЧЕСКИЙ ТИП (overheat / cavitation / electrical)
 - **Зачем отдельная модель:** SHAP-эвристика в `xai_module.py` давала точность ~0.61 из-за отсутствия физического смысла у абсолютных порогов SHAP; обучаемый классификатор даёт измеримую, защищаемую точность
 - Вход: `fault_type_pumps_dataset.csv` (строки с `target==1 & 2`, `fault_target` 0/1/2)
 - **Group Split:** train = MNHV_001–004, test = MNHV_005; `class_weight='balanced'`
 - Три модели: LR, RF, XGBoost (n=300, lr=0.1, depth=6, `mlogloss`)
 - **Метрики:** macro-F1, balanced accuracy, per-class recall, раздельно по стадии (Warning / Critical) через `severity_stage`
-- Визуализация через `visualisation_instruments/ml_visualisation.py` (функция `plot_fault_classifier`)
+- Визуализация через `src/visualisation/ml_visualisation.py` (функция `plot_fault_classifier`)
 - **Выходы:**
-  - Модели: `fault_lr_model.joblib`, `fault_rf_model.joblib`, `fault_xgboost_model.joblib`
+  - Модели: `models/fault_type/fault_{lr,rf,xgboost}_model.joblib`
   - Графики: `ML_fault_plot1_confusion_matrix.png`, `ML_fault_plot2_model_comparison.png`, `ML_fault_plot3_stage_split.png`
-  - Таблица: `data/tables/ML_fault_classifier_summary.csv`
+  - Таблица: `artifacts/tables/ML_fault_classifier_summary.csv`
 
-### 6. `xai_module.py` — Объяснимый ИИ (SHAP)
-- **`XAIExplainer`:** `shap.TreeExplainer` для XGBoost модели ТЯЖЕСТИ, `target_class_idx=2` (Авария)
-- Возвращает **`SymptomVector`** (dataclass): `predicted_class`, `probabilities`, `critical_probability`, `top_symptoms`, `shap_base_value`, `inferred_fault`, `true_fault`
+### 6. `src/xai/xai_module.py` — Объяснимый ИИ (SHAP)
+- **`XAIExplainer(model_path, fault_model_path)`:** грузит ОБЕ модели — `shap.TreeExplainer` для XGBoost тяжести (`target_class_idx=2`, Авария) и для классификатора типа
+- Возвращает **`SymptomVector`** (dataclass): `predicted_class`, `probabilities`, `critical_probability`, `top_symptoms`, `shap_base_value`, `inferred_fault`, `true_fault`, а также поля fault-классификатора (`fault_top_symptoms`, `fault_confidence`, `fault_probabilities`)
 - Сортировка по `abs(shap_weight)` — признак -0.8 важнее признака +0.1
 - **`_infer_fault_type(contributions)`** — SHAP-эвристика определения типа отказа по долям положительного вклада датчиков (масштабонезависима): температура≥40% → overheat; ток≥40% при молчащих остальных → electrical; иначе cavitation. Точность валидируется `validate_fault_inference()`
 - Пороги ГОСТ из `config/settings/settings.py`
-- Визуализация вынесена в `visualisation_instruments/xai_visualisation.py`:
-  - `plot_waterfall()`, `plot_summary_by_fault_type()` → **severity-модель** (`shap_plot1-4_*`)
+- Визуализация вынесена в `src/visualisation/xai_visualisation.py`:
+  - `plot_severity_waterfall()`, `plot_severity_summary()`, `plot_severity_summary_by_fault_type()` → **severity-модель** (`shap_severity_plot1-4_*`)
   - `plot_fault_waterfall()`, `plot_fault_summary_by_type()` → **fault-классификатор** (`shap_fault_plot1-4_*`)
-- **Выходы:** `shap_plot1-4_*` (severity SHAP) + `shap_fault_plot1-4_*` (fault-classifier SHAP)
+- **Выходы:** `shap_severity_plot1-4_*` (severity SHAP) + `shap_fault_plot1-4_*` (fault-classifier SHAP)
 
-### 7. `rag_database.py` — База знаний (RAG)
+### 7. `src/rag/rag_database.py` — База знаний (RAG)
 - **Стек:** LangChain + ChromaDB (локально) + `intfloat/multilingual-e5-large` (MPS, M2)
 - **`StructuredPDFLoader`:** pymupdf4llm → Markdown (сохраняет таблицы), fallback → pdfplumber; оставлен как расширение — в текущей версии не используется
 - **`TextKnowledgeLoader`:** загрузка `.md`/`.txt` файлов
@@ -236,7 +270,7 @@ predictive_alarm_platform/
 - Визуализация: `plot_all_rag(kb, test_queries, plots_dir)` в `__main__` (принимает объект `kb`, не отдельные параметры)
 - **Выходы:** `rag_plot1–5_*.png`
 
-### 8. `ai_agent.py` — LLM-агент
+### 8. `src/agent/ai_agent.py` — LLM-агент
 - **`DiagnosticAgent`** — принимает `SymptomVector` + 4 канала RAG-контекста, строит промпт, вызывает Ollama
 - **`AgentResponse`** dataclass: `pump_id`, `raw_text`, `model_name`, `used_context`, `sources`, `latency_sec`, `gen_time_sec`, `eval_count`, `prompt_eval_count`, `tokens_per_sec`, `format_ok`, `error`
 - **`SYSTEM_PROMPT`** загружается из `config/prompts/diagnostic_agent.md` (anti-hallucination, строгий формат 5 разделов: СТАТУС / ДИАГНОЗ / ПРЕДПИСАНИЕ / РЕКОМЕНДАЦИИ ТОиР / ПЛАНОВЫЙ РЕМОНТ)
@@ -258,14 +292,14 @@ predictive_alarm_platform/
 - **`__main__`:** цепочка XAI → RAG (4 канала) → LLM с последовательным прогоном трёх моделей
 - Три тестируемые модели: `qwen3.5:9b` (default), `phi4:14b`, `second_constantine/yandex-gpt-5-lite:8b`
 
-### 9. `scripts/xgboost_benchmark.py` — LOGO CV бенчмарк
+### 9. `experiments/logo_cv/xgboost_benchmark.py` — LOGO CV бенчмарк
 - **Leave-One-Group-Out Cross-Validation:** 5 фолдов, каждый раз один насос — тест, остальные 4 — обучение
 - **Цель:** доказать, что XGBoost обобщается на любой новый агрегат парка (не переобучен на MNHV_005)
 - Метрики: F1-Macro, Recall(Critical), PR-AUC по каждому фолду
 - Визуализация: `ML_plot5_logo_cv_comparison.png`
-- Импортирует из `src.ml_pipeline` (функция `evaluate_model`)
+- Содержит собственную копию `evaluate_model()` (дублирует логику из `severity_classifier_pipeline.py`)
 
-### 10. `scripts/ai_agent_benchmark.py` — Бенчмарк LLM-агента
+### 10. `experiments/llm_benchmark/ai_agent_benchmark.py` — Бенчмарк LLM-агента
 - **6 сценариев:** 3 типа отказа × 2 стадии (Предупреждение / Авария) — строит `build_scenarios(xai, df, preprocessor, kb)`
 - Каждый сценарий получает полный 4-канальный вход (rag, operator, repair, schedule)
 - **5 автометрик:**
@@ -278,19 +312,47 @@ predictive_alarm_platform/
 - Усреднение по 6 сценариям × 3 повтора = 18 прогонов на модель
 - **Выходы:** `agent_benchmark_multi.csv`, `agent_summary_table.csv` (index=model), `agent_summary_by_stage.csv` (model × stage), `agent_plot1-5_*.png`
 
-### 11. `scripts/rag_regression_guard_test.py` — Регрессионный guard RAG
+### 11. `experiments/validation/rag_regression_guard_test.py` — Регрессионный guard RAG
 - **Цель:** защита от регрессии в стадийной и сценарной привязке SOP-чанков после перестройки базы
 - **3 теста:**
   1. `test_sop_chunks_tagged_with_fault_and_stage` — все 3 типа размечены `fault_type`; у operator-чанков есть `stage`; оба стадийных блока (warning + critical) присутствуют для каждого типа
   2. `test_operator_actions_locked_by_fault_and_stage` — `search_operator_actions(fault, stage)` возвращает чанки строго своего типа и стадии; позитивная и негативная лексическая проверка по `STAGE_OPERATOR_KW`
   3. `test_repair_works_locked_by_fault` — `search_repair_works(fault)` не смешивает сценарии
-- Запуск: `pytest scripts/rag_regression_guard_test.py -v` или `python scripts/rag_regression_guard_test.py`
-- Предусловие: база собрана с актуальной разметкой (`kb.build_database(reset=True)`)
+- Запуск: `pytest experiments/validation/rag_regression_guard_test.py -v` или `python experiments/validation/rag_regression_guard_test.py`
+- Предусловие: база собрана с актуальной разметкой (`kb.build_database(reset=True)`) в `artifacts/chroma_db`
 
-### 12. `scripts/permutation_test.py` — Sanity check классификатора типа
+### 12. `experiments/validation/permutation_test.py` — Sanity check классификатора типа
 - Загружает `fault_type_pumps_dataset.csv`, перемешивает `fault_target` случайным образом (`rng(42)`)
 - Обучает XGBoost на перемешанных метках, проверяет balanced accuracy на тесте — должна упасть к ~1/3
 - **Цель:** доказать, что модель учится реальным сигнатурам, а не паразитным паттернам в данных
+
+### 13. `src/runtime/online_preprocessor.py` — Потоковый препроцессор (РЕАЛТАЙМ)
+- **`OnlinePreprocessor`** — stateful-расчёт того же вектора `FEATURE_COLS`, что и offline `data_preprocessor.py`, но по одной строке через кольцевой буфер (`deque`) на каждый `pump_id`
+- **Контракт паритета online == offline** (не менять без regression-теста): `shift(1)` (текущая строка не входит в окно), `min_periods=w`, `diff_30 = x[T-1] - x[T-31]`, `std` с `ddof=1` (как pandas)
+- **Прогрев:** `WARMUP_ROWS = 60` строк; `push()` возвращает `None`, пока буфер не заполнен; именно поэтому демо-сценарий несёт 60-минутный warmup-префикс
+- **`verify_parity(raw_df, offline_features, feature_cols)`** — сверка потокового расчёта с offline-матрицей (бросает `AssertionError` на первой расходящейся колонке)
+
+### 14. `src/runtime/alarm_runtime.py` — Runtime-слой управления тревогами
+- **`PumpAlarmFSM`** — дебаунс-автомат тревог по парку: переход подтверждается только после N одинаковых предсказаний подряд (`confirm_up=2`, `confirm_down=5` — эскалация быстрее деэскалации); практика рационализации ISA 18.2 / EEMUA 191
+- **Гейтинг LLM:** `update()` возвращает `Incident` только на подтверждённой ЭСКАЛАЦИИ, требующей предписания — тяжёлая цепочка XAI→RAG→агент (~20 с) запускается один раз на стадию, а не на каждый тик
+- **`Incident`** — жизненный цикл инцидента (Предупреждение→Авария→сброс); кеш предписаний, трасс извлечения и `SymptomVector` по стадиям
+- **`AlarmJournal`** — журнал всех событий, включая подавленные state-based фильтром сигналы (требование ФЗ-116 / ГОСТ Р 22.1.12-2005: скрытые сигналы хранятся в архиве)
+
+### 15. `src/runtime/platform_backend.py` — Адаптер UI ↔ аналитическое ядро
+- **Единственная точка интеграции:** `app.py` не импортирует ML/XAI/RAG/агента напрямую — только этот адаптер; замена источника данных (демо-CSV → SCADA) и смена сигнатур модулей локализованы здесь
+- **`PlatformBackend`** (боевой): грузит severity-модель + `AlarmManager`, `XAIExplainer` (обе модели), `KnowledgeBaseManager`, `DiagnosticAgent`; `process_tick()` (дешёвый ML на каждый тик), `explain()`, `prescription_stream()` (4 канала RAG + стрим агента), `retrieval_trace()`, `shap_figures()`
+- **`ProtoBackend`** (отладка): тяжесть/тип берутся из меток датасета, предписание имитируется — позволяет верстать UI без Ollama/ChromaDB/моделей. UI откатывается на него автоматически, если боевой backend не инициализировался
+
+### 16. `experiments/data_stream/demo_stream.py` — Детерминированный демо-сценарий
+- **`extract_demo_scenario(dataset_path, fault_type, pump_id='MNHV_005', ...)`** — НЕ генерирует данные заново, а вырезает готовый эпизод `[warmup 60 мин → Healthy → Degradation → Critical]` заданного типа из размеченного датасета (воспроизводимость + честность: тот же unseen MNHV_005, на котором валидированы модели)
+- **`ScenarioPlayer`** — плеер потока: выдаёт строки по одной, хранит позицию (живёт в `st.session_state`), `skip_warmup()` прогоняет warmup-префикс пакетом
+
+### 17. `src/app/app.py` — Streamlit двухуровневый UI (NAMUR NE 129)
+- **Оператор:** карта оборудования (плитки-статусы NAMUR NE 107), счётчики активных аварий/предупреждений/подавленных/переходов, drill-down в агрегат с интерактивными Plotly-графиками всех 4 параметров (пороги-линии, ховер); предписание агента — потоковый «тост» в правом нижнем углу (сворачивается, квитируется)
+- **Инженер:** событийный диагностический console (появляется при инциденте) — вкладки: SHAP обеих моделей (PNG из `shap_figures()`), таблицы симптомов, трассировка RAG по каналам, план/история ТОиР
+- **Сайдбар-«язычок»:** история предписаний + панель сборки/воспроизведения демо-сценария (валидация)
+- Поток: `advance_stream()` прогоняет N строк через backend+FSM; на эскалации ставит `pending_stream`, дашборд дорисовывается, затем тост стримит предписание (экран не «замерзает» на генерации)
+- Запуск: `streamlit run src/app/app.py`
 
 ---
 
@@ -298,7 +360,7 @@ predictive_alarm_platform/
 
 ### `config/settings/settings.py`
 Единственный источник истины для всех константных значений проекта.
-Импортируется во все модули `src/` и `scripts/`:
+Импортируется во все модули `src/` и `experiments/`:
 
 | Константа | Содержание |
 |---|---|
@@ -323,50 +385,45 @@ predictive_alarm_platform/
 | `DIRECTIONS`, `FMT` | Направления метрик и форматы для хитмапа бенчмарка |
 
 ### `config/prompts/diagnostic_agent.md`
-Системный промпт `DiagnosticAgent`. Загружается при импорте `ai_agent.py`. Редактируется без изменения Python-кода.
+Системный промпт `DiagnosticAgent`. Загружается при импорте `src/agent/ai_agent.py`. Редактируется без изменения Python-кода.
 - 8 строгих правил: только из КОНТЕКСТА, источник по имени, разделение 4 каналов (справочный/оператор/ТОиР/график), стадийный тон (Авария vs Предупреждение), краткость
 - Вердикт по внеплановому выводу в ремонт вставляется в промпт детерминированно агентом, модель переписывает его дословно
 - Формат ответа: 5 разделов — СТАТУС / ДИАГНОЗ И ОБОСНОВАНИЕ / ПРЕДПИСАНИЕ (ДЕЙСТВИЯ ОПЕРАТОРА) / РЕКОМЕНДАЦИИ ТОиР (РЕМОНТНОЙ БРИГАДЕ) / ПЛАНОВЫЙ РЕМОНТ
 
 ---
 
-## Визуализация (`visualisation_instruments/`)
+## Визуализация (`src/visualisation/`)
 
-Все функции реэкспортируются через `__init__.py` — импорт: `from visualisation_instruments import plot_all`.
+Все функции реэкспортируются через `__init__.py` — импорт: `from src.visualisation import plot_all`.
 
 | Модуль | Функции | Откуда вызывается |
 |---|---|---|
 | `simulation_visualisation.py` | `plot_smart_episode(df, hours, save_dir)` | `data_generator.py` |
-| `ml_visualisation.py` | `plot_all(metrics, y_test, output_dir)`, `recall_plot(results, signatures, save_dir)`, `plot_fault_classifier(metrics, output_dir)` | `ml_pipeline.py`, `fault_recall_analysis.py`, `fault_classifier_pipeline.py` |
+| `ml_visualisation.py` | `plot_all(metrics, y_test, output_dir)`, `recall_plot(results, signatures, save_dir)`, `plot_fault_classifier(metrics, output_dir)` | `severity_classifier_pipeline.py`, `fault_recall_analysis.py`, `fault_classifier_pipeline.py` |
 | `rag_visualisation.py` | `plot_all_rag(kb, test_queries, save_dir)` → 5 графиков: `plot_knowledge_base_stats`, `plot_chunk_length_distribution`, `plot_retrieval_quality`, `plot_fault_coverage_heatmap`, `plot_fault_section_sourcing` | `rag_database.py` |
-| `xai_visualisation.py` | `plot_waterfall()`, `plot_summary_by_fault_type()` — severity; `plot_fault_waterfall()`, `plot_fault_summary_by_type()` — fault classifier | `xai_module.py` |
-| `ai_visualisation.py` | `plot_performance(df, save_dir)`, `plot_quality_auto(df, save_dir)`, `plot_summary_heatmap(summary_df, directions, fmt, save_dir)`, `plot_expert_radar(expert_scores, save_dir)`, `plot_stage_breakdown(df, save_dir)` | `scripts/ai_agent_benchmark.py`, автономно |
+| `xai_visualisation.py` | `plot_severity_waterfall()`, `plot_severity_summary()`, `plot_severity_summary_by_fault_type()` — severity; `plot_fault_waterfall()`, `plot_fault_summary_by_type()` — fault classifier | `xai_module.py`, `platform_backend.py` |
+| `ai_visualisation.py` | `plot_performance(df, save_dir)`, `plot_quality_auto(df, save_dir)`, `plot_summary_heatmap(summary_df, directions, fmt, save_dir)`, `plot_expert_radar(expert_scores, save_dir)`, `plot_stage_breakdown(df, save_dir)` | `experiments/llm_benchmark/ai_agent_benchmark.py`, автономно |
 
 ---
 
-## Что предстоит сделать
+## Что предстоит сделать / доработать
 
-### `app.py` — Streamlit UI
-Двухуровневый интерфейс по стандарту NAMUR NE 129:
+Все основные модули, включая Streamlit UI (`src/app/app.py`) и runtime-слой, **реализованы**;
+пути в `src/runtime/platform_backend.py` синхронизированы с новой раскладкой
+(`models/severity/`, `models/fault_type/`, `artifacts/chroma_db`, `artifacts/graphs`).
+Остаточные задачи:
 
-**Уровень 1 — Operator Dashboard:**
-- Агрегированный статус парка (цвета NAMUR NE 107: зелёный / жёлтый / красный / серый)
-- Счётчик активных тревог, лист отложенных (Alarm Shelving stash)
-- Пошаговая инструкция от агента при аварии
+1. **Регрессионный тест паритета** online/offline препроцессора (`verify_parity`) — оформить как запускаемый модуль (упомянут в docstring `online_preprocessor.py` как `scripts.test_online_parity`, файл пока отсутствует).
+2. Подключение реального источника ТОиР-истории вместо демо-данных в инженерной вкладке.
 
-**Уровень 2 — Engineer Tab:**
-- Графики временных рядов с порогами
-- SHAP Waterfall plot (из `xai_visualisation.plot_waterfall()`)
-- SHAP Beeswarm plot (из `xai_visualisation.plot_summary_by_fault_type()`)
-- История инцидентов, bad actors
-
-**Режим инференса:**
+**Режим инференса в UI (через `OnlinePreprocessor`, по одной строке):**
 ```python
-last_61_rows = df[df['pump_id'] == pump_id].tail(61)
-features = preprocessor.process(last_61_rows, is_training=False)
-feature_row = features.iloc[-1:][preprocessor.FEATURE_COLS]
-raw_state = last_61_rows.iloc[-1]['state']
-prediction = alarm_manager.predict_with_context(feature_row, raw_state)
+tick = backend.process_tick(pump_id, raw_row)      # OnlinePreprocessor + AlarmManager
+trigger = fsm.update(pump_id, ts, tick.severity,    # дебаунс-FSM, гейтинг LLM
+                     suppressed=tick.suppressed, fault_type=tick.fault_type)
+if trigger is not None:                             # подтверждённая эскалация
+    sv = backend.explain(pump_id, ts, trigger.stage)
+    stream = backend.prescription_stream(sv, STAGE_BY_SEVERITY[trigger.stage])
 ```
 
 ---
@@ -380,11 +437,14 @@ prediction = alarm_manager.predict_with_context(feature_row, raw_state)
 | `fault_type` сохраняется в processed CSV | В ML не попадает (нет в FEATURE_COLS), но нужен `fault_recall_analysis.py` для доказательства различения сигнатур |
 | Отдельные флаги `anomaly_vibration/temperature/current` | Точечные маркеры на пострадавшем датчике без путаницы на графике |
 | Group Split по pump_id | Доказывает обобщение на unseen equipment — строгий MLOps-стандарт |
-| LOGO CV в `scripts/xgboost_benchmark.py` | Доказывает, что результат не случаен для конкретного тестового насоса |
+| LOGO CV в `experiments/logo_cv/xgboost_benchmark.py` | Доказывает, что результат не случаен для конкретного тестового насоса |
 | Отдельная модель типа отказа вместо SHAP-эвристики | SHAP-пороги «плывут» при переобучении; обучаемый классификатор даёт измеримую точность |
 | `build_fault_dataset()` те же `FEATURE_COLS` | Согласует признаковое пространство train/inference для обеих моделей |
 | `permutation_test.py` — sanity check | Метки перемешаны → balanced accuracy ~1/3 → доказывает отсутствие паразитных паттернов |
-| `data/tables/` отдельно от `data/graphs/` | CSV-таблицы результатов не смешиваются с PNG-графиками |
+| `artifacts/` отдельно от `data/` | Сгенерированные графики/таблицы/ChromaDB изолированы от входных датасетов |
+| `artifacts/tables/` отдельно от `artifacts/graphs/` | CSV-таблицы результатов не смешиваются с PNG-графиками |
+| Пакетная раскладка `src/<domain>/` | Доменное разделение (data/ml/xai/rag/agent/runtime/app); явные импорты `src.<domain>.<module>` |
+| `models/severity/` + `models/fault_type/` | Иерархия моделей отражена в файловой структуре; имена с префиксом домена |
 | `shift(1)` перед `rolling()` | Предотвращает data leakage в признаках |
 | `min_periods=w` для mean/max | Честный NaN вместо статистики по 1–2 точкам |
 | `diff_30 = shift(1) - shift(31)` | Ровно 30 шагов, консистентно с rolling(30) |
@@ -396,7 +456,7 @@ prediction = alarm_manager.predict_with_context(feature_row, raw_state)
 | FEATURE_COLS явный список | Единый контракт признаков для train и inference |
 | `doc_type_map` как единственный allowlist | Нет нужды в `skip_pdfs` — загружаются только перечисленные файлы |
 | `config/settings/settings.py` как единственный источник констант | Исключает дублирование порогов, seeds, имён файлов по модулям |
-| Визуализация в `visualisation_instruments/` | SRP: модули данных не зависят от matplotlib; графики редактируются независимо |
+| Визуализация в `src/visualisation/` | SRP: модули данных не зависят от matplotlib; графики редактируются независимо |
 | Промпт в `config/prompts/diagnostic_agent.md` | Редактируется без изменения Python-кода; читается при импорте |
 | 4-канальный промпт (справочный/оператор/ТОиР/график) | Разделение источников по назначению: модель не смешивает диагноз и предписание |
 | Детерминированный вердикт о внеплановом выводе | P(аварии) считается агентом; модель переписывает готовую фразу — не принимает решение сама |
@@ -408,6 +468,13 @@ prediction = alarm_manager.predict_with_context(feature_row, raw_state)
 | `stage_appropriate` как метрика | Автоматически проверяет, что на Предупреждение нет останова, на Аварию есть решительное действие |
 | `rag_regression_guard_test.py` | Защита от регрессии при перестройке базы; тест запускается перед любым изменением разметки SOP |
 | `agent_summary_table.csv` читается с `index_col=0` | `model` — индекс DataFrame; без этого хитмап показывает 0,1,2 вместо имён |
+| Слой `src/runtime/` между UI и ядром | `app.py` зависит только от `platform_backend`; смена источника данных и сигнатур модулей локализована |
+| `PlatformBackend` + `ProtoBackend` (один интерфейс) | UI тестируем и верстаем без Ollama/ChromaDB/моделей; автоматический откат на прототип при сбое инициализации |
+| Гейтинг LLM в `PumpAlarmFSM` | Тяжёлая цепочка XAI→RAG→агент (~20 с) запускается раз на подтверждённую эскалацию, а не на каждый тик |
+| Дебаунс FSM (`confirm_up=2`, `confirm_down=5`) | Анти-дребезг тревог (ISA 18.2 / EEMUA 191); эскалация подтверждается быстрее деэскалации |
+| `AlarmJournal` хранит подавленные сигналы | ФЗ-116 / ГОСТ Р 22.1.12-2005: скрытые сигналы обязаны быть в архиве |
+| `OnlinePreprocessor` с контрактом паритета online==offline | Один и тот же `FEATURE_COLS` в train и realtime; расхождение ловится `verify_parity` |
+| Демо-сценарий вырезается из датасета, не генерится заново | Воспроизводимость + честность: те же unseen-данные MNHV_005, на которых валидированы модели |
 
 ---
 
@@ -429,8 +496,8 @@ prediction = alarm_manager.predict_with_context(feature_row, raw_state)
 | RAG / Embeddings | LangChain, ChromaDB, intfloat/multilingual-e5-large |
 | LLM | Ollama (локально, macOS M2) |
 | PDF парсинг | pymupdf4llm, pdfplumber |
-| UI | Streamlit |
-| Визуализация | matplotlib, seaborn |
+| UI | Streamlit (интерактивные графики — Plotly) |
+| Визуализация | matplotlib, seaborn, plotly |
 | Данные | pandas, numpy |
 
 ---
