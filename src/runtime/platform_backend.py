@@ -114,7 +114,8 @@ class PlatformBackend:
         self._last_trace: List[dict] = []  # трасса последнего RAG-извлечения
 
     def process_tick(self, pump_id: str, raw_row: pd.Series) -> TickResult:
-        feats = self.preproc.push(pump_id, raw_row.to_dict())   # type: ignore
+        raw = raw_row.to_dict() if hasattr(raw_row, "to_dict") else dict(raw_row)
+        feats = self.preproc.push(pump_id, raw) # type: ignore
         if feats is None:
             return TickResult(ready=False)
         self._last_features[pump_id] = feats
