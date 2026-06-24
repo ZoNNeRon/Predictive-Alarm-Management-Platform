@@ -19,6 +19,7 @@ from typing import Iterator, List, Optional, Tuple
 
 import joblib
 import pandas as pd
+import tempfile
 
 # разрешение путей (файл лежит в src/app/) 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -105,10 +106,6 @@ class PlatformBackend:
         self.fault_model = self.xai.fault_model
         self.rag = KnowledgeBaseManager(data_dir=_kb_dir, chroma_dir=_chroma_dir)
         self.agent = DiagnosticAgent()   # model_name=DEFAULT_MODEL по умолчанию
-
-        # директория для PNG SHAP-графиков, отдаваемых в инженерную вкладку
-        self._plots_dir = os.path.join(_PROJECT_ROOT, "artifacts", "graphs")
-        os.makedirs(self._plots_dir, exist_ok=True)
 
         self._last_features: dict = {}     # pump_id -> последняя строка признаков
         self._last_trace: List[dict] = []  # трасса последнего RAG-извлечения
@@ -233,14 +230,13 @@ class PlatformBackend:
             self._rag_context(symptom_vector, stage)
         return self._last_trace
 
-    def shap_figures(self, pump_id: str) -> Tuple[Optional[str], Optional[str]]:
-        """PNG-пути waterfall-графиков (модель тяжести, модель типа).
+    def shap_figures(self, pump_id: str) -> Tuple[Optional[bytes], Optional[bytes]]:
+        """PNG-байты waterfall-графиков (модель тяжести, модель типа) В ПАМЯТИ.
 
-        Реальные функции из visualisation_instruments сохраняют файл по
-        save_path и принимают (xai, feature_row, ...). Возвращаем пути PNG;
-        UI показывает их через st.image. None — если график не построился.
+        Рисуем во временный файл, читаем байты, файл сразу удаляем — на диск
+        ничего не оседает (artifacts/graphs не засоряется). UI показывает байты
+        через st.image. None — если график не построился.
         """
-
         feats = self._last_features.get(pump_id)
         if feats is None:
             return None, None
@@ -250,21 +246,26 @@ class PlatformBackend:
         except Exception:
             return None, None
 
-        sev_path = os.path.join(self._plots_dir, f"ui_waterfall_sev_{pump_id}.png")
-        fault_path = os.path.join(self._plots_dir, f"ui_waterfall_fault_{pump_id}.png")
+        def _to_bytes(plot_fn):
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                    tmp_path = tmp.name
+                plot_fn(self.xai, feats, pump_id=pump_id, save_path=tmp_path)
+                if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
+                    with open(tmp_path, "rb") as fh:
+                        return fh.read()
+                return None
+            except Exception:
+                return None
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
 
-        sev_out = fault_out = None
-        try:
-            plot_severity_waterfall(self.xai, feats, pump_id=pump_id, save_path=sev_path)
-            sev_out = sev_path if os.path.exists(sev_path) else None
-        except Exception:
-            sev_out = None
-        try:
-            plot_fault_waterfall(self.xai, feats, pump_id=pump_id, save_path=fault_path)
-            fault_out = fault_path if os.path.exists(fault_path) else None
-        except Exception:
-            fault_out = None
-        return sev_out, fault_out
+        return _to_bytes(plot_severity_waterfall), _to_bytes(plot_fault_waterfall)
 
 
 class ProtoBackend(PlatformBackend):

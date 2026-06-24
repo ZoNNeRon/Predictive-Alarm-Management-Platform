@@ -45,6 +45,8 @@ except Exception:
 class RealtimePlayer:
     """Drop-in вместо ScenarioPlayer поверх живого мультинасосного генератора."""
 
+    TRIP_DELAY_TICKS = 5    # держим аварию в потоке N мин до защитного останова
+
     def __init__(self,
                  generator: Optional[LiveMultiPumpGenerator] = None,
                  horizon_minutes: int = 1440,
@@ -54,6 +56,7 @@ class RealtimePlayer:
         self.horizon = int(horizon_minutes)
         self.warmup_rows = int(warmup_rows)
         self.pos = 0  # пройдено sim-минут (тиков) ВИДИМОГО потока
+        self._pending_trips: dict[str, int] = {}   # pid -> тиков до фактического Off
 
     # ---- интерфейс, совпадающий со ScenarioPlayer ----
 
@@ -84,6 +87,13 @@ class RealtimePlayer:
         for _ in range(int(n)):
             if self.finished:
                 return
+            # отложенный защитный останов: гасим агрегат через TRIP_DELAY_TICKS мин
+            # ПОСЛЕ подтверждения аварии — аварийные тики копятся в потоке (статистика)
+            for _pid in list(self._pending_trips):
+                self._pending_trips[_pid] -= 1
+                if self._pending_trips[_pid] <= 0:
+                    self._pending_trips.pop(_pid, None)
+                    self.gen.trip(_pid)
             for row in self.gen.step():
                 yield row
             self.pos += 1
@@ -95,9 +105,10 @@ class RealtimePlayer:
         return self.gen.acknowledge(pump_id)
 
     def trip(self, pump_id: str) -> None:
-        """Защитный останов из UI → генератор: насос уходит в Off и держится там
-        до квитирования (вызывается приложением при подтверждении аварии моделью)."""
-        self.gen.trip(pump_id)
+        """Защитный останов с ЗАДЕРЖКОЙ: после подтверждения аварии агрегат ещё
+        TRIP_DELAY_TICKS мин остаётся в потоке (аварийные тики копятся → статистика),
+        затем уходит в Off. Фактический gen.trip выполняется в next_rows()."""
+        self._pending_trips.setdefault(pump_id, self.TRIP_DELAY_TICKS)
 
 
 # Самотест: интерфейс-совместимость и поток

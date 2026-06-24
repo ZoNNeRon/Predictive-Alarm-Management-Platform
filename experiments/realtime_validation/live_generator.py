@@ -88,7 +88,7 @@ class RealtimeConfig:
     """
     # длительности состояний (sim-мин)
     off_min: int = 5;          off_max: int = 16          # был 60..180
-    healthy_norm_min: int = 150; healthy_norm_max: int = 301  # длиннее: реже отказы
+    healthy_norm_min: int = 130; healthy_norm_max: int = 221  # короче старого: насыщеннее событиями (пик переходов ~4/ч)
     healthy_pre_fault_min: int = 20; healthy_pre_fault_max: int = 41  # перед отказом
     degradation_min: int = 90;  degradation_max: int = 151  # умеренно (distribution!)
     critical_min: int = 10;     critical_max: int = 31      # был 10..60
@@ -100,7 +100,7 @@ class RealtimeConfig:
     p_fault: float = 0.22
     # частота аппаратной аномалии датчика за минуту в Healthy (был 0.001).
     # Поднята, чтобы «лавина» была видимой за короткий прогон валидации.
-    anomaly_rate: float = 0.015
+    anomaly_rate: float = 0.0075
 
     # квитирование предупреждения: вероятность реального устранения
     warning_recovery_prob: float = 0.5
@@ -135,6 +135,8 @@ class _PumpRuntime:
     # учёт исходов квитирования (для будущих метрик)
     ack_recovered: int = 0
     ack_restarted: int = 0
+    # первый рабочий цикл после старта симуляции — гарантированно без отказа
+    first_cycle: bool = False
 
 
 class LiveMultiPumpGenerator:
@@ -167,12 +169,16 @@ class LiveMultiPumpGenerator:
             curr=_HEALTHY_FIXED["current"] + rng.normal(0, 0.8),
             press=_HEALTHY_FIXED["pressure"] + rng.normal(0, 0.018),
         )
-        # первый цикл — гарантированно нормальный (нет отказа в окне прогрева)
-        p.state = HEALTHY
+        # старт симуляции — с ПУСКА оборудования (а не из середины работы):
+        # Пуск → Норма. Параметры не «появляются изнеоткуда». Первый рабочий
+        # цикл гарантированно без отказа (флаг снимается в STARTUP→HEALTHY).
+        p.state = STARTUP
+        p.seg_len = int(rng.integers(self.cfg.startup_min, self.cfg.startup_max))
+        p.seg_i = 0
+        p.remaining = p.seg_len
         p.cycle_is_failure = False
         p.fault = None
-        p.remaining = int(rng.integers(self.cfg.healthy_norm_min,
-                                       self.cfg.healthy_norm_max))
+        p.first_cycle = True
         return p
 
     def reset(self) -> None:
@@ -201,7 +207,11 @@ class LiveMultiPumpGenerator:
             p.vib = _HEALTHY_FIXED["vibration"] + rng.normal(0, 0.08)
             p.curr = _HEALTHY_FIXED["current"] + rng.normal(0, 0.8)
             p.press = _HEALTHY_FIXED["pressure"] + rng.normal(0, 0.018)
-            p.cycle_is_failure = bool(rng.random() < cfg.p_fault)
+            if p.first_cycle:
+                p.first_cycle = False
+                p.cycle_is_failure = False        # первый рабочий цикл — без отказа
+            else:
+                p.cycle_is_failure = bool(rng.random() < cfg.p_fault)
             if p.cycle_is_failure:
                 p.fault = str(rng.choice(np.array(FAULT_TYPES, dtype=object),
                                          p=FAULT_WEIGHTS))
@@ -281,7 +291,10 @@ class LiveMultiPumpGenerator:
             i, dur = p.seg_i, max(1, p.seg_len)
             p.temp = p.temp + rng.normal(4.0, 0.8)
             p.vib = rng.normal(4.5, 0.5)
-            p.curr = rng.normal(150 * (1 - 0.6 * i / dur), 10)
+            # пусковой ток как в датасете (инраш ~150 А, спадает). Глушится
+            # состоянием STARTUP + сбросом окна + warming-фильтром, поэтому
+            # ложной аварии не даёт, но на графике совпадает с обучающими данными.
+            p.curr = rng.normal(150 * (1 - 0.6 * i / dur), 7)
             p.press = rng.normal(1.8, 0.12)
             p.seg_i += 1
 
@@ -392,6 +405,8 @@ class LiveMultiPumpGenerator:
             p.cycle_is_failure = False
             p.fault = None
             p.deg_trends = {}
+            p.first_cycle = True       # рестарт = чистый пуск: первый цикл гарантированно
+                                       # без отказа (как старт симуляции и как в датасете)
             p.remaining = int(rng.integers(self.cfg.ack_off_min, self.cfg.ack_off_max))
             p.ack_restarted += 1
             return "restarted"

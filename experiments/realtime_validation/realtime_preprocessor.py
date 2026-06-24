@@ -57,12 +57,20 @@ class RealtimeProgressivePreprocessor(OnlinePreprocessor):
     """OnlinePreprocessor с прогрессивным прогревом (признаки с 1-й строки)."""
 
     def push(self, pump_id: str, raw_row: Dict[str, float]) -> Optional[pd.DataFrame]:
+        # ЧИСТЫЙ контракт (бит-в-бит со строгим). Обнуление окна на пуске/простое
+        # делает приложение явным вызовом reset() — см. advance_stream: там надёжно
+        # доступно состояние агрегата, не зависим от того, доходит ли "state" сюда.
         buf = self._buffers.setdefault(pump_id, deque(maxlen=WARMUP_ROWS + 1))
         # shift(1): считаем ПО буферу ДО добавления текущей строки.
         # Отличие от строгого — порог: с 1-й строки истории, а не с 60-й.
         features = self._compute(buf) if len(buf) >= 1 else None
         buf.append({p: float(raw_row[p]) for p in PARAMS})
         return features
+
+    def reset(self, pump_id: str) -> None:
+        """Явный сброс окна агрегата (вызывается приложением при трипе/квитировании
+        аварии). Дублирует авто-сброс на OFF, на случай досрочного перезапуска."""
+        self._buffers.pop(pump_id, None)
 
     def _compute(self, buf: deque) -> pd.DataFrame:
         hist = {p: np.array([r[p] for r in buf], dtype=float) for p in PARAMS}
@@ -81,7 +89,7 @@ class RealtimeProgressivePreprocessor(OnlinePreprocessor):
             out[f"{p}_diff_30"] = (float(series[-1] - series[-31])
                                    if n >= 31 else 0.0)
         row = pd.DataFrame([out])
-        return row[self.feature_cols]   # жёсткий порядок колонок по контракту # type: ignore
+        return row[self.feature_cols]   # жёсткий порядок колонок по контракту  # type: ignore
 
     def rows_seen(self, pump_id: str) -> int:
         """Накоплено строк истории по насосу — для бейджа «прогрев» на плитке."""

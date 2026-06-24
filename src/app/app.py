@@ -85,7 +85,7 @@ RENAG_MIN = 10            # повторное оповещение, если с
 REFRESH = 2.0            # период переотрисовки главного прохода (с)
 GEN_TIMEOUT = 90.0       # страховочный таймаут генерации предписания (с)
 YRANGE = {"vibration": (0, 12), "temperature": (0, 98),
-          "current": (0, 115), "pressure": (0, 2)}
+          "current": (0, 150), "pressure": (0, 2)}
 
 st.set_page_config(page_title="Платформа предиктивного управления",
                    layout="wide", initial_sidebar_state="collapsed")
@@ -155,16 +155,17 @@ def get_gen_store():
     return {"jobs": {}, "lock": threading.Lock()}
 
 
-def _launch_generation(backend, sv, pump_id, stage):
+def _launch_generation(backend, sv, pump_id, stage, force=False):
     store = get_gen_store()
     jobs, lock = store["jobs"], store["lock"]          # стабильные объекты
     key = (pump_id, stage)
     stage_key = STAGE_BY_SEVERITY[stage]
     with lock:
-        if key in jobs:
+        if key in jobs and not force:
             return
-        jobs[key] = {"partial": "", "text": None, "trace": None,
-                     "done": False, "started": time.time()}
+        job = {"partial": "", "text": None, "trace": None,
+               "done": False, "started": time.time()}
+        jobs[key] = job        # при force старое задание перезаписывается → его поток осиротевает
 
     def _run():
         acc = []
@@ -172,43 +173,60 @@ def _launch_generation(backend, sv, pump_id, stage):
             for chunk in backend.prescription_stream(sv, stage_key):
                 acc.append(chunk)
                 with lock:
-                    if key in jobs:
-                        jobs[key]["partial"] = "".join(acc)
+                    job["partial"] = "".join(acc)
             text = "".join(acc)
             try:
                 trace = backend.retrieval_trace(sv, stage_key) or []
             except Exception:
                 trace = []
             with lock:
-                if key in jobs:
-                    jobs[key].update(text=text, trace=trace)
+                job.update(text=text, trace=trace)
         except Exception as e:
             with lock:
-                if key in jobs:
-                    jobs[key].update(
-                        text=f"[ошибка генерации: {type(e).__name__}: {e}]",
-                        trace=[])
+                job.update(
+                    text=f"[ошибка генерации: {type(e).__name__}: {e}]",
+                    trace=[])
         finally:
             with lock:
-                if key in jobs:
-                    jobs[key]["done"] = True
+                job["done"] = True
 
     threading.Thread(target=_run, daemon=True).start()
 
 
 def poll_renags():
-    """Ре-наг: после квитирования, если та же проблема держится дольше RENAG_MIN
-    (в sim-минутах), считаем это НОВЫМ возникновением — снимаем квитирование
-    (тост снова показывается) и добавляем новую строку в историю с новой
-    датой/временем. Предписание НЕ перегенерируем: проблема та же, текст берём
-    от предыдущего возникновения (inc.prescriptions[stage])."""
+    """Ре-наг: после квитирования, если проблема РЕАЛЬНО держится дольше RENAG_MIN
+    (sim-мин) — новое возникновение (оператор видит, что параметры не в норме).
+    Авария — пока агрегат в аварийном останове (tripped). Предупреждение — пока
+    severity ещё >= 1. Вернулся в норму — не ре-нагаем."""
     ss = st.session_state
     if not ss.sim_ts:
         return
+    inc_pid = {inc.incident_id: inc.pump_id for inc in ss.fsm.all_incidents()}
     for key, ack_ts in list(ss.acked.items()):
+        incident_id, stage = key
+        pid = inc_pid.get(incident_id)
+        if pid is None:
+            continue
+        # Инцидент ещё ТЕКУЩИЙ для агрегата? Если его сменил новый (tripped/state
+        # относятся к НАСОСУ, а acked — к ИНЦИДЕНТУ), старый квитированный инцидент
+        # больше не «держится» — он закрыт и остаётся квитированным навсегда.
+        # Без этой проверки новая авария на том же насосе ошибочно «ре-нагала» бы
+        # старую квитированную (и та уходила в «возвращено в норму»).
+        cur = ss.fsm.incident(pid) or ss.pinned.get(pid)
+        if cur is None or cur.incident_id != incident_id:
+            continue
+        if stage == 2:
+            still = pid in ss.tripped                 # авария: ещё в останове
+        else:
+            still = ss.fsm.state(pid) >= 1            # предупреждение: ещё не в норме
+        if not still:
+            continue
         if minutes_since(ack_ts, ss.sim_ts) >= RENAG_MIN:
-            ss.acked.pop(key, None)
-            ss.occurrences.setdefault(key, []).append(ss.sim_ts)
+            ss.acked.pop(key, None)                  # тост снова покажется
+            ev = _find_event(incident_id, stage)     # та же запись — НЕ дублируем строку
+            if ev is not None:
+                ev["status"] = "active"
+                ev["status_ts"] = None
 
 def poll_generations():
     ss = st.session_state
@@ -264,12 +282,20 @@ def init_state():
     ss.setdefault("toast_expanded", set())
     ss.setdefault("toir_log", {})       # журнал выполненных работ по насосам
     ss.setdefault("acked", {})               # (incident_id, stage) -> sim_ts квитирования
-    ss.setdefault("occurrences", {})  # (incident_id, stage) -> [ts возникновений]
+    # Журнал событий истории — ЕДИНСТВЕННЫЙ источник левой панели «История».
+    # Append-only, по одной записи на возникновение (incident_id, stage); статус
+    # меняется на месте. Не зависит от мутаций stage_ts инцидента в FSM, поэтому
+    # не нужна склейка «близнецов» по временному окну (была хрупкой).
+    ss.setdefault("events", [])         # список dict: см. _log_event()
     ss.setdefault("validation", None)
     ss.setdefault("tripped", set())     # насосы в аварийном останове до квитирования
     ss.setdefault("pinned", {})         # закреплённые инциденты: живут до квитирования
     ss.setdefault("shap_frozen", {})    # SHAP-фигуры, замороженные на момент эскалации
-    ss.setdefault("hist_state", {})     # замороженный статус записей истории
+    ss.setdefault("anomaly_suppressed", 0)   # сглаженные аномалии (для «Подавлено»)
+    ss.setdefault("_presc_ft", {})   # (incident_id, stage) -> тип, под который собрано предписание
+    ss.setdefault("_ft_cand", {})    # pid -> (тип-кандидат, тиков подряд)
+    ss.setdefault("_deadzone", {})       # pid -> остаток жёсткой мёртвой зоны после пуска
+    ss.setdefault("recovering", set())   # квитированные аварии: гасим стейл fsm.state=2
 
 
 def get_backend():
@@ -312,10 +338,79 @@ def _on_escalation(pump_id, stage):
         ss.shap_frozen[(inc.incident_id, stage)] = ss.backend.shap_figures(pump_id)
     except Exception:
         pass
-    # первое возникновение стадии (в истории — отдельная строка с этим временем)
-    ss.occurrences[(inc.incident_id, stage)] = [inc.stage_ts]
+    # ОДНА запись истории на это возникновение (incident_id, stage). Guard выше
+    # (`stage in inc.symptom_vectors`) гарантирует ровно один заход → дублей нет.
+    _log_event(inc, stage)
     _launch_generation(ss.backend, sv, pump_id, stage)
     ss.pinned[pump_id] = inc            # держим ссылку — переживёт закрытие в FSM
+    ss._presc_ft[(inc.incident_id, stage)] = inc.fault_type
+
+
+def _log_event(inc, stage):
+    """Добавить запись в журнал истории один раз на (incident_id, stage).
+
+    ts фиксируется СЕЙЧАС (на момент возникновения) и больше не меняется — даже
+    если FSM позже сдвинет inc.stage_ts при повторной эскалации. Это и есть
+    устойчивость: каждая авария/предупреждение в истории ровно один раз."""
+    ss = st.session_state
+    key = (inc.incident_id, stage)
+    if any((e["incident_id"], e["stage"]) == key for e in ss.events):
+        return
+    ss.events.append({
+        "incident_id": inc.incident_id,
+        "pump_id": inc.pump_id,
+        "stage": stage,
+        "ts": inc.stage_ts,            # время возникновения, неизменно
+        "status": "active",           # active -> acked / resolved (на месте)
+        "status_ts": None,
+    })
+
+
+def _find_event(incident_id, stage):
+    for e in st.session_state.events:
+        if e["incident_id"] == incident_id and e["stage"] == stage:
+            return e
+    return None
+
+
+def _refine_warning_type(pump_id, warming):
+    """Тип отказа на ранней (слабой) сигнатуре часто неверен (склонен к «электрике»).
+    По мере развития дефекта классификатор уточняет тип; если он устойчиво сменился —
+    пересобираем диагностику и текст предписания предупреждения под верный тип."""
+    ss = st.session_state
+    if warming:
+        return
+    inc = ss.fsm.incident(pump_id)
+    tick = ss.last_tick.get(pump_id)
+    if (inc is None or tick is None or not getattr(tick, "ready", False)
+            or pump_id in ss.tripped or inc.stage != 1
+            or 1 not in inc.symptom_vectors):
+        return
+    live_ft = tick.fault_type
+    built_for = ss._presc_ft.get((inc.incident_id, 1))
+    if not live_ft or built_for is None or live_ft == built_for:
+        ss._ft_cand.pop(pump_id, None)
+        return
+    cand, cnt = ss._ft_cand.get(pump_id, (None, 0))
+    cnt = cnt + 1 if cand == live_ft else 1
+    ss._ft_cand[pump_id] = (live_ft, cnt)
+    if cnt < 6:                          # дебаунс: тип держится ~6 мин подряд
+        return
+    ss._ft_cand.pop(pump_id, None)
+    try:
+        sv = ss.backend.explain(pump_id, ss.sim_ts, 1)   # пересчёт на ТЕКУЩЕМ окне
+    except Exception:
+        return
+    inc.fault_type = live_ft
+    ss._presc_ft[(inc.incident_id, 1)] = live_ft
+    inc.symptom_vectors[1] = sv
+    inc.prescriptions.pop(1, None)       # текст перегенерируется в фоне
+    inc.retrieval_traces.pop(1, None)
+    try:
+        ss.shap_frozen[(inc.incident_id, 1)] = ss.backend.shap_figures(pump_id)
+    except Exception:
+        pass
+    _launch_generation(ss.backend, sv, pump_id, 1, force=True)
 
 
 def advance_stream(n_rows):
@@ -332,21 +427,60 @@ def advance_stream(n_rows):
         push_history(pump_id, row)
         tick = backend.process_tick(pump_id, row)
         ss.last_tick[pump_id] = tick
+        # Пуск/простой (OFF=0, STARTUP=1) + мёртвая зона: обнуляем окно, пока
+        # пусковой ток не вернулся под порог, затем ещё короткий хвост — так весь
+        # переходник (любой длины) вырезан из скоринга, а не только первые 5 строк.
+        try:
+            stt = int(float(row["state"]))
+        except (KeyError, TypeError, ValueError):
+            stt = None
+        if stt in (0, 1):
+            backend.preproc.reset(pump_id)
+            ss._deadzone[pump_id] = 5
+        elif ss._deadzone.get(pump_id, 0) > 0:
+            backend.preproc.reset(pump_id)
+            try:
+                _cur = float(row["current"])
+            except (KeyError, TypeError, ValueError):
+                _cur = None
+            spiking = _cur is not None and _cur > THRESHOLDS["current"]["warning"]
+            ss._deadzone[pump_id] = 5 if spiking else ss._deadzone[pump_id] - 1
         if not tick.ready:
             continue
-        trigger = fsm.update(pump_id, ts, tick.severity,
-                             suppressed=tick.suppressed,
+        warming = (hasattr(backend.preproc, "rows_seen")
+                   and backend.preproc.rows_seen(pump_id) < 15)
+        trigger = fsm.update(pump_id, ts,
+                             0 if warming else tick.severity,
+                             suppressed=tick.suppressed or warming,
                              fault_type=tick.fault_type)
         if ss.validation is not None:
-            ss.validation.add(row,
-                              tick.severity if tick.ready else -1,
-                              tick.suppressed,
-                              trigger is not None)
-        if trigger is not None:
+            ss.validation.add(row, tick.severity if tick.ready else -1,
+                              tick.suppressed, trigger is not None)
+        # сглаженная аномалия датчика: наивная модель выдала бы тревогу, окна её
+        # погасили → засчитываем в «Подавлено» на дашборде оператора
+        if trigger is None and (row.get("anomaly_vibration") or
+                                row.get("anomaly_temperature") or
+                                row.get("anomaly_current")):
+            ss.anomaly_suppressed = ss.get("anomaly_suppressed", 0) + 1
+        # дедуп аварии НЕЗАВИСИМО от ss.tripped: пока по агрегату жив неквитированный
+        # аварийный инцидент (закреплён в ss.pinned, стадия 2) ИЛИ идёт останов/
+        # восстановление — повтор аварии НЕ заводим (это дрожание типа / повторный
+        # трип того же события, а не новый инцидент).
+        _pin = ss.pinned.get(pump_id)
+        _alarm_live = _pin is not None and 2 in _pin.symptom_vectors
+        if trigger is not None and not (
+                trigger.stage == 2 and (pump_id in ss.tripped
+                                        or pump_id in ss.recovering
+                                        or _alarm_live)):
             _on_escalation(pump_id, trigger.stage)
-            if trigger.stage == 2 and hasattr(player, "trip"):
-                player.trip(pump_id)
-                ss.tripped.add(pump_id)        # держит «Отказ» до квитирования
+            if trigger.stage == 2:
+                ss.tripped.add(pump_id)        # держит «Отказ» и ГЛУШИТ повторный трип
+                if hasattr(player, "trip"):
+                    player.trip(pump_id)        # теперь ОТЛОЖЕННЫЙ останов (см. плеер)
+        # восстановление завершено, когда FSM реально вернулась в норму
+        if pump_id in ss.recovering and fsm.state(pump_id) == 0:
+            ss.recovering.discard(pump_id)
+        _refine_warning_type(pump_id, warming)
     if player.finished:
         ss.playing = False
 
@@ -371,6 +505,8 @@ def status_key_for(pump_id):
         return "check"
     if not tick.ready:
         return "offline"
+    if pump_id in ss.recovering:         # квитировано: не показываем стейл-«Отказ»
+        return "check"
     return SEV_TO_NE107[ss.fsm.state(pump_id)]
 
 
@@ -531,18 +667,23 @@ def _acknowledge_incident(inc, stage, text):
     ss = st.session_state
     ss.fsm.acknowledge(inc.pump_id, ss.sim_ts or "")
     ss.pinned.pop(inc.pump_id, None)     # снимаем закрепление
-    ss.acked[(inc.incident_id, stage)] = ss.sim_ts or inc.stage_ts   # время
-    occ = ss.occurrences.get((inc.incident_id, stage)) or [inc.stage_ts]
-    ss.hist_state[(inc.incident_id, stage, len(occ) - 1)] = ("acked", ss.sim_ts or inc.stage_ts)
+    ack_ts = ss.sim_ts or inc.stage_ts
+    ss.acked[(inc.incident_id, stage)] = ack_ts       # время (тост-гейтинг)
+    ev = _find_event(inc.incident_id, stage)          # помечаем ТУ ЖЕ запись истории
+    if ev is not None:
+        ev["status"] = "acked"
+        ev["status_ts"] = ack_ts
     if hasattr(ss.player, "acknowledge"):
         ss.player.acknowledge(inc.pump_id)        # предупреждение: 50%; авария: рестарт
     if stage == 2:
         ss.tripped.discard(inc.pump_id)      # снимаем «Отказ», генератор перезапустит
+        ss.recovering.add(inc.pump_id)       # fsm.state=2 ещё ~4 тика стейл — гасим «Отказ»
         when = pd.Timestamp(ss.sim_ts or inc.stage_ts).strftime("%Y-%m-%d %H:%M")
         ss.toir_log.setdefault(inc.pump_id, []).insert(
             0, {"Дата": when,
                 "Работа": "Проведены внеплановые работы по ликвидации аварии",
                 "Тип": inc.fault_label, "Статус": "выполнено"})
+        ss._ft_cand.pop(inc.pump_id, None)   # снимаем «временную память» уточнителя типа
             
 
 def _render_toast_card(inc, stage):
@@ -550,7 +691,7 @@ def _render_toast_card(inc, stage):
     pid = inc.pump_id
     stage_label = SEVERITY_LABELS.get(stage, stage)
     ready_text = inc.prescriptions.get(stage)
-    expanded = pid in ss.toast_expanded                 # по умолчанию свёрнуто
+    expanded = (pid in ss.toast_expanded) or (pid in ss.tripped)   # авария — всегда развёрнута
 
     with st.container(key=f"toastcard_{pid}_{stage}"):
         if not expanded:
@@ -651,13 +792,15 @@ def render_sidebar(op_page, en_page, nav):
                     ss.history, ss.last_tick = {}, {}
                     ss.selected_pump, ss.acked = None, {}
                     ss.playing = True                 # #8: поток стартует сразу
-                    ss.occurrences = {}
+                    ss.events = []                    # чистая история нового прогона
+                    ss.pinned, ss.tripped = {}, set()
                     ss.toast_expanded = set()
+                    ss.recovering = set()
                     ss.validation = ValidationCollector.from_settings()
                     _store = get_gen_store()
                     with _store["lock"]:
                         _store["jobs"].clear()
-                    ss.backend.preproc.reset()
+                    ss.backend.preproc.reset(None)  # type: ignore
                     for row in ss.player.skip_warmup():    # realtime: пусто (warmup_rows=0)
                         pid = str(row["pump_id"])
                         push_history(pid, row)
@@ -708,8 +851,10 @@ def view_operator():
     k = st.columns(4)
     k[0].metric("Активные аварии", fsm.active_alarm_count())
     k[1].metric("Предупреждения", fsm.active_warning_count())
-    k[2].metric("Подавлено", fsm.journal.count("suppressed"),
-                help="Сигналы пуска/простоя. Скрыты, но в архиве (ФЗ-116).")
+    k[2].metric("Подавлено",
+                fsm.journal.count("suppressed") + ss.get("anomaly_suppressed", 0),
+                help="Пуск/простой + сглаженные аномалии датчиков (наивная модель "
+                     "выдала бы тревогу). Скрыты, но в архиве (ФЗ-116).")
     recent_tx = sum(1 for e in ss.fsm.journal.events
                     if e.kind == "transition" and ss.sim_ts
                     and minutes_since(getattr(e, "ts", ss.sim_ts), ss.sim_ts) <= 60)
@@ -720,12 +865,29 @@ def view_operator():
     for col, pid in zip(cols, pumps):
         s = NE107[status_key_for(pid)]
         inc = fsm.incident(pid)
-        extra = FAULT_LABELS.get(inc.fault_type or "", "") if inc and inc.fault_type else ""
+        if inc is None and pid in ss.tripped:
+            inc = ss.pinned.get(pid)
         prep = ss.backend.preproc
-        warming = hasattr(prep, "rows_seen") and prep.rows_seen(pid) < 15
-        color = "#5A5F66" if warming else s["color"]
-        icon = "◌" if warming else s["icon"]
-        label = "Прогрев · накопление истории" if warming else s["label"]
+        raw_state = ss.history[pid][-1]["state"] if ss.history.get(pid) else 2
+        tripped = pid in ss.tripped
+        recovering = pid in ss.recovering             # квитировано — идёт восстановление
+        warming = (not tripped) and hasattr(prep, "rows_seen") and prep.rows_seen(pid) < 15
+        # тип отказа — только при активной аварии/предупреждении, НЕ на прогреве/восстановлении
+        show_fault = tripped or (not warming and not recovering
+                                 and inc is not None and fsm.state(pid) >= 1)
+        extra = (FAULT_LABELS.get(inc.fault_type or "", "")
+                 if (show_fault and inc and inc.fault_type) else "")
+        if tripped:                                   # авария важнее прогрева
+            color, icon, label = s["color"], s["icon"], s["label"]
+        elif recovering:                              # стейл fsm.state=2 после ack — не «Отказ»
+            color, icon, label = "#5A5F66", "◌", "Перезапуск · восстановление"
+        elif warming:                                 # понятный текст вместо «прогрев»
+            color, icon = "#5A5F66", "◌"
+            label = ("Оборудование отключено" if int(raw_state) == 0
+                     else "Пуск · накопление истории" if int(raw_state) == 1
+                     else "Накопление истории")
+        else:
+            color, icon, label = s["color"], s["icon"], s["label"]
         col.markdown(f"<div class='tile' style='background:{color}'>"
                      f"<div class='tid'>{icon} {pid}</div>"
                      f"<div class='tst'>{label}</div>"
@@ -792,9 +954,14 @@ def view_engineer():
         return fsm.incident(pid) or ss.pinned.get(pid)
 
     def _sev(pid):
-        if pid in ss.tripped:
-            return 2
-        return fsm.state(pid)
+            if pid in ss.tripped:
+                return 2
+            if pid in ss.recovering:              # квитировано — стейл fsm.state=2 гасим
+                return 0
+            prep = getattr(ss.backend, "preproc", None)
+            if prep is not None and hasattr(prep, "rows_seen") and prep.rows_seen(pid) < 15:
+                return 0                          # прогрев после рестарта — это не авария
+            return fsm.state(pid)
 
     def _recency(pid):
         inc = _inc(pid)
@@ -825,8 +992,15 @@ def view_engineer():
         return
 
     stage = inc.stage
+    # Уверенность типа и признаки на активном предупреждении считаем ЖИВО по текущему
+    # окну — они растут по мере развития дефекта. Зафиксированный при эскалации вектор
+    # замораживаем ТОЛЬКО при отказе (агрегат остановлен, новых данных нет) — как SHAP.
     sv = inc.symptom_vectors.get(stage) or \
         next((v for v in inc.symptom_vectors.values() if v is not None), None)
+    if pid not in ss.tripped:
+        live_sv = ss.backend.explain(pid, ss.sim_ts or inc.stage_ts, stage)
+        if live_sv is not None:
+            sv = live_sv
 
     c = st.columns(3)
     c[0].metric("Состояние", SEVERITY_LABELS.get(stage, stage))
@@ -842,8 +1016,19 @@ def view_engineer():
     tabs = st.tabs(["Диагностика (SHAP)", "Симптомы", "Трассировка RAG",
                     "ТОиР: план и история"])
     with tabs[0]:
-        frozen = ss.shap_frozen.get((inc.incident_id, stage))
-        f_sev, f_fault = frozen if frozen else ss.backend.shap_figures(inc.pump_id)
+        use_frozen = inc.pump_id in ss.tripped
+        if use_frozen:
+            f_sev, f_fault = ss.shap_frozen.get((inc.incident_id, stage)) or (None, None)
+        else:
+            # живой SHAP с троттлингом ~5 c: иначе медиафайлы плодятся каждые 2 c,
+            # старые вытесняются → MediaFileStorageError и картинка «замирает».
+            ck = f"_shaplive_{inc.pump_id}"
+            cached = ss.get(ck)
+            now = time.time()
+            if cached is None or now - cached[0] >= 5:
+                cached = (now, ss.backend.shap_figures(inc.pump_id))
+                ss[ck] = cached
+            f_sev, f_fault = cached[1]
         if not (f_sev or f_fault):
             st.caption("SHAP-графики доступны в боевом режиме ядра.")
         gc = st.columns(2)
@@ -854,8 +1039,9 @@ def view_engineer():
             gc[1].image(f_sev, use_container_width=True,
                         caption="Вклад признаков по классу «Авария» "
                                 "(удалённость от аварии)")
-        st.caption("SHAP зафиксирован на момент подтверждения состояния — "
-                   "не пересчитывается после останова агрегата.")
+        st.caption("SHAP зафиксирован на момент аварии — не пересчитывается после "
+                   "останова." if use_frozen else
+                   "SHAP по текущему окну — обновляется каждые ~5 c, пока агрегат в работе.")
     with tabs[1]:
         for attr, title in (("fault_top_symptoms", "Признаки типа отказа"),
                             ("top_symptoms", "Признаки тяжести (класс «Авария»)")):
@@ -930,63 +1116,84 @@ def _engineer_live():
 
 @st.fragment(run_every=REFRESH)
 def _render_history():
+    """История из устойчивого журнала ss.events.
+
+    Каждое возникновение (incident_id, stage) — РОВНО одна запись (append-once
+    в _log_event). Дубли невозможны по построению, склейка по времени не нужна.
+    Статус записи (active/acked/resolved/escalated) выводится здесь; acked и
+    resolved фиксируются с временем и больше не меняются."""
     ss = st.session_state
-    entries = []
-    for inc in ss.fsm.all_incidents():
-        for stage in inc.symptom_vectors.keys():
-            occ = ss.occurrences.get((inc.incident_id, stage)) or [inc.stage_ts]
-            last = len(occ) - 1
-            for idx, ts in enumerate(occ):
-                entries.append((inc, stage, ts, idx, idx == last))
-    entries.sort(key=lambda e: (str(e[2]), e[0].incident_id, e[1]), reverse=True)
+    events = ss.events
     GREY = "#5A5F66"
-    def _hstate(inc, stage, idx, is_latest):
-        key = (inc.incident_id, stage, idx)
-        if key in ss.hist_state:                      # уже зафиксировано — не трогаем
-            return ss.hist_state[key]
-        if not is_latest:                             # вытеснено ре-нагом → закрыто
-            ss.hist_state[key] = ("resolved", ss.sim_ts or inc.stage_ts)
-            return ss.hist_state[key]
-        cur = ss.fsm.incident(inc.pump_id)
-        active = ((cur is not None and cur.incident_id == inc.incident_id)
-                  or inc.pump_id in ss.tripped)
-        if active:
-            return ("active", None)                   # ещё живо — не фиксируем
-        ss.hist_state[key] = ("resolved", ss.sim_ts or inc.stage_ts)
-        return ss.hist_state[key]
+
+    # incident_id -> Incident (для текста предписания); и множество ЖИВЫХ инцидентов
+    by_id = {}
+    for inc in ss.fsm.all_incidents():
+        by_id[inc.incident_id] = inc
+    for inc in ss.pinned.values():
+        by_id.setdefault(inc.incident_id, inc)
+    live_ids = {inc.incident_id for inc in ss.pinned.values()}
+    for pid in ss.history:
+        cur = ss.fsm.incident(pid)
+        if cur is not None:
+            live_ids.add(cur.incident_id)
+    alarm_ids = {e["incident_id"] for e in events if e["stage"] == 2}
+
+    def _kind(e):
+        """Текущий вид записи. acked/resolved — терминальные (фиксируются на месте)."""
+        if e["status"] == "acked":
+            return "acked"
+        if e["status"] == "resolved":
+            return "resolved"
+        # предупреждение, доросшее до аварии того же инцидента — не «норма», а эскалация
+        if e["stage"] == 1 and e["incident_id"] in alarm_ids:
+            return "escalated"
+        if e["incident_id"] not in live_ids:          # инцидент закрыт → возврат в норму
+            e["status"] = "resolved"
+            e["status_ts"] = ss.sim_ts
+            return "resolved"
+        return "active"
+
+    rows = sorted(events, key=lambda e: (str(e["ts"]), e["incident_id"], e["stage"]),
+                  reverse=True)
 
     rules = []
-    for inc, stage, ts, idx, is_latest in entries:
-        kind, _ = _hstate(inc, stage, idx, is_latest)
+    for e in rows:
+        kind = _kind(e)
         col = (ACK_COLOR if kind == "acked"
                else GREY if kind == "resolved"
-               else SEV_COLOR.get(int(stage), GREY))
-        cls = f"hist_{inc.incident_id}_{stage}_{idx}"
+               else SEV_COLOR.get(int(e["stage"]), GREY))
+        cls = f"hist_{e['incident_id']}_{e['stage']}"
         rules.append(
             f".st-key-{cls}{{border-left:4px solid {col};border-radius:8px;"
             f"background:{col}14;padding:1px 8px 1px 9px;margin-bottom:7px;}}"
             f".st-key-{cls} [data-testid='stExpander']{{border:none;}}")
     if rules:
         st.markdown("<style>" + "".join(rules) + "</style>", unsafe_allow_html=True)
-    if not entries:
+    if not rows:
         st.caption("Предписаний пока нет.")
-    for inc, stage, ts, idx, is_latest in entries:
-        kind, htime = _hstate(inc, stage, idx, is_latest)
-        text = inc.prescriptions.get(stage)
+
+    for e in rows:
+        kind = _kind(e)
+        stage = e["stage"]
+        inc = by_id.get(e["incident_id"])
+        text = inc.prescriptions.get(stage) if inc is not None else None
+
+        def _fmt(t):
+            try: return pd.Timestamp(t).strftime("%d.%m %H:%M")
+            except Exception: return str(t)
+
         if kind == "acked":
-            try: tw = pd.Timestamp(htime).strftime("%d.%m %H:%M")   # type: ignore
-            except Exception: tw = str(htime)
-            badge = f" · ✓ квитировано {tw}"
+            badge = f" · ✓ квитировано {_fmt(e['status_ts'])}"
         elif kind == "resolved":
-            try: tw = pd.Timestamp(htime).strftime("%d.%m %H:%M")   # type: ignore
-            except Exception: tw = str(htime)
-            badge = f" · ↩ возвращено в норму {tw}"
+            badge = f" · ↩ возвращено в норму {_fmt(e['status_ts'])}"
+        elif kind == "escalated":
+            badge = " · ↑ переросло в аварию"
         else:
             badge = ""
-        try: when = pd.Timestamp(ts).strftime("%d.%m %H:%M")
-        except Exception: when = str(ts or "—")
-        with st.container(key=f"hist_{inc.incident_id}_{stage}_{idx}"):
-            with st.expander(f"{when} · {inc.pump_id} · "
+        when = _fmt(e["ts"])
+        with st.container(key=f"hist_{e['incident_id']}_{stage}"):
+            with st.expander(f"{when} · {e['pump_id']} · "
                              f"{SEVERITY_LABELS.get(stage, stage)}{badge}"):
                 if text:
                     st.markdown(sections_html(text), unsafe_allow_html=True)

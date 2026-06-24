@@ -202,7 +202,7 @@ def plot_avalanche(log: pd.DataFrame):
     ax1.set_ylabel("Количество сигналов")
     ax1.set_ylim(0, raw * 1.18 if raw else 1)
     ax1.annotate(f"подавлено {ratio:.1f}%",
-                 xy=(1, confirmed + raw * 0.035), xytext=(0.62, raw * 0.45),
+                 xy=(1, confirmed + raw * 0.02), xytext=(1, raw * 0.52),
                  ha="center", color=C_BLUE, fontweight="bold", fontsize=12,
                  arrowprops=dict(arrowstyle="->", color=C_BLUE, lw=1.6))
 
@@ -387,7 +387,7 @@ def plot_state_timeline_all(log: pd.DataFrame):
                bbox_to_anchor=(0.5, 0.0), frameon=False, fontsize=9)
     fig.suptitle("Таймлайн состояния по насосам парка", fontweight="bold", fontsize=13)
     fig.autofmt_xdate()
-    fig.tight_layout(rect=[0, 0.04, 1, 0.97]) # type: ignore
+    fig.tight_layout(rect=[0, 0.04, 1, 0.97])   # type: ignore
     return fig
 
 
