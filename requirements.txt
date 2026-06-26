@@ -1,3 +1,20 @@
+# =====================================================================
+# Predictive Alarm Platform — зависимости (полный pip freeze)
+# ---------------------------------------------------------------------
+# Python: 3.9.6 — среда сборки и тестирования. Минимум 3.9
+#         (код использует PEP 585: подписки builtin-дженериков, напр. list[int]).
+#
+# Внешнее (НЕ устанавливается через pip):
+#   • Ollama (https://ollama.com) + локальная LLM-модель из
+#     config/settings/settings.py (qwen3.5:9b / phi4:14b /
+#     second_constantine/yandex-gpt-5-lite:8b). Нужно только LLM-агенту;
+#     UI/демо работают и без него (автооткат на ProtoBackend).
+#
+# Установка:
+#   python -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt
+# =====================================================================
+
 aiohappyeyeballs==2.6.1
 aiohttp==3.13.5
 aiosignal==1.4.0
@@ -29,6 +46,7 @@ flatbuffers==25.12.19
 fonttools==4.60.2
 frozenlist==1.8.0
 fsspec==2025.10.0
+git-filter-repo==2.47.0
 gitdb==4.0.12
 GitPython==3.1.50
 googleapis-common-protos==1.75.0
@@ -158,3 +176,9 @@ xgboost==2.1.4
 yarl==1.22.0
 zipp==3.23.1
 zstandard==0.25.0
+
+# --- Тесты (опционально) ---------------------------------------------
+# Раннер для experiments/validation/*_test.py. Тесты также запускаются как
+# обычные скрипты (python experiments/validation/<file>.py) без pytest.
+# Не входит в pip freeze venv — версию подберёт резолвер под Python 3.9.
+pytest

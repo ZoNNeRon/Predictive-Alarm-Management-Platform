@@ -202,25 +202,36 @@ def plot_avalanche(log: pd.DataFrame):
     ax1.set_ylabel("Количество сигналов")
     ax1.set_ylim(0, raw * 1.18 if raw else 1)
     ax1.annotate(f"подавлено {ratio:.1f}%",
-                 xy=(1, confirmed + raw * 0.02), xytext=(1, raw * 0.52),
+                 xy=(1, confirmed + raw * 0.1), xytext=(1, raw * 0.52),
                  ha="center", color=C_BLUE, fontweight="bold", fontsize=12,
                  arrowprops=dict(arrowstyle="->", color=C_BLUE, lw=1.6))
 
     by_reason = (log[log["raw_fire"] & ~log["escalated"]]
-                 .groupby("suppress_reason").size())
-    names = {"anomaly": "Аномалии датчиков\n(сглажены окнами)",
-             "startup_idle": "Пуск / простой\n(состояние, ФЗ-116)",
-             "debounce": "Удержание тревоги\n(один сигнал на инцидент)",
+                 .groupby("suppress_reason").size()
+                 .sort_values(ascending=False))   # по часовой: от большего к меньшему
+    names = {"anomaly": "Аномалии датчиков (сглажены окнами)",
+             "startup_idle": "Пуск / простой (состояние, ФЗ-116)",
+             "debounce": "Удержание тревоги (один сигнал на инцидент)",
              "": "Прочее"}
     reason_color = {"anomaly": C_WARN, "startup_idle": C_BLUE,
                     "debounce": C_GRAY, "": "#9AA0A6"}
-    labels = [names.get(k, k) for k in by_reason.index]
     if by_reason.sum() > 0:
-        ax2.pie(by_reason.values, labels=labels, autopct="%1.0f%%",
-                colors=[reason_color.get(k, "#9AA0A6") for k in by_reason.index],
-                textprops={"fontsize": 9}, wedgeprops={"linewidth": 1,
-                                                       "edgecolor": "white"})
-        ax2.set_title("Чем подавлено")
+        total = int(by_reason.sum())
+        colors = [reason_color.get(k, "#9AA0A6") for k in by_reason.index]
+        # Проценты — на крупных секторах; подписи причин — в легенде снизу
+        # (вертикальный список): мелкие сектора 1–6% радиальными подписями
+        # налезали друг на друга. Легенда исключает наложение by design.
+        wedges, _t, _a = ax2.pie(
+            by_reason.values, colors=colors, startangle=90, counterclock=False,
+            autopct=lambda p: f"{p:.0f}%" if p >= 8 else "",
+            pctdistance=0.62, wedgeprops={"linewidth": 1, "edgecolor": "white"},
+            textprops={"fontsize": 13, "fontweight": "bold", "color": "white"})
+        legend_labels = [f"{names.get(str(k), str(k))} — {v / total * 100:.0f}%"
+                         for k, v in by_reason.items()]
+        ax2.legend(wedges, legend_labels, loc="upper center",
+                   bbox_to_anchor=(0.5, -0.02), fontsize=11.5, frameon=False,
+                   handlelength=1.1, labelspacing=0.5)
+        ax2.set_title("Какой сигнал подавлен")
     else:
         ax2.axis("off")
     fig.tight_layout()
@@ -292,10 +303,11 @@ def plot_confusion(log: pd.DataFrame):
     fig, ax = plt.subplots(figsize=(5.6, 5))
     ax.imshow(mn, cmap="Blues", vmin=0, vmax=1)
     ax.set_xticks(range(3)); ax.set_yticks(range(3))
-    ax.set_xticklabels([SEV_LABELS[i] for i in range(3)], rotation=20, ha="right")
+    ax.set_xticklabels([SEV_LABELS[i] for i in range(3)], rotation=15, ha="center")
     ax.set_yticklabels([SEV_LABELS[i] for i in range(3)])
-    ax.set_xlabel("Детектировано"); ax.set_ylabel("Истина")
-    ax.set_title("Матрица ошибок тяжести")
+    ax.set_xlabel("Детектировано", fontsize=14)
+    ax.set_ylabel("Истина", fontsize=14)
+    ax.set_title("Матрица ошибок тяжести", fontsize=16)
     for i in range(3):
         for j in range(3):
             ax.text(j, i, f"{mn[i, j]*100:.0f}%\n{m[i, j]}", ha="center",
@@ -372,20 +384,20 @@ def plot_state_timeline_all(log: pd.DataFrame):
                            color="#8E24AA", marker="o", zorder=6,
                            edgecolors="white", linewidths=0.4)
         ax.set_ylim(0, 1); ax.set_yticks([0.25, 0.75])
-        ax.set_yticklabels(["детект", "истина"], fontsize=8)
-        ax.set_ylabel(pid, fontsize=9.5, rotation=0, ha="right",
+        ax.set_yticklabels(["детект", "истина"], fontsize=12)
+        ax.set_ylabel(pid, fontsize=14, rotation=0, ha="right",
                       va="center", labelpad=34, fontweight="bold")
         ax.grid(False)
         for sp in ax.spines.values():
             sp.set_visible(False)
-    axes[-1].set_xlabel("Время")
+    axes[-1].set_xlabel("Дата (мм-дд) Время (час)", fontsize=14)
     leg = [Patch(facecolor=SEV_COLORS[k], label=SEV_LABELS[k]) for k in (0, 1, 2)]
     leg.append(Patch(facecolor=C_GRAY, label="Пуск / простой"))
     leg.append(Line2D([0], [0], marker="o", color="white", markerfacecolor="#8E24AA",
                       markersize=8, label="Аномалия (истина)", linewidth=0))    # type: ignore
     fig.legend(handles=leg, ncol=5, loc="lower center",
-               bbox_to_anchor=(0.5, 0.0), frameon=False, fontsize=9)
-    fig.suptitle("Таймлайн состояния по насосам парка", fontweight="bold", fontsize=13)
+               bbox_to_anchor=(0.5, 0.0), frameon=False, fontsize=10)
+    fig.suptitle("Таймлайн состояния по насосам парка", fontweight="bold", fontsize=16)
     fig.autofmt_xdate()
     fig.tight_layout(rect=[0, 0.04, 1, 0.97])   # type: ignore
     return fig
@@ -404,7 +416,7 @@ def render_all(log: pd.DataFrame, outdir: str) -> Dict[str, str]:
     paths = {}
     for name, fig in figs.items():
         p = os.path.join(outdir, f"validation_{name}.png")
-        fig.savefig(p)
+        fig.savefig(p, bbox_inches="tight")   # захватить вынесенную вниз легенду
         plt.close(fig)
         paths[name] = p
     return paths

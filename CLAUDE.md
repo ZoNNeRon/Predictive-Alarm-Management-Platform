@@ -60,11 +60,16 @@ predictive_alarm_platform/
 │       ├── ml_visualisation.py          # Графики ML (confusion, metrics, PR, recall, fault classifier)
 │       ├── rag_visualisation.py         # Графики RAG (состав базы, чанки, качество поиска)
 │       ├── xai_visualisation.py         # Графики XAI (waterfall, beeswarm — severity + fault)
-│       └── ai_visualisation.py          # Графики бенчмарка LLM-агента
+│       ├── ai_visualisation.py          # Графики бенчмарка LLM-агента
+│       └── realtime_val_visualisation.py # ГОТОВО — ValidationCollector + графики real-time валидации (лавина тревог)
 │
 ├── experiments/                     # (бывш. scripts/) — исследования и регрессионные тесты
 │   ├── data_stream/
 │   │   └── demo_stream.py           # ГОТОВО — детерминированный демо-сценарий из датасета + ScenarioPlayer
+│   ├── realtime_validation/         # ГОТОВО — режим реального времени (живая генерация парка)
+│   │   ├── live_generator.py        # LiveMultiPumpGenerator + RealtimeConfig (AR(1) один-в-один с data_generator)
+│   │   ├── realtime_player.py       # RealtimePlayer — драйвер тика (интерфейс ScenarioPlayer)
+│   │   └── realtime_preprocessor.py # RealtimeProgressivePreprocessor — прогрессивный прогрев (признаки с 1-й строки)
 │   ├── logo_cv/
 │   │   └── xgboost_benchmark.py     # ГОТОВО — LOGO CV (5 фолдов), доказательство обобщения
 │   ├── llm_benchmark/
@@ -118,8 +123,13 @@ predictive_alarm_platform/
 │   │   ├── agent_plot3_summary_heatmap.png      # Сводный хитмап (relative quality)
 │   │   ├── agent_plot4_expert_radar.png         # Радар экспертных оценок
 │   │   ├── agent_plot5_stage_breakdown.png      # Стадийный разрез (Warning vs Авария)
-│   │   ├── ui_waterfall_sev_MNHV_005.png        # SHAP waterfall тяжести для инженерной вкладки UI (runtime)
-│   │   └── ui_waterfall_fault_MNHV_005.png      # SHAP waterfall типа отказа для инженерной вкладки UI (runtime)
+│   │   ├── ui_waterfall_sev_MNHV_00X.png        # SHAP waterfall тяжести для инженерной вкладки UI (runtime, по насосам)
+│   │   ├── ui_waterfall_fault_MNHV_00X.png      # SHAP waterfall типа отказа для инженерной вкладки UI (runtime)
+│   │   ├── validation_avalanche.png             # Real-time валидация: лавина тревог (наивный vs система)
+│   │   ├── validation_alarm_rate.png            # Темп тревог во времени (норматив ISA 18.2)
+│   │   ├── validation_detection_latency.png     # Латентность обнаружения отказа
+│   │   ├── validation_confusion.png             # Матрица ошибок детектирования (истина генератора)
+│   │   └── validation_timeline.png              # Таймлайн состояний парка
 │   └── tables/                                  # CSV-таблицы результатов
 │       ├── ML_fault_recall_table.csv
 │       ├── ML_fault_classifier_summary.csv
@@ -154,6 +164,7 @@ predictive_alarm_platform/
 │       └── diagnostics_extended.md    # Расширенная вибродиагностика (diagnostics)
 │
 ├── requirements.txt
+├── README.md                          # Витрина проекта для GitHub (RU)
 └── CLAUDE.md                          # ← этот файл
 ```
 
@@ -209,6 +220,7 @@ predictive_alarm_platform/
 - **`analyze_fault_recall(model, df_test, feature_cols, save_graphs_dir, save_tables_dir)`** — вызывается из `severity_classifier_pipeline.py` (шаг 10) и автономно
 - **Recall(Critical):** доля строк `state=4` данного `fault_type`, предсказанных как класс 2
 - **Recall(Warning):** доля строк `state=3` данного `fault_type`, предсказанных как ≥ 1 (угроза не пропущена)
+- **Результаты (тест MNHV_005, из `ML_fault_recall_table.csv`):** Recall(Авария) 0.945 / 0.944 / 0.969, Recall(Предупреждение) 0.970 / 0.995 / 0.983 (Перегрев/Кавитация/Электрика) — все три сигнатуры распознаются, ни один тип не пропущен
 - **Fallback:** если `fault_type` отсутствует в processed CSV — присоединяется из raw по `[timestamp, pump_id]`
 - Визуализация вынесена в `src/visualisation/ml_visualisation.py` (функция `recall_plot`)
 - **Выходы:** `artifacts/graphs/ML_plot4_fault_recall_analysis.png`, `artifacts/tables/ML_fault_recall_table.csv`
@@ -220,6 +232,7 @@ predictive_alarm_platform/
 - **Group Split:** train = MNHV_001–004, test = MNHV_005; `class_weight='balanced'`
 - Три модели: LR, RF, XGBoost (n=300, lr=0.1, depth=6, `mlogloss`)
 - **Метрики:** macro-F1, balanced accuracy, per-class recall, раздельно по стадии (Warning / Critical) через `severity_stage`
+- **Результаты (тест MNHV_005, из `ML_fault_classifier_summary.csv`):** XGBoost (основная) macro-F1=**0.995**, balanced acc=**0.995**, recall по типам 0.996 / 0.997 / 0.992 (Перегрев/Кавитация/Электрика); RF 0.993 / 0.992; LR 0.974 / 0.976
 - Визуализация через `src/visualisation/ml_visualisation.py` (функция `plot_fault_classifier`)
 - **Выходы:**
   - Модели: `models/fault_type/fault_{lr,rf,xgboost}_model.joblib`
@@ -348,18 +361,45 @@ predictive_alarm_platform/
 - **`ScenarioPlayer`** — плеер потока: выдаёт строки по одной, хранит позицию (живёт в `st.session_state`), `skip_warmup()` прогоняет warmup-префикс пакетом
 
 ### 17. `src/app/app.py` — Streamlit двухуровневый UI (NAMUR NE 129)
-- **Мультистраничная навигация** (`st.Page` / `st.navigation`): Оператор (`url_path="operator"`, default) и Инженер (`url_path="engineer"`) — настоящие независимые страницы, переключение через `st.switch_page`; поддеревья изолированы, экраны не «протекают» друг в друга
-- **Оператор:** карта оборудования (плитки-статусы NAMUR NE 107), счётчики активных аварий/предупреждений/подавленных/переходов, drill-down в агрегат с интерактивными Plotly-графиками всех 4 параметров (пороги-линии, **ось реального времени**, ховер); предписания — стопка «тостов» справа снизу (по одной карточке на насос, показывается старшая стадия; цвет рамки по тяжести; сворачивается/квитируется)
-- **Инженер:** список **ВСЕХ агрегатов**, отсортированных по тяжести (Авария→Предупреждение→Норма); для «Нормы» — снимок текущих параметров, для инцидента — вкладки: SHAP обеих моделей (PNG из `shap_figures()`), таблицы симптомов, трассировка RAG по каналам, план/история ТОиР
-- **Сайдбар-«язычок»:** история предписаний (одна строка на каждое **возникновение**, цветовая подсветка по тяжести/квитированию) + панель сборки/воспроизведения демо-сценария (валидация)
+- **Мультистраничная навигация** (`st.Page` / `st.navigation`, `position="hidden"`): Оператор (`url_path="operator"`, default) и Инженер (`url_path="engineer"`) — настоящие независимые страницы (переключение кнопками в сайдбаре через `st.switch_page`); поддеревья изолированы, экраны не «протекают» друг в друга
+- **Два источника данных** (радиокнопка в сайдбаре):
+  - **Датасет (демо)** — `extract_demo_scenario` + `ScenarioPlayer` + строгий `OnlinePreprocessor` (60-мин прогрев). Путь к CSV резолвится от `_PROJECT_ROOT` (не от CWD Streamlit)
+  - **Реальное время** — `LiveMultiPumpGenerator` + `RealtimePlayer` + `RealtimeProgressivePreprocessor` (признаки с 0-й минуты, холодный старт `warmup_rows=0`)
+- **Оператор:** карта оборудования (плитки-статусы NAMUR NE 107), счётчики активных аварий/предупреждений/подавленных/переходов-в-час (скользящее окно 60 мин), drill-down в агрегат с интерактивными Plotly-графиками 4 параметров (пороги-линии, **ось реального времени**, фикс-диапазоны `YRANGE`, ховер); предписания — стопка «тостов» справа снизу (по одной карточке на насос, старшая стадия; цвет рамки по тяжести; сворачивается/квитируется)
+- **Инженер:** список **ВСЕХ агрегатов**, отсортированных по тяжести (Авария→Предупреждение→Норма); для «Нормы» — снимок текущих параметров, для инцидента — вкладки: SHAP обеих моделей (живой с троттлингом ~5 c, либо замороженный при аварии), таблицы симптомов (live по текущему окну на предупреждении), трассировка RAG по каналам, план/история ТОиР
+- **Сайдбар-«язычок»:** история предписаний + панель источника данных/воспроизведения + кнопка «Сохранить графики валидации» (real-time режим)
 
-**Архитектура реального времени (ключевое отличие от прежней версии):**
-- **Поток данных не останавливается на эскалации:** `advance_stream()` прогоняет N строк через backend+FSM и на триггере вызывает `_on_escalation()` без `break`/снятия `playing` — ползунок и графики продолжают идти
-- **Фоновая генерация предписания:** медленная цепочка RAG+LLM (~13 с) вынесена в daemon-поток; задания живут в потокобезопасном сторе `get_gen_store()` (`@st.cache_resource` — переживает rerun'ы Streamlit, в отличие от модульных globals и `session_state`). Главный проход только опрашивает store (`poll_generations()`) и дописывает готовый текст в `Incident.prescriptions`
-- **Факт инцидента фиксируется сразу:** `_on_escalation()` синхронно считает `SymptomVector` (быстро, главный поток) → инцидент мгновенно появляется в истории и тосте, ещё до готовности текста; быстрый переход Предупреждение→Авария не теряет предупреждение
-- **Ре-наг (`poll_renags()`):** если после квитирования стадия держится дольше `RENAG_MIN` (10 sim-минут) — снимается квитирование, в историю добавляется новое возникновение с новым временем; предписание не перегенерируется (проблема та же)
-- **Перерисовка:** фоновый поток не может сам инициировать rerun, поэтому пока идёт генерация ИЛИ воспроизведение, главный цикл переотрисовывается по таймеру `REFRESH` (0.6 с)
+**Архитектура реального времени:**
+- **Перерисовка через фрагменты:** экраны и история обёрнуты в `@st.fragment(run_every=REFRESH)` (`REFRESH=2.0 с`); движок (`_engine_tick`) гонит поток и опрашивает фон **внутри** фрагмента — нет глобального `time.sleep`/`st.rerun`, который перебивал бы клики (квитировать/развернуть) и кидал экран наверх
+- **Поток данных не останавливается на эскалации:** `advance_stream()` на триггере вызывает `_on_escalation()` без `break`/снятия `playing` — ползунок и графики продолжают идти
+- **Фоновая генерация предписания:** медленная цепочка RAG+LLM (~13 с) — в daemon-потоке; задания в потокобезопасном сторе `get_gen_store()` (`@st.cache_resource` — переживает rerun'ы Streamlit). Главный проход опрашивает store (`poll_generations()`) и дописывает готовый текст в `Incident.prescriptions`
+- **Факт инцидента фиксируется сразу:** `_on_escalation()` синхронно считает `SymptomVector` → инцидент мгновенно появляется в истории/тосте; быстрый переход Предупреждение→Авария не теряет предупреждение
+- **Журнал событий истории `ss.events`** — устойчивый append-only лог (одна запись = одно возникновение с уникальным `eid`), единственный источник левой панели. Не зависит от мутаций `stage_ts` инцидента в FSM (раньше история строилась из `fsm.all_incidents()` и хрупко склеивалась по временно́му окну — заменено). Кап `MAX_EVENTS=100` (`_cap_events` при каждом `_append_event`): выбрасываются старейшие ЗАВЕРШЁННЫЕ записи (acked/resolved), активные сохраняются; осиротевшие кэши `shap_frozen`/`_presc_ft` подчищаются (`_prune_incident_caches`)
+- **Жизненный цикл алармов:** `ss.tripped` (авария держит «Отказ» + глушит повторный трип до квитирования), `ss.recovering` (после квитирования гасит стейл `fsm.state=2` до возврата в норму), `ss.pinned` (ссылка на инцидент переживает закрытие в FSM), `ss._deadzone` (мёртвая зона после пуска: окно обнуляется, пока пусковой ток выше порога), `_refine_warning_type` (уточнение типа отказа по мере развития слабой ранней сигнатуры)
+- **Ре-наг (`poll_renags()`):** если после квитирования проблема **реально держится** (инцидент всё ещё текущий для агрегата) дольше `RENAG_MIN` (10 sim-мин) — в историю добавляется **новая строка** возникновения (`_append_event`), прежняя остаётся квитированной; предписание то же (текст в `Incident.prescriptions`)
 - Запуск: `streamlit run src/app/app.py`
+
+### 18. `experiments/realtime_validation/live_generator.py` — Живой генератор парка
+- **`LiveMultiPumpGenerator`** — генерирует телеметрию ПОШАГОВО («здесь и сейчас»): на тик — по строке на каждый насос парка по единым модельным часам. Формулы AR(1), сигнатуры 3 типов отказа, startup-всплеск, аномалии и State Machine перенесены **один-в-один** из `data_generator.py` (те же μ, φ, σ, linspace-тренды); отличия только структурные (поминутный шаг, RNG-поток на насос, ускоренные тайминги)
+- **`RealtimeConfig`** — ручки темпа/вероятностей (длительность деградации `degradation_min/max`, частота аномалий и т.д.), чтобы валидация шла минуты, а не дни
+- **Квитирование как обратная связь:** `acknowledge(pump_id)` — Degradation+ack → 50% возврат в Healthy; Critical+ack → 100% останов (Off→Startup→Healthy, «режим предотвращённых сигналов»); `trip(pump_id)` — принудительный останов аварийного агрегата
+
+### 19. `experiments/realtime_validation/realtime_player.py` — Драйвер тика реального времени
+- **`RealtimePlayer`** — тонкая обёртка над `LiveMultiPumpGenerator`, повторяет интерфейс `ScenarioPlayer` (`next_rows`/`finished`/`progress`/`pos`/`__len__`/`skip_warmup`) → встаёт на место плеера в `app.py` без переписывания UI
+- За тик отдаёт строку на КАЖДЫЙ насос (общий timestamp); `pos` считает sim-минуты; `acknowledge`/`trip` пробрасываются в генератор. С `warmup_rows=0` — честный холодный старт (в паре с прогрессивным препроцессором)
+
+### 20. `experiments/realtime_validation/realtime_preprocessor.py` — Прогрессивный препроцессор
+- **`RealtimeProgressivePreprocessor(OnlinePreprocessor)`** — выдаёт вектор `FEATURE_COLS` с ПЕРВОЙ строки (расширяющиеся → скользящие окна), снимая «слепое окно» 60-мин прогрева на старте демо. Наследует `__init__`/`feature_cols`, переопределяет только политику прогрева
+- **Паритет на полном окне:** начиная с 60-й строки результат бит-в-бит совпадает со строгим `OnlinePreprocessor` (и, значит, с offline-обучением) — самотест в `__main__`. `shift(1)`, порядок колонок, `std` (ddof=1, 0 при <2 точках), `diff_30` (0 при <31 строке) сохранены
+- `reset(pump_id=None)` совместим с базовым: без аргумента — полный сброс всех буферов (старт сценария), с `pump_id` — сброс конкретного агрегата (трип/пуск)
+- `rows_seen(pump_id)` — для бейджа «прогрев»/«накопление истории» на плитке
+
+### 21. `src/visualisation/realtime_val_visualisation.py` — Метрики и графики real-time валидации
+- **`ValidationCollector`** — накапливает per-tick лог прогона (истина генератора + что выдала система); `from_settings()`, `add(...)`, `to_frame()`
+- **`summarize(log)`** — сводные метрики; **`render_all(log, outdir)`** — публикационные графики в `artifacts/graphs/`:
+  - `validation_avalanche.png` — **главное доказательство цели:** сколько тревог выдал бы наивный пороговый алармер vs сколько оставила система (гашение окнами/состоянием/дебаунсом)
+  - `validation_alarm_rate.png` — темп тревог во времени (норматив ISA 18.2 ≤6/час), `validation_detection_latency.png` — латентность обнаружения, `validation_confusion.png` — матрица ошибок против истины генератора, `validation_timeline.png` — таймлайн состояний парка
+- Полностью автономен от моделей (есть самотест на синтетическом логе)
 
 ---
 
@@ -410,22 +450,27 @@ predictive_alarm_platform/
 | `rag_visualisation.py` | `plot_all_rag(kb, test_queries, save_dir)` → 5 графиков: `plot_knowledge_base_stats`, `plot_chunk_length_distribution`, `plot_retrieval_quality`, `plot_fault_coverage_heatmap`, `plot_fault_section_sourcing` | `rag_database.py` |
 | `xai_visualisation.py` | `plot_severity_waterfall()`, `plot_severity_summary()`, `plot_severity_summary_by_fault_type()` — severity; `plot_fault_waterfall()`, `plot_fault_summary_by_type()` — fault classifier | `xai_module.py`, `platform_backend.py` |
 | `ai_visualisation.py` | `plot_performance(df, save_dir)`, `plot_quality_auto(df, save_dir)`, `plot_summary_heatmap(summary_df, directions, fmt, save_dir)`, `plot_expert_radar(expert_scores, save_dir)`, `plot_stage_breakdown(df, save_dir)` | `experiments/llm_benchmark/ai_agent_benchmark.py`, автономно |
+| `realtime_val_visualisation.py` | `ValidationCollector`, `summarize(log)`, `render_all(log, outdir)` → `plot_avalanche`, `plot_alarm_rate`, `plot_detection_latency`, `plot_confusion`, `plot_state_timeline_all` | `app.py` (real-time режим), автономно (самотест) |
 
 ---
 
 ## Что предстоит сделать / доработать
 
-Все основные модули, включая Streamlit UI (`src/app/app.py`) и runtime-слой, **реализованы**;
-пути в `src/runtime/platform_backend.py` синхронизированы с новой раскладкой
-(`models/severity/`, `models/fault_type/`, `artifacts/chroma_db`, `artifacts/graphs`).
-Остаточные задачи:
+Функционально проект **завершён**: аналитическое ядро (две модели, XAI, RAG, LLM-агент),
+runtime-слой, двухуровневый Streamlit UI с двумя источниками данных (демо-датасет +
+живой режим реального времени) и подсистема real-time валидации с публикационными
+графиками — реализованы и работают.
 
-1. **Регрессионный тест паритета** online/offline препроцессора (`verify_parity`) — оформить как запускаемый модуль (упомянут в docstring `online_preprocessor.py` как `scripts.test_online_parity`, файл пока отсутствует).
-2. Подключение реального источника ТОиР-истории вместо демо-данных в инженерной вкладке.
+Остаточные (косметические / по желанию — **сейчас не трогаем**):
 
-**Режим инференса в UI (через `OnlinePreprocessor`, по одной строке):**
+1. Доработка графиков, комментариев, чистка неиспользуемого контекста и мелкая полировка UI.
+2. **Регрессионный тест паритета** online/offline препроцессора (`verify_parity`) — оформить как запускаемый модуль (упомянут в docstring `online_preprocessor.py` как `scripts.test_online_parity`, файл пока отсутствует).
+3. Подключение реального источника ТОиР-истории вместо демо-данных в инженерной вкладке.
+4. Валидация на реальных промышленных данных (текущая — на физически достоверном синтетическом датасете и живом генераторе).
+
+**Режим инференса в UI (по одной строке):**
 ```python
-tick = backend.process_tick(pump_id, raw_row)      # OnlinePreprocessor + AlarmManager
+tick = backend.process_tick(pump_id, raw_row)      # online-препроцессор + AlarmManager
 trigger = fsm.update(pump_id, ts, tick.severity,    # дебаунс-FSM, гейтинг LLM
                      suppressed=tick.suppressed, fault_type=tick.fault_type)
 if trigger is not None:                             # подтверждённая эскалация
@@ -485,7 +530,14 @@ if trigger is not None:                             # подтверждённа
 | Фоновый поток генерации предписания (`get_gen_store` через `@st.cache_resource`) | Поток данных и графики не «замерзают» на ~13 с генерации RAG+LLM; store переживает rerun'ы Streamlit (модульные globals и `session_state` для этого не годятся) |
 | Поток данных не останавливается на эскалации | `SymptomVector` считается синхронно (факт инцидента фиксируется сразу), текст дописывается в фоне — быстрый переход Предупреждение→Авария не теряет предупреждение |
 | Мультистраничная навигация (`st.Page`/`st.navigation`) вместо `ss.role` | Реальная изоляция поддеревьев Оператор/Инженер; элементы одного экрана не протекают на другой |
-| Ре-наг по таймеру `RENAG_MIN` без перегенерации | Удержание стадии после квитирования = новое возникновение в истории; текст переиспользуется, LLM не дёргается повторно |
+| Перерисовка через `@st.fragment(run_every=REFRESH)`, без глобального `time.sleep`/`st.rerun` | Глобальный rerun перебивал фрагменты, съедал клики (квитировать/развернуть), кидал экран наверх и двоил тики |
+| История из журнала `ss.events` (append-only, уникальный `eid`) | Устойчивость: не зависит от мутаций `stage_ts` инцидента в FSM; хрупкая склейка «близнецов» по временно́му окну больше не нужна |
+| Ре-наг = НОВАЯ строка истории (а не мутация старой) | Квитированное событие остаётся завершённым; повторное возникновение через `RENAG_MIN` — отдельная строка с тем же предписанием; ре-наг только если инцидент всё ещё текущий для агрегата |
+| `RealtimeProgressivePreprocessor` для живого режима | Признаки с 1-й минуты (нет «слепого окна»); паритет бит-в-бит со строгим препроцессором после 60-й строки сохранён |
+| `LiveMultiPumpGenerator` повторяет формулы `data_generator.py` один-в-один | Живой режим валиден на той же физике, что и обучение; квитирование как обратная связь (50% восстановление / 100% останов) |
+| `RealtimePlayer` повторяет интерфейс `ScenarioPlayer` | Живой режим встаёт на место демо-плеера без переписывания UI (advance_stream/тосты/графики как есть) |
+| Мёртвая зона после пуска (`_deadzone`) + сброс окна на OFF/STARTUP | Пусковой ток/гидроудар не попадают в скоринг — переходник любой длины вырезан, а не первые 5 строк |
+| Путь к CSV резолвится от `_PROJECT_ROOT` | Сборка демо-сценария не зависит от рабочей директории, из которой запущен `streamlit run` |
 
 ---
 
@@ -501,7 +553,7 @@ if trigger is not None:                             # подтверждённа
 
 | Компонент | Технология |
 |---|---|
-| Язык | Python 3.11+ |
+| Язык | Python 3.9+ (среда: 3.9.6) |
 | ML | scikit-learn, XGBoost |
 | XAI | shap (TreeExplainer) |
 | RAG / Embeddings | LangChain, ChromaDB, intfloat/multilingual-e5-large |

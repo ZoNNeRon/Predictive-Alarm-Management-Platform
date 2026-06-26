@@ -312,13 +312,20 @@ class ProtoBackend(PlatformBackend):
                           severity_proba=proba, fault_type=ft, fault_proba=fp)
 
     def explain(self, pump_id, ts, severity):
-        # имитация SymptomVector ровно теми полями, что читает UI/трасса
+        # имитация SymptomVector ровно с теми полями, что у боевого (xai_module):
+        # UI читает probabilities[1] (drill-down предупреждения) — без него падает.
         from types import SimpleNamespace
         label, ft = self._last_label.get(pump_id, (0, None))
+        proba = [[0.97, 0.025, 0.005],
+                 [0.10, 0.85, 0.05],
+                 [0.02, 0.08, 0.90]][label]
         sym = SimpleNamespace(
             pump_id=pump_id, timestamp=ts, predicted_class=label,
-            critical_probability=87.3 if label == 2 else 41.0,
+            probabilities=proba,                       # [P(Норма),P(Пред),P(Авария)]
+            critical_probability=proba[2] * 100,
+            shap_base_value=0.0,
             inferred_fault=ft or "unknown",
+            true_fault=ft or "unknown",
             top_symptoms=[SimpleNamespace(feature="temperature_mean_60",
                                           sensor="temperature", value=94.1,
                                           shap_weight=2.31, window="mean_60")],

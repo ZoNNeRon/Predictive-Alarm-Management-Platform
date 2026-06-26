@@ -84,6 +84,7 @@ WINDOW_MIN = 120
 RENAG_MIN = 10            # повторное оповещение, если стадия держится (sim-минуты)
 REFRESH = 2.0            # период переотрисовки главного прохода (с)
 GEN_TIMEOUT = 90.0       # страховочный таймаут генерации предписания (с)
+MAX_EVENTS = 100         # кап истории: дольше демо не гоняем (защита от роста памяти)
 YRANGE = {"vibration": (0, 12), "temperature": (0, 98),
           "current": (0, 150), "pressure": (0, 2)}
 
@@ -120,6 +121,12 @@ button[kind="primary"], button[data-testid="stBaseButton-primary"] {
 
 .vbadge {font-size:.72rem; color:#c8ccd1; margin:0 0 2px 2px;}
 .vbadge b {color:#fff;}
+
+/* Резерв высоты графиков: при авто-перерисовке Plotly-iframe на миг схлопывается
+   в 0, контент под ним съезжает вверх и браузер обрезает прокрутку («прыжок
+   наверх»). Фиксируем минимальную высоту слота — слот не схлопывается. */
+[data-testid="stPlotlyChart"], [data-testid="stVegaLiteChart"],
+[data-testid="stArrowVegaLiteChart"] {min-height:200px;}
 
 /* контейнер тостов — фиксирован справа снизу, прозрачный; внутри карточки стопкой */
 .st-key-presctoast {position:fixed; right:16px; bottom:16px; width:430px;
@@ -223,10 +230,10 @@ def poll_renags():
             continue
         if minutes_since(ack_ts, ss.sim_ts) >= RENAG_MIN:
             ss.acked.pop(key, None)                  # тост снова покажется
-            ev = _find_event(incident_id, stage)     # та же запись — НЕ дублируем строку
-            if ev is not None:
-                ev["status"] = "active"
-                ev["status_ts"] = None
+            # НОВОЕ возникновение → отдельная строка истории с текущим временем.
+            # Прежняя строка остаётся квитированной (завершённое событие).
+            # Предписание берётся то же — текст лежит в inc.prescriptions[stage].
+            _append_event(incident_id, pid, stage, ss.sim_ts)
 
 def poll_generations():
     ss = st.session_state
@@ -287,6 +294,7 @@ def init_state():
     # меняется на месте. Не зависит от мутаций stage_ts инцидента в FSM, поэтому
     # не нужна склейка «близнецов» по временному окну (была хрупкой).
     ss.setdefault("events", [])         # список dict: см. _log_event()
+    ss.setdefault("_event_seq", 0)      # монотонный id строки истории (eid)
     ss.setdefault("validation", None)
     ss.setdefault("tripped", set())     # насосы в аварийном останове до квитирования
     ss.setdefault("pinned", {})         # закреплённые инциденты: живут до квитирования
@@ -296,6 +304,45 @@ def init_state():
     ss.setdefault("_ft_cand", {})    # pid -> (тип-кандидат, тиков подряд)
     ss.setdefault("_deadzone", {})       # pid -> остаток жёсткой мёртвой зоны после пуска
     ss.setdefault("recovering", set())   # квитированные аварии: гасим стейл fsm.state=2
+
+
+def _reset_run_state():
+    """Полный сброс ПОТОКОВОГО состояния прогона (при сборке нового сценария).
+
+    Обнуляется ВСЁ, что накапливается по ходу прогона; сохраняются backend/модели,
+    роль и пользовательские настройки (speed). Это единственный источник истины
+    сброса — добавляя новый per-run ключ в session_state, обнуляй его здесь, иначе
+    он «протечёт» в следующий прогон (стейл-инциденты, заморож. SHAP, счётчики).
+    Player и preproc создаются вызывающей стороной до этого сброса — их не трогаем."""
+    ss = st.session_state
+    ss.fsm = PumpAlarmFSM()
+    ss.history = {}
+    ss.last_tick = {}
+    ss.sim_ts = None
+    ss.selected_pump = None
+    # история событий + тосты
+    ss.events = []
+    ss._event_seq = 0
+    ss.acked = {}
+    ss.toast_expanded = set()
+    # жизненный цикл алармов
+    ss.pinned = {}
+    ss.tripped = set()
+    ss.recovering = set()
+    ss.shap_frozen = {}
+    ss._presc_ft = {}
+    ss._ft_cand = {}
+    ss._deadzone = {}
+    # счётчики/журналы и технические кэши
+    ss.anomaly_suppressed = 0
+    ss.toir_log = {}
+    ss._last_advance = 0.0
+    for k in [k for k in list(ss.keys()) if str(k).startswith("_shaplive_")]:
+        del ss[k]                        # троттлинг-кэш живого SHAP по насосам
+    # фоновые задания генерации предписаний
+    _store = get_gen_store()
+    with _store["lock"]:
+        _store["jobs"].clear()
 
 
 def get_backend():
@@ -346,29 +393,86 @@ def _on_escalation(pump_id, stage):
     ss._presc_ft[(inc.incident_id, stage)] = inc.fault_type
 
 
-def _log_event(inc, stage):
-    """Добавить запись в журнал истории один раз на (incident_id, stage).
-
-    ts фиксируется СЕЙЧАС (на момент возникновения) и больше не меняется — даже
-    если FSM позже сдвинет inc.stage_ts при повторной эскалации. Это и есть
-    устойчивость: каждая авария/предупреждение в истории ровно один раз."""
+def _append_event(incident_id, pump_id, stage, ts):
+    """Добавить ОДНУ строку истории. Каждая строка — отдельное возникновение
+    с уникальным eid (первичное обнаружение ИЛИ ре-наг через 10 мин). ts
+    фиксируется на момент возникновения и не меняется."""
     ss = st.session_state
-    key = (inc.incident_id, stage)
-    if any((e["incident_id"], e["stage"]) == key for e in ss.events):
-        return
+    ss._event_seq = ss.get("_event_seq", 0) + 1
     ss.events.append({
-        "incident_id": inc.incident_id,
-        "pump_id": inc.pump_id,
+        "eid": ss._event_seq,         # уникальный ключ строки (контейнер/CSS)
+        "incident_id": incident_id,
+        "pump_id": pump_id,
         "stage": stage,
-        "ts": inc.stage_ts,            # время возникновения, неизменно
+        "ts": ts,                     # время возникновения, неизменно
         "status": "active",           # active -> acked / resolved (на месте)
         "status_ts": None,
     })
+    _cap_events()
+
+
+def _cap_events():
+    """Держать историю в пределах MAX_EVENTS.
+
+    Отбрасываем самые старые ЗАВЕРШЁННЫЕ записи (квитированные / возвращённые в
+    норму) — они уже не нужны в тосте/на разборе; активные сохраняем. Если
+    активных накопилось больше капа (патология длинного прогона), добиваем
+    самыми старыми по eid. Заодно чистим осиротевшие кэши инцидентов."""
+    ss = st.session_state
+    events = ss.events
+    over = len(events) - MAX_EVENTS
+    if over <= 0:
+        return
+    by_age = sorted(events, key=lambda e: e["eid"])          # старые первыми
+    drop = {e["eid"] for e in by_age
+            if e["status"] in ("acked", "resolved")}         # кандидаты-терминалы
+    # оставить под удаление ровно `over` штук, начиная со старейших терминалов
+    drop = set(sorted(drop)[:over])
+    if len(drop) < over:                                     # терминалов не хватило
+        for e in by_age:
+            if len(drop) >= over:
+                break
+            drop.add(e["eid"])
+    ss.events = [e for e in events if e["eid"] not in drop]
+    _prune_incident_caches()
+
+
+def _prune_incident_caches():
+    """Снять заморож. SHAP и тип-память по инцидентам, которых уже нет ни в
+    истории, ни среди живых (pinned / текущие в FSM) — иначе кэши растут вечно."""
+    ss = st.session_state
+    keep = {e["incident_id"] for e in ss.events}
+    keep |= {inc.incident_id for inc in ss.pinned.values()}
+    for pid in ss.history:
+        cur = ss.fsm.incident(pid)
+        if cur is not None:
+            keep.add(cur.incident_id)
+    for store_name in ("shap_frozen", "_presc_ft"):
+        store = ss.get(store_name, {})
+        for key in [k for k in store if k[0] not in keep]:
+            del store[key]
+
+
+def _log_event(inc, stage):
+    """Первое возникновение (incident_id, stage) — из _on_escalation, один раз.
+
+    Дубль первичного обнаружения исключаем по (incident_id, stage). Повторные
+    возникновения после квитирования (ре-наг) добавляются отдельной строкой
+    напрямую через _append_event — они НЕ блокируются этим guard'ом."""
+    ss = st.session_state
+    if any(e["incident_id"] == inc.incident_id and e["stage"] == stage
+           for e in ss.events):
+        return
+    _append_event(inc.incident_id, inc.pump_id, stage, inc.stage_ts)
 
 
 def _find_event(incident_id, stage):
-    for e in st.session_state.events:
-        if e["incident_id"] == incident_id and e["stage"] == stage:
+    """Последнее (новейшее) АКТИВНОЕ событие для (incident_id, stage).
+
+    Квитируем именно текущее возникновение, а прежние (уже acked) не трогаем."""
+    for e in reversed(st.session_state.events):
+        if (e["incident_id"] == incident_id and e["stage"] == stage
+                and e["status"] == "active"):
             return e
     return None
 
@@ -768,7 +872,7 @@ def render_sidebar(op_page, en_page, nav):
             else:
                 horizon = st.number_input("Горизонт прогона, мин",
                                           min_value=60, max_value=10000,
-                                          value=480, step=60)
+                                          value=2500, step=60)
                 st.caption("Парк из 5 насосов; отказы по типам генерируются "
                            "случайно. Темп/вероятности — в RealtimeConfig.")
                 build_label = "Запустить поток"
@@ -778,7 +882,11 @@ def render_sidebar(op_page, en_page, nav):
                     fc = ss.backend.preproc.feature_cols      # единый контракт признаков
                     if mode == "Датасет (демо)":
                         ss.backend.preproc = OnlinePreprocessor(fc)   # строгий + 60-прогрев
-                        scen = extract_demo_scenario(dataset, fault)
+                        # Путь резолвим от КОРНЯ проекта, а не от CWD Streamlit
+                        # (CWD зависит от того, откуда запущен streamlit run).
+                        ds_path = (dataset if os.path.isabs(dataset)
+                                   else os.path.join(_PROJECT_ROOT, dataset))
+                        scen = extract_demo_scenario(ds_path, fault)
                         ss.player = ScenarioPlayer(scen)
                         done = f"Готово: {len(scen)} мин, {scen['pump_id'].iloc[0]}"
                     else:
@@ -788,19 +896,10 @@ def render_sidebar(op_page, en_page, nav):
                                                    warmup_rows=0)     # холодный старт
                         done = (f"Поток запущен: {len(ss.player)} мин, "
                                 f"{len(ss.player.gen.pump_ids)} насосов")
-                    ss.fsm = PumpAlarmFSM()
-                    ss.history, ss.last_tick = {}, {}
-                    ss.selected_pump, ss.acked = None, {}
+                    _reset_run_state()                # полный сброс накопителей прогона
                     ss.playing = True                 # #8: поток стартует сразу
-                    ss.events = []                    # чистая история нового прогона
-                    ss.pinned, ss.tripped = {}, set()
-                    ss.toast_expanded = set()
-                    ss.recovering = set()
                     ss.validation = ValidationCollector.from_settings()
-                    _store = get_gen_store()
-                    with _store["lock"]:
-                        _store["jobs"].clear()
-                    ss.backend.preproc.reset(None)  # type: ignore
+                    ss.backend.preproc.reset(None)    # буферы препроцессора  # type: ignore
                     for row in ss.player.skip_warmup():    # realtime: пусто (warmup_rows=0)
                         pid = str(row["pump_id"])
                         push_history(pid, row)
@@ -1118,10 +1217,11 @@ def _engineer_live():
 def _render_history():
     """История из устойчивого журнала ss.events.
 
-    Каждое возникновение (incident_id, stage) — РОВНО одна запись (append-once
-    в _log_event). Дубли невозможны по построению, склейка по времени не нужна.
-    Статус записи (active/acked/resolved/escalated) выводится здесь; acked и
-    resolved фиксируются с временем и больше не меняются."""
+    Одна строка = одно ВОЗНИКНОВЕНИЕ с уникальным eid: первичное обнаружение
+    или ре-наг через 10 мин после квитирования (отдельной строкой, прежняя
+    остаётся квитированной). Дублей первичного обнаружения нет (guard в
+    _log_event). Статус (active/acked/resolved/escalated) выводится здесь;
+    acked и resolved фиксируются с временем и больше не меняются."""
     ss = st.session_state
     events = ss.events
     GREY = "#5A5F66"
@@ -1154,8 +1254,8 @@ def _render_history():
             return "resolved"
         return "active"
 
-    rows = sorted(events, key=lambda e: (str(e["ts"]), e["incident_id"], e["stage"]),
-                  reverse=True)
+    # сортировка по времени, затем по eid (новейшее возникновение выше)
+    rows = sorted(events, key=lambda e: (str(e["ts"]), e["eid"]), reverse=True)
 
     rules = []
     for e in rows:
@@ -1163,7 +1263,7 @@ def _render_history():
         col = (ACK_COLOR if kind == "acked"
                else GREY if kind == "resolved"
                else SEV_COLOR.get(int(e["stage"]), GREY))
-        cls = f"hist_{e['incident_id']}_{e['stage']}"
+        cls = f"hist_{e['eid']}"
         rules.append(
             f".st-key-{cls}{{border-left:4px solid {col};border-radius:8px;"
             f"background:{col}14;padding:1px 8px 1px 9px;margin-bottom:7px;}}"
@@ -1192,7 +1292,7 @@ def _render_history():
         else:
             badge = ""
         when = _fmt(e["ts"])
-        with st.container(key=f"hist_{e['incident_id']}_{stage}"):
+        with st.container(key=f"hist_{e['eid']}"):
             with st.expander(f"{when} · {e['pump_id']} · "
                              f"{SEVERITY_LABELS.get(stage, stage)}{badge}"):
                 if text:

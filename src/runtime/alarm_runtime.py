@@ -110,13 +110,17 @@ class PumpAlarmFSM:
     пропустить аварию дороже, чем подержать предупреждение лишнюю минуту.
     """
 
-    def __init__(self, confirm_up: int = 2, confirm_down: int = 5):
+    def __init__(self, confirm_up: int = 2, confirm_down: int = 5,
+                 max_closed: int = 200):
         self.confirm_up = confirm_up
         self.confirm_down = confirm_down
         self._state: Dict[str, int] = {}
         self._pending: Dict[str, tuple] = {}   # pump_id -> (candidate, count)
         self._incidents: Dict[str, Incident] = {}
+        # Закрытые инциденты копятся для истории. Кап (> кап ss.events в UI с
+        # запасом) защищает ядро от роста памяти на длинном live-прогоне.
         self._closed: List[Incident] = []
+        self._max_closed = max_closed
         self._ids = itertools.count(1)
         self.journal = AlarmJournal()
 
@@ -189,6 +193,8 @@ class PumpAlarmFSM:
             inc = self._incidents.pop(pump_id, None)
             if inc is not None:
                 self._closed.append(inc)
+                if len(self._closed) > self._max_closed:
+                    self._closed = self._closed[-self._max_closed:]
             self.journal.add(JournalEvent(ts, pump_id, "reset",
                                           note="возврат в норму"))
             return None
