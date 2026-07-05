@@ -1,26 +1,28 @@
 """
 Регрессионный тест паритета препроцессоров: online == offline
 =============================================================
+
+
 Гарантирует, что вектор признаков FEATURE_COLS, посчитанный ПОТОКОВО (по одной
 строке, как в реальном времени), бит-в-бит совпадает с ОФЛАЙН-расчётом, на
-котором обучены модели. Любое расхождение — это рассинхрон train/inference:
+котором обучены модели. Любое расхождение - это рассинхрон train/inference:
 модель в проде увидела бы не те числа, что в обучении.
 
 Что проверяется:
-  1. `verify_parity`: строгий `OnlinePreprocessor` == offline `DataPreprocessor`
-     (тот же `shift(1)`, `min_periods=w`, `diff_30`, `std` ddof=1) на каждой строке
-     после прогрева — иначе AssertionError с первой расходящейся колонкой.
-  2. Прогрессивный `RealtimeProgressivePreprocessor` (живой режим, признаки с 1-й
+  1. verify_parity: строгий OnlinePreprocessor == offline DataPreprocessor
+     (тот же shift(1), min_periods=w, diff_30, std ddof=1) на каждой строке
+     после прогрева - иначе AssertionError с первой расходящейся колонкой.
+  2. Прогрессивный RealtimeProgressivePreprocessor (живой режим, признаки с 1-й
      строки) == строгий препроцессор на ПОЛНОМ окне (>= WARMUP_ROWS): ускоренный
      прогрев на старте не ломает паритет с обучением.
   3. На частичном окне (во время прогрева) прогрессивный ВЫДАЁТ признаки, а
-     строгий молчит — подтверждение разной политики прогрева (это фича, не баг).
+     строгий молчит - подтверждение разной политики прогрева (это фича, не баг).
 
-Выравнивание индексов (важно): `verify_parity` сопоставляет строки по индексу
-сырого датасета, поэтому offline считаем через `process(is_training=False)` —
+Выравнивание индексов (важно): verify_parity сопоставляет строки по индексу
+сырого датасета, поэтому offline считается через process(is_training=False) -
 этот режим НЕ делает dropna/reset_index и сохраняет исходный индекс.
 
-Скорость: берём первые HEAD_ROWS строк КАЖДОГО насоса (непрерывная ранняя
+Скорость: берутся первые HEAD_ROWS строк КАЖДОГО насоса (непрерывная ранняя
 история → окна корректны), а не весь датасет на 648k строк.
 
 Запуск:
@@ -49,7 +51,7 @@ from experiments.realtime_validation.realtime_preprocessor import (
     RealtimeProgressivePreprocessor)
 
 _RAW = os.path.join(_PROJECT_ROOT, 'data', 'raw', 'industrial_pumps_dataset.csv')
-HEAD_ROWS = 800     # на насос: WARMUP_ROWS(60) прогрева + запас проверочных строк
+HEAD_ROWS = 800 # на насос: WARMUP_ROWS(60) прогрева + запас проверочных строк
 ATOL = 1e-8
 
 _pre = DataPreprocessor(window_sizes=WINDOW_SIZES)
@@ -64,6 +66,7 @@ def _raw_head() -> pd.DataFrame:
     Непрерывная ранняя история → скользящие окна считаются корректно; объём мал
     → тест проходит за секунды. Индекс сбрасывается в чистый RangeIndex, чтобы
     offline и сырой датасет ссылались на одни и те же метки строк."""
+
     if 'raw' not in _cache:
         if not os.path.isfile(_RAW):
             raise FileNotFoundError(
@@ -80,8 +83,9 @@ def _raw_head() -> pd.DataFrame:
 def _offline_features(raw: pd.DataFrame) -> pd.DataFrame:
     """Offline-матрица признаков с СОХРАНЁННЫМ индексом raw.
 
-    is_training=False не делает dropna/reset_index — индекс совпадает с raw,
+    is_training=False не делает dropna/reset_index - индекс совпадает с raw,
     поэтому verify_parity может сопоставить строки по метке."""
+    
     return _pre.process(raw.copy(), is_training=False)
 
 
@@ -106,10 +110,10 @@ def test_progressive_matches_strict_on_full_window():
                  if k in ('vibration', 'temperature', 'current', 'pressure')}
             fs = strict.push(pid, dict(d))
             fp = prog.push(pid, dict(d))
-            if fs is None:                  # строгий ещё прогревается — не сравниваем
+            if fs is None: # строгий ещё прогревается - не сравниваем
                 continue
             assert fp is not None, (
-                f"pump={pid}: строгий выдал признаки, прогрессивный — None.")
+                f"pump={pid}: строгий выдал признаки, прогрессивный - None.")
             diff = np.abs(fs[FEATURE_COLS].to_numpy(dtype=float)
                           - fp[FEATURE_COLS].to_numpy(dtype=float))
             if not np.all(diff <= ATOL):
@@ -118,11 +122,11 @@ def test_progressive_matches_strict_on_full_window():
                     f"pump={pid}: расхождение на полном окне, колонка={bad}, "
                     f"strict={fs[bad].iloc[0]:.10f}, prog={fp[bad].iloc[0]:.10f}")
             checked += 1
-    assert checked > 0, "Нет строк на полном окне — проверка не выполнена."
+    assert checked > 0, "Нет строк на полном окне - проверка не выполнена."
     print(f"[OK] progressive == strict на полном окне: {checked} строк.")
 
 
-# Тест 3: на частичном окне (прогрев) прогрессивный выдаёт признаки, строгий — нет
+# Тест 3: на частичном окне (прогрев) прогрессивный выдаёт признаки, строгий - нет
 def test_progressive_emits_during_warmup():
     raw = _raw_head()
     pid = raw['pump_id'].iloc[0]
@@ -143,7 +147,7 @@ def test_progressive_emits_during_warmup():
     assert emitted_during_warmup > 0, (
         "Прогрессивный препроцессор не выдал признаки в окне прогрева.")
     print(f"[OK] progressive выдал {emitted_during_warmup} строк в прогреве "
-          f"(строгий — 0).")
+          f"(строгий - 0).")
 
 
 if __name__ == "__main__":

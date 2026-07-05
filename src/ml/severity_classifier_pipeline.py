@@ -1,6 +1,8 @@
 """
 Аналитическое ядро предиктивной диагностики (ML Pipeline)
 =========================================================
+src/ml/severity_classifier_pipeline.py
+
 Модуль отвечает за обучение, изоляционное тестирование (Group Split) и 
 сравнение предиктивных моделей (Logistic Regression, Random Forest, XGBoost) 
 для выявления деградации оборудования. Включает программную реализацию 
@@ -8,12 +10,14 @@
 в пусковых и нерабочих режимах насоса.
 
 В рамках модуля обучается первая и основная модель машинного обучения - модель тяжести,
-выявленибщая ненормальный режим работы, т.е. статус "Предупреждение" или "Отказ". 
+выявляющая ненормальный режим работы, т.е. статус "Предупреждение" или "Отказ". 
 Обучается на датасете preprocessed_pumps_dataset.csv.
 """
 
 import pandas as pd
+import numpy as np
 import os
+from typing import cast
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 import xgboost as xgb
@@ -26,7 +30,6 @@ warnings.filterwarnings('ignore')
 import joblib
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(_THIS_DIR))
 for _p in (_THIS_DIR, _PROJECT_ROOT):
@@ -37,7 +40,7 @@ from src.visualisation.ml_visualisation import plot_all
 from src.data.data_preprocessor import DataPreprocessor
 _preprocessor = DataPreprocessor(window_sizes=WINDOW_SIZES)
 FEATURE_COLS = _preprocessor.FEATURE_COLS
-from fault_recall_analysis import analyze_fault_recall
+from src.ml.fault_recall_analysis import analyze_fault_recall
 
 # AlarmManager
 
@@ -47,12 +50,13 @@ class AlarmManager:
 
     Принцип: ML-модель работает только тогда, когда насос физически находится
     в штатном режиме работы. Для состояний Off (0) и Startup (1) прогноз
-    принудительно гасится — любые аномальные показатели в эти периоды
+    принудительно гасится - любые аномальные показатели в эти периоды
     являются нормой (пусковые токи, гидроудар) и не должны порождать сигнал.
 
     Это первый уровень фильтрации в архитектуре платформы (State-based Alarming),
     поверх которого работает ML-слой.
     """
+
     def __init__(self, model):
         self.model = model
 
@@ -63,9 +67,10 @@ class AlarmManager:
             raw_state: Физическое состояние агрегата из State Machine (0–4)
 
         Returns:
-            0 (Норма) — если насос Off или Startup (принудительно)
-            0/1/2 — прогноз ML-модели, если насос в рабочем режиме
+            0 (Норма) - если насос Off или Startup (принудительно)
+            0/1/2 - прогноз ML-модели, если насос в рабочем режиме
         """
+
         if raw_state in [0, 1]:
             return 0  # Alarm Shelving: гасит любой тревожный сигнал
 
@@ -81,20 +86,20 @@ def evaluate_model(name: str, short_name: str, model,
 
     Метрики и их обоснование для задачи предиктивного обслуживания:
 
-    Confusion Matrix — показывает конкретную цену каждого типа ошибки.
+    Confusion Matrix - показывает конкретную цену каждого типа ошибки.
         В нефтегазовой отрасли False Negative (пропущенная авария, ошибка 2 рода) 
         несравнимо дороже False Positive (ложная тревога, ошибка 1 рода), 
         поэтому матрица обязательна.
 
-    F1-Macro — среднее F1 по всем классам без учёта их размера.
-        Предотвращает "утопание" редких классов (Авария — ~0.2% строк)
+    F1-Macro - среднее F1 по всем классам без учёта их размера.
+        Предотвращает "утопание" редких классов (Авария - ~0,4% строк)
         в weighted-среднем, которое доминируется классом Норма.
 
-    Recall класса "Авария" (KPI системы) — доля реальных аварий,
+    Recall класса "Авария" (KPI системы) - доля реальных аварий,
         которую система обнаружила. Это ключевой бизнес-показатель:
         Recall=0.95 означает, что 95 из 100 аварий будут пойманы заблаговременно.
 
-    PR-AUC — площадь под кривой Precision-Recall.
+    PR-AUC - площадь под кривой Precision-Recall.
         При сильном дисбалансе классов ROC-AUC завышается (много TN в знаменателе).
         PR-AUC честно оценивает качество работы на редком классе,
         не "разбавляя" результат тривиальными True Negative.
@@ -111,20 +116,21 @@ def evaluate_model(name: str, short_name: str, model,
     print("\nМатрица ошибок (Confusion Matrix):")
     print(confusion_matrix(y_test, y_pred))
 
-    # Classification Report
+    # Отчет по классификации Classification Report
     target_names = ['0: Норма', '1: Warning', '2: Авария']
-    report = classification_report(y_test, y_pred,
-                                   target_names=target_names, output_dict=True)
+    report = cast(dict, classification_report(y_test, y_pred,
+                                              target_names=target_names,
+                                              output_dict=True))
     print("\nОтчет по классификации (Classification Report):")
     print(classification_report(y_test, y_pred, target_names=target_names))
 
     # PR-AUC
-    y_test_bin = label_binarize(y_test, classes=[0, 1, 2])
+    y_test_bin = cast(np.ndarray, label_binarize(y_test, classes=[0, 1, 2]))
     pr_auc_macro = average_precision_score(y_test_bin, y_proba, average="macro")
-    pr_auc_critical = average_precision_score(y_test_bin[:, 2], y_proba[:, 2]) # type: ignore
+    pr_auc_critical = average_precision_score(y_test_bin[:, 2], y_proba[:, 2])
 
-    # Recall класса "Авария" — явный KPI
-    recall_critical = report['2: Авария']['recall'] # type: ignore
+    # Recall класса "Авария" - явный KPI
+    recall_critical = report['2: Авария']['recall']
 
     print(f"PR-AUC (Macro Average):    {pr_auc_macro:.4f}")
     print(f"PR-AUC (Класс 'Авария'):   {pr_auc_critical:.4f}")
@@ -133,9 +139,9 @@ def evaluate_model(name: str, short_name: str, model,
     return {
         'name': name,
         'label': short_name,                            # имя для графиков
-        'f1_macro': report['macro avg']['f1-score'],    # type: ignore
-        'f1_warning': report['1: Warning']['f1-score'], # type: ignore
-        'f1_critical': report['2: Авария']['f1-score'], # type: ignore
+        'f1_macro': report['macro avg']['f1-score'],
+        'f1_warning': report['1: Warning']['f1-score'],
+        'f1_critical': report['2: Авария']['f1-score'],
         'recall_critical': recall_critical,
         'pr_auc_macro': pr_auc_macro,
         'pr_auc_critical': pr_auc_critical,
@@ -154,7 +160,7 @@ if __name__ == "__main__":
                 os.path.abspath(__file__))))
     processed_data_path = os.path.join(project_root, 'data', 'processed', 
                                        'preprocessed_pumps_dataset.csv')
-    save_graps_dir = os.path.join(project_root, 'artifacts', 'graphs')
+    save_graphs_dir = os.path.join(project_root, 'artifacts', 'graphs')
     save_tables_dir = os.path.join(project_root, 'artifacts', 'tables')
 
     # 1. Загрузка данных
@@ -167,7 +173,7 @@ if __name__ == "__main__":
 
     # 2. Group Split по оборудованию (доказывает обобщение на новый агрегат)
     df_train = df[df['pump_id'].isin(TRAIN_PUMPS)].copy()
-    df_test = df[df['pump_id'].isin(TEST_PUMPS)].copy()
+    df_test = cast(pd.DataFrame, df[df['pump_id'].isin(TEST_PUMPS)].copy())
 
     print(f"Обучающая выборка (насосы 1-4): {len(df_train):,} строк")
     print(f"Тестовая выборка  (насос 5):    {len(df_test):,} строк")
@@ -178,20 +184,20 @@ if __name__ == "__main__":
     if missing:
         raise ValueError(f"В датасете отсутствуют признаки: {missing[:5]}...")
 
-    X_train = df_train[FEATURE_COLS]
+    X_train = cast(pd.DataFrame, df_train[FEATURE_COLS])
     y_train = df_train['target']
-    X_test = df_test[FEATURE_COLS]
+    X_test = cast(pd.DataFrame, df_test[FEATURE_COLS])
     y_test = df_test['target']
 
     print(f"Признаков для ML: {len(FEATURE_COLS)}")
 
-    # 4. Веса классов для компенсации дисбаланса (Critical — редкий класс)
+    # 4. Веса классов для компенсации дисбаланса (Critical - редкий класс)
     sample_weights = compute_sample_weight(class_weight='balanced', y=y_train)
 
     # 5. Обучение моделей
     print("\nОбучение моделей запущено...")
 
-    # Logistic Regression — линейный baseline
+    # Logistic Regression - линейный baseline
     # solver='saga': поддерживает многоклассовую задачу и большие датасеты
     lr_model = LogisticRegression(
         class_weight='balanced', max_iter=500,
@@ -199,7 +205,7 @@ if __name__ == "__main__":
     )
     lr_model.fit(X_train, y_train)
 
-    # Random Forest — ансамбль бэггинга
+    # Random Forest - ансамбль бэггинга
     # n_estimators=300: достаточно для стабилизации дисперсии на 320k строк
     rf_model = RandomForestClassifier(
         n_estimators=300, class_weight='balanced',
@@ -207,7 +213,7 @@ if __name__ == "__main__":
     )
     rf_model.fit(X_train, y_train)
 
-    # XGBoost — ансамбль бустинга с взвешиванием через sample_weight
+    # XGBoost - ансамбль бустинга с взвешиванием через sample_weight
     xgb_model = xgb.XGBClassifier(
         objective='multi:softprob',
         num_class=3,
@@ -228,7 +234,7 @@ if __name__ == "__main__":
     ]
 
     # 7. Три технических графика
-    plot_all(metrics, y_test, save_graps_dir)
+    plot_all(metrics, y_test, save_graphs_dir)
 
     # 8. Демонстрация AlarmManager (Alarm Shelving)
     print(f"\n{'='*50}")
@@ -244,11 +250,11 @@ if __name__ == "__main__":
 
         pred_a = manager.predict_with_context(critical_features, raw_state=2)
         print(f"\nСценарий А: State=2 (штатная работа), признаки аварийные.")
-        print(f"  → AlarmManager: Класс {pred_a} — Авария. Сигнал передан на дашборд.")
+        print(f"  → AlarmManager: Класс {pred_a} - Авария. Сигнал передан на дашборд.")
 
         pred_b = manager.predict_with_context(critical_features, raw_state=1)
         print(f"\nСценарий Б: State=1 (запуск), те же аварийные признаки.")
-        print(f"  → AlarmManager: Класс {pred_b} — Норма. "
+        print(f"  → AlarmManager: Класс {pred_b} - Норма. "
               f"Сигнал подавлен (Alarm Shelving: пусковые токи в норме).")
     else:
         print("В тестовой выборке аварий не найдено.")
@@ -268,5 +274,5 @@ if __name__ == "__main__":
 
     # 10. Анализ recall по типам отказа
     raw_data_path = os.path.join(project_root, 'data', 'raw', 'industrial_pumps_dataset.csv')
-    analyze_fault_recall(xgb_model, df_test, FEATURE_COLS, save_graps_dir,  # type: ignore
+    analyze_fault_recall(xgb_model, df_test, FEATURE_COLS, save_graphs_dir,
                          save_tables_dir, raw_data_path=raw_data_path)

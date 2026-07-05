@@ -1,33 +1,37 @@
 """
-app.py — пользовательский интерфейс платформы предиктивного управления.
+Двухуровневый Streamlit-дашборд (Operator + Engineer UI)
+========================================================
+src/app/app.py
+
+Пользовательский интерфейс платформы предиктивного управления.
 
 ДВА РАЗНЫХ ИНТЕРФЕЙСА (NAMUR NE 129):
-  ОПЕРАТОР — процессная осведомлённость по парку в реальном времени: карта
+  ОПЕРАТОР - процессная осведомлённость по парку в реальном времени: карта
     оборудования (NE 107), drill-down с интерактивными графиками (Plotly, ось
-    времени), предписание агента — потоковый тост справа снизу.
-  ИНЖЕНЕР — событийная диагностика: SHAP обеих моделей, симптомы, трассировка
+    времени), предписание агента - потоковый тост справа снизу.
+  ИНЖЕНЕР - событийная диагностика: SHAP обеих моделей, симптомы, трассировка
     RAG, план/история ТОиР. Список ВСЕХ агрегатов сортируется по тяжести.
 
 АРХИТЕКТУРА РЕАЛЬНОГО ВРЕМЕНИ (важно):
-  • Поток данных НЕ останавливается при обнаружении предупреждения/аварии —
+  - Поток данных НЕ останавливается при обнаружении предупреждения/аварии -
     ползунок и графики продолжают идти. advance_stream нигде не снимает playing
     по факту эскалации и не делает break.
-  • Медленная генерация предписания (RAG+LLM, ~13 с) вынесена в ФОНОВЫЙ ПОТОК
+  - Медленная генерация предписания (RAG+LLM, ~13 с) вынесена в ФОНОВЫЙ ПОТОК
     и пишет в потокобезопасный модульный словарь _GEN. Главный проход её только
-    опрашивает — поэтому UI не «замораживается». Поток трогает RAG/Ollama;
-    главный поток — модели/препроцессор (process_tick, explain). Подсистемы
+    опрашивает - поэтому UI не «замораживается». Поток трогает RAG/Ollama;
+    главный поток - модели/препроцессор (process_tick, explain). Подсистемы
     разные, общих изменяемых объектов нет.
-  • Факт инцидента попадает в историю СРАЗУ при обнаружении (как только посчитан
-    SymptomVector), ещё до завершения генерации. Текст дописывается потом —
+  - Факт инцидента попадает в историю СРАЗУ при обнаружении (как только посчитан
+    SymptomVector), ещё до завершения генерации. Текст дописывается потом -
     целиком, не потокенно. Быстрый переход Предупреждение→Авария не «теряет»
     предупреждение.
-  • Экраны Оператор/Инженер рендерятся в РАЗНЫХ keyed-контейнерах — Streamlit
+  - Экраны Оператор/Инженер рендерятся в РАЗНЫХ keyed-контейнерах - Streamlit
     держит их как независимые поддеревья, наложений при переключении нет.
 
 Запуск:  streamlit run src/app/app.py
 
-ОГРАНИЧЕНИЕ (честно): фоновый поток в Streamlit не может сам перерисовать
-страницу — обновление идёт только когда главный проход делает rerun. Поэтому
+ОГРАНИЧЕНИЕ: фоновый поток в Streamlit не может сам перерисовать
+страницу - обновление идёт только когда главный проход делает rerun. Поэтому
 пока идёт генерация ИЛИ воспроизведение, главный цикл переотрисовывается по
 таймеру (REFRESH). Это и обеспечивает «живой» поток и дорисовку тоста.
 """
@@ -69,24 +73,27 @@ from src.runtime.online_preprocessor import OnlinePreprocessor
 from experiments.realtime_validation.realtime_preprocessor import RealtimeProgressivePreprocessor
 from src.visualisation.realtime_val_visualisation import ValidationCollector, render_all, summarize
 
+# Тюнинг-константы UI/runtime - из единого источника config/settings (алиасы
+# сохраняют короткие локальные имена и существующие использования).
+from config.settings import (ISA_ALARM_RATE_LIMIT,
+                             UI_REFRESH_SEC as REFRESH,
+                             UI_RENAG_MIN as RENAG_MIN,
+                             UI_GEN_TIMEOUT_SEC as GEN_TIMEOUT,
+                             UI_MAX_EVENTS as MAX_EVENTS,
+                             UI_GRAPH_WINDOW_MIN as WINDOW_MIN,
+                             UI_YRANGE as YRANGE,
+                             UI_SEVERITY_COLORS as SEV_COLOR,
+                             UI_ACK_COLOR as ACK_COLOR)
+
 NE107 = {
     "good":        {"color": "#1E8A3C", "icon": "●", "label": "Норма"},
     "out_of_spec": {"color": "#E0A800", "icon": "▲", "label": "Выход за пределы"},
     "maintenance": {"color": "#1565C0", "icon": "⬒", "label": "Требуется ТО"},
     "failure":     {"color": "#C62828", "icon": "✖", "label": "Отказ"},
     "check":       {"color": "#EF6C00", "icon": "◌", "label": "Пуск / простой"},
-    "offline":     {"color": "#5A5F66", "icon": "—", "label": "Нет данных"},
+    "offline":     {"color": "#5A5F66", "icon": "-", "label": "Нет данных"},
 }
 SEV_TO_NE107 = {0: "good", 1: "out_of_spec", 2: "failure"}
-SEV_COLOR = {0: "#1E8A3C", 1: "#E0A800", 2: "#C62828"}   # норма/пред/авария
-ACK_COLOR = "#1E8A3C"                                     # квитировано — зелёный
-WINDOW_MIN = 120
-RENAG_MIN = 10            # повторное оповещение, если стадия держится (sim-минуты)
-REFRESH = 2.0            # период переотрисовки главного прохода (с)
-GEN_TIMEOUT = 90.0       # страховочный таймаут генерации предписания (с)
-MAX_EVENTS = 100         # кап истории: дольше демо не гоняем (защита от роста памяти)
-YRANGE = {"vibration": (0, 12), "temperature": (0, 98),
-          "current": (0, 150), "pressure": (0, 2)}
 
 st.set_page_config(page_title="Платформа предиктивного управления",
                    layout="wide", initial_sidebar_state="collapsed")
@@ -124,11 +131,11 @@ button[kind="primary"], button[data-testid="stBaseButton-primary"] {
 
 /* Резерв высоты графиков: при авто-перерисовке Plotly-iframe на миг схлопывается
    в 0, контент под ним съезжает вверх и браузер обрезает прокрутку («прыжок
-   наверх»). Фиксируем минимальную высоту слота — слот не схлопывается. */
+   наверх»). Фиксируем минимальную высоту слота - слот не схлопывается. */
 [data-testid="stPlotlyChart"], [data-testid="stVegaLiteChart"],
 [data-testid="stArrowVegaLiteChart"] {min-height:200px;}
 
-/* контейнер тостов — фиксирован справа снизу, прозрачный; внутри карточки стопкой */
+/* контейнер тостов - фиксирован справа снизу, прозрачный; внутри карточки стопкой */
 .st-key-presctoast {position:fixed; right:16px; bottom:16px; width:430px;
     max-width:44vw; max-height:82vh; overflow-y:auto; z-index:1000;
     background:transparent; padding:0;}
@@ -143,28 +150,33 @@ button[kind="primary"], button[data-testid="stBaseButton-primary"] {
 .presc-sb  {color:#dfe4e8; font-size:.74rem; white-space:pre-wrap; line-height:1.2;}
 .st-key-presctoast [data-testid="stButton"] button {padding:.12rem .5rem; font-size:.74rem;}
 
-/* история предписаний — компактный шрифт заголовка карточки */
+/* история предписаний - компактный шрифт заголовка карточки */
 [data-testid="stSidebar"] [data-testid="stExpander"] summary p {font-size:.82rem;}
 </style>
 """, unsafe_allow_html=True)
 
 
-# ===================================================================== #
 # ФОНОВАЯ ГЕНЕРАЦИЯ (потокобезопасный модульный словарь; НЕ session_state)
-# ===================================================================== #
+
 @st.cache_resource
 def get_gen_store():
     """ЕДИНОЕ хранилище фоновых заданий, переживающее rerun'ы Streamlit.
     Обычные модульные globals при каждом rerun пересоздаются (скрипт
-    исполняется заново) — из-за этого поток писал в осиротевший словарь,
+    исполняется заново) - из-за этого поток писал в осиротевший словарь,
     и предписание не доходило ни в тост, ни в историю. cache_resource даёт
     единый объект на всё приложение."""
+
     return {"jobs": {}, "lock": threading.Lock()}
 
 
 def _launch_generation(backend, sv, pump_id, stage, force=False):
+    """Запустить фоновый daemon-поток генерации предписания (RAG+LLM, ~13 с).
+
+    Пишет частичный/готовый текст и трассу в потокобезопасный store (get_gen_store).
+    force=True перезаписывает существующее задание (напр. при смене типа отказа)."""
+
     store = get_gen_store()
-    jobs, lock = store["jobs"], store["lock"]          # стабильные объекты
+    jobs, lock = store["jobs"], store["lock"] # стабильные объекты
     key = (pump_id, stage)
     stage_key = STAGE_BY_SEVERITY[stage]
     with lock:
@@ -172,9 +184,12 @@ def _launch_generation(backend, sv, pump_id, stage, force=False):
             return
         job = {"partial": "", "text": None, "trace": None,
                "done": False, "started": time.time()}
-        jobs[key] = job        # при force старое задание перезаписывается → его поток осиротевает
+        jobs[key] = job # при force старое задание перезаписывается 
 
     def _run():
+        """Тело daemon-потока: стримит предписание в job['partial'], по завершении
+        кладёт готовый текст и трассу; ошибки перехватываются в job['text']."""
+
         acc = []
         try:
             for chunk in backend.prescription_stream(sv, stage_key):
@@ -202,9 +217,10 @@ def _launch_generation(backend, sv, pump_id, stage, force=False):
 
 def poll_renags():
     """Ре-наг: после квитирования, если проблема РЕАЛЬНО держится дольше RENAG_MIN
-    (sim-мин) — новое возникновение (оператор видит, что параметры не в норме).
-    Авария — пока агрегат в аварийном останове (tripped). Предупреждение — пока
-    severity ещё >= 1. Вернулся в норму — не ре-нагаем."""
+    (sim-мин) - новое возникновение (оператор видит, что параметры не в норме).
+    Авария - пока агрегат в аварийном останове (tripped). Предупреждение - пока
+    severity ещё >= 1. Вернулся в норму - не ре-нагаем."""
+
     ss = st.session_state
     if not ss.sim_ts:
         return
@@ -215,27 +231,32 @@ def poll_renags():
         if pid is None:
             continue
         # Инцидент ещё ТЕКУЩИЙ для агрегата? Если его сменил новый (tripped/state
-        # относятся к НАСОСУ, а acked — к ИНЦИДЕНТУ), старый квитированный инцидент
-        # больше не «держится» — он закрыт и остаётся квитированным навсегда.
+        # относятся к НАСОСУ, а acked - к ИНЦИДЕНТУ), старый квитированный инцидент
+        # больше не «держится» - он закрыт и остаётся квитированным навсегда.
         # Без этой проверки новая авария на том же насосе ошибочно «ре-нагала» бы
         # старую квитированную (и та уходила в «возвращено в норму»).
         cur = ss.fsm.incident(pid) or ss.pinned.get(pid)
         if cur is None or cur.incident_id != incident_id:
             continue
         if stage == 2:
-            still = pid in ss.tripped                 # авария: ещё в останове
+            still = pid in ss.tripped # авария: ещё в останове
         else:
-            still = ss.fsm.state(pid) >= 1            # предупреждение: ещё не в норме
+            still = ss.fsm.state(pid) >= 1 # предупреждение: ещё не в норме
         if not still:
             continue
         if minutes_since(ack_ts, ss.sim_ts) >= RENAG_MIN:
-            ss.acked.pop(key, None)                  # тост снова покажется
+            ss.acked.pop(key, None) # тост снова покажется
             # НОВОЕ возникновение → отдельная строка истории с текущим временем.
             # Прежняя строка остаётся квитированной (завершённое событие).
-            # Предписание берётся то же — текст лежит в inc.prescriptions[stage].
+            # Предписание берётся то же - текст лежит в inc.prescriptions[stage].
             _append_event(incident_id, pid, stage, ss.sim_ts)
 
+
 def poll_generations():
+    """Опросить фоновые задания: завершённые (или по таймауту) вписать текстом и
+    трассой в Incident.prescriptions/retrieval_traces и убрать из store.
+    Вызывается из главного прохода на каждый тик перерисовки."""
+
     ss = st.session_state
     store = get_gen_store()
     jobs, lock = store["jobs"], store["lock"]
@@ -259,21 +280,20 @@ def poll_generations():
             jobs.pop(key, None)
 
 
-def has_pending():
-    store = get_gen_store()
-    with store["lock"]:
-        return len(store["jobs"]) > 0
-
-
 def gen_partial(key):
+    """Частично сгенерированный текст предписания по (pump_id, stage) - для тоста
+    «формируется…» по мере накопления; None, если задания нет."""
+
     store = get_gen_store()
     with store["lock"]:
         job = store["jobs"].get(key)
         return job["partial"] if job else None
 
 
-# ===================================================================== #
 def init_state():
+    """Инициализировать все ключи st.session_state значениями по умолчанию
+    (идемпотентно через setdefault) - вызывается в начале каждого прохода main()."""
+
     ss = st.session_state
     ss.setdefault("backend", None)
     ss.setdefault("backend_kind", None)
@@ -284,26 +304,25 @@ def init_state():
     ss.setdefault("history", {})
     ss.setdefault("last_tick", {})
     ss.setdefault("sim_ts", None)
-    ss.setdefault("role", "Оператор")
     ss.setdefault("selected_pump", None)
     ss.setdefault("toast_expanded", set())
-    ss.setdefault("toir_log", {})       # журнал выполненных работ по насосам
-    ss.setdefault("acked", {})               # (incident_id, stage) -> sim_ts квитирования
-    # Журнал событий истории — ЕДИНСТВЕННЫЙ источник левой панели «История».
+    ss.setdefault("toir_log", {})           # журнал выполненных работ по насосам
+    ss.setdefault("acked", {})              # (incident_id, stage) -> sim_ts квитирования
+    # Журнал событий истории - ЕДИНСТВЕННЫЙ источник левой панели «История».
     # Append-only, по одной записи на возникновение (incident_id, stage); статус
     # меняется на месте. Не зависит от мутаций stage_ts инцидента в FSM, поэтому
     # не нужна склейка «близнецов» по временному окну (была хрупкой).
-    ss.setdefault("events", [])         # список dict: см. _log_event()
-    ss.setdefault("_event_seq", 0)      # монотонный id строки истории (eid)
+    ss.setdefault("events", [])             # список dict: см. _log_event()
+    ss.setdefault("_event_seq", 0)          # монотонный id строки истории (eid)
     ss.setdefault("validation", None)
-    ss.setdefault("tripped", set())     # насосы в аварийном останове до квитирования
-    ss.setdefault("pinned", {})         # закреплённые инциденты: живут до квитирования
-    ss.setdefault("shap_frozen", {})    # SHAP-фигуры, замороженные на момент эскалации
-    ss.setdefault("anomaly_suppressed", 0)   # сглаженные аномалии (для «Подавлено»)
-    ss.setdefault("_presc_ft", {})   # (incident_id, stage) -> тип, под который собрано предписание
-    ss.setdefault("_ft_cand", {})    # pid -> (тип-кандидат, тиков подряд)
-    ss.setdefault("_deadzone", {})       # pid -> остаток жёсткой мёртвой зоны после пуска
-    ss.setdefault("recovering", set())   # квитированные аварии: гасим стейл fsm.state=2
+    ss.setdefault("tripped", set())         # насосы в аварийном останове до квитирования
+    ss.setdefault("pinned", {})             # закреплённые инциденты: живут до квитирования
+    ss.setdefault("shap_frozen", {})        # SHAP-фигуры, замороженные на момент эскалации
+    ss.setdefault("anomaly_suppressed", 0)  # сглаженные аномалии (для «Подавлено»)
+    ss.setdefault("_presc_ft", {})          # (incident_id, stage) -> тип, под который собрано предписание
+    ss.setdefault("_ft_cand", {})           # pid -> (тип-кандидат, тиков подряд)
+    ss.setdefault("_deadzone", {})          # pid -> остаток жёсткой мёртвой зоны после пуска
+    ss.setdefault("recovering", set())      # квитированные аварии: гасится стейл fsm.state=2
 
 
 def _reset_run_state():
@@ -311,9 +330,10 @@ def _reset_run_state():
 
     Обнуляется ВСЁ, что накапливается по ходу прогона; сохраняются backend/модели,
     роль и пользовательские настройки (speed). Это единственный источник истины
-    сброса — добавляя новый per-run ключ в session_state, обнуляй его здесь, иначе
+    сброса - добавляя новый per-run ключ в session_state, обнуляй его здесь, иначе
     он «протечёт» в следующий прогон (стейл-инциденты, заморож. SHAP, счётчики).
-    Player и preproc создаются вызывающей стороной до этого сброса — их не трогаем."""
+    Player и preproc создаются вызывающей стороной до этого сброса - их не трогаем."""
+
     ss = st.session_state
     ss.fsm = PumpAlarmFSM()
     ss.history = {}
@@ -338,7 +358,7 @@ def _reset_run_state():
     ss.toir_log = {}
     ss._last_advance = 0.0
     for k in [k for k in list(ss.keys()) if str(k).startswith("_shaplive_")]:
-        del ss[k]                        # троттлинг-кэш живого SHAP по насосам
+        del ss[k] # троттлинг-кэш живого SHAP по насосам
     # фоновые задания генерации предписаний
     _store = get_gen_store()
     with _store["lock"]:
@@ -346,6 +366,10 @@ def _reset_run_state():
 
 
 def get_backend():
+    """Вернуть backend (кешируется в session_state). Пытается поднять боевой
+    PlatformBackend; при любой ошибке (нет Ollama/ChromaDB/моделей) откатывается
+    на ProtoBackend - UI работает в демо-режиме."""
+
     ss = st.session_state
     if ss.backend is None:
         try:
@@ -358,6 +382,9 @@ def get_backend():
 
 
 def push_history(pump_id, row, keep=600):
+    """Дописать строку телеметрии в кольцевую историю насоса (для графиков);
+    хранится не более keep последних точек на агрегат."""
+
     h = st.session_state.history.setdefault(pump_id, [])
     h.append({k: row.get(k) for k in
               ("timestamp", "vibration", "temperature", "current",
@@ -367,9 +394,10 @@ def push_history(pump_id, row, keep=600):
 
 
 def _on_escalation(pump_id, stage):
-    """Обнаружена эскалация. СРАЗУ: считаем SymptomVector (быстро, главный поток),
-    помечаем инцидент как обнаруженный (→ он мгновенно появляется в истории и в
-    тосте) и запускаем фоновую генерацию текста. Поток данных НЕ останавливаем."""
+    """Обнаружена эскалация. СРАЗУ: считается SymptomVector (быстро, главный поток),
+    инцидент помечается как обнаруженный (→ мгновенно появляется в истории и в
+    тосте), запускается фоновая генерация текста. Поток данных НЕ останавливается."""
+
     ss = st.session_state
     inc = ss.fsm.incident(pump_id)
     if inc is None or stage in inc.symptom_vectors:
@@ -380,7 +408,7 @@ def _on_escalation(pump_id, stage):
         inc.symptom_vectors[stage] = None
         inc.prescriptions[stage] = f"[ошибка анализа: {type(e).__name__}: {e}]"
         return
-    inc.symptom_vectors[stage] = sv          # факт инцидента зафиксирован сейчас
+    inc.symptom_vectors[stage] = sv # факт инцидента зафиксирован сейчас
     try:
         ss.shap_frozen[(inc.incident_id, stage)] = ss.backend.shap_figures(pump_id)
     except Exception:
@@ -389,23 +417,24 @@ def _on_escalation(pump_id, stage):
     # (`stage in inc.symptom_vectors`) гарантирует ровно один заход → дублей нет.
     _log_event(inc, stage)
     _launch_generation(ss.backend, sv, pump_id, stage)
-    ss.pinned[pump_id] = inc            # держим ссылку — переживёт закрытие в FSM
+    ss.pinned[pump_id] = inc # ссылка удерживается - переживёт закрытие в FSM
     ss._presc_ft[(inc.incident_id, stage)] = inc.fault_type
 
 
 def _append_event(incident_id, pump_id, stage, ts):
-    """Добавить ОДНУ строку истории. Каждая строка — отдельное возникновение
+    """Добавить ОДНУ строку истории. Каждая строка - отдельное возникновение
     с уникальным eid (первичное обнаружение ИЛИ ре-наг через 10 мин). ts
     фиксируется на момент возникновения и не меняется."""
+
     ss = st.session_state
     ss._event_seq = ss.get("_event_seq", 0) + 1
     ss.events.append({
-        "eid": ss._event_seq,         # уникальный ключ строки (контейнер/CSS)
+        "eid": ss._event_seq, # уникальный ключ строки (контейнер/CSS)
         "incident_id": incident_id,
         "pump_id": pump_id,
         "stage": stage,
-        "ts": ts,                     # время возникновения, неизменно
-        "status": "active",           # active -> acked / resolved (на месте)
+        "ts": ts, # время возникновения, неизменно
+        "status": "active", # active -> acked / resolved (на месте)
         "status_ts": None,
     })
     _cap_events()
@@ -415,20 +444,21 @@ def _cap_events():
     """Держать историю в пределах MAX_EVENTS.
 
     Отбрасываем самые старые ЗАВЕРШЁННЫЕ записи (квитированные / возвращённые в
-    норму) — они уже не нужны в тосте/на разборе; активные сохраняем. Если
+    норму) - они уже не нужны в тосте/на разборе; активные сохраняем. Если
     активных накопилось больше капа (патология длинного прогона), добиваем
     самыми старыми по eid. Заодно чистим осиротевшие кэши инцидентов."""
+
     ss = st.session_state
     events = ss.events
     over = len(events) - MAX_EVENTS
     if over <= 0:
         return
-    by_age = sorted(events, key=lambda e: e["eid"])          # старые первыми
+    by_age = sorted(events, key=lambda e: e["eid"]) 
     drop = {e["eid"] for e in by_age
-            if e["status"] in ("acked", "resolved")}         # кандидаты-терминалы
-    # оставить под удаление ровно `over` штук, начиная со старейших терминалов
+            if e["status"] in ("acked", "resolved")} 
+    # оставить под удаление ровно over штук, начиная со старейших терминалов
     drop = set(sorted(drop)[:over])
-    if len(drop) < over:                                     # терминалов не хватило
+    if len(drop) < over:
         for e in by_age:
             if len(drop) >= over:
                 break
@@ -439,7 +469,8 @@ def _cap_events():
 
 def _prune_incident_caches():
     """Снять заморож. SHAP и тип-память по инцидентам, которых уже нет ни в
-    истории, ни среди живых (pinned / текущие в FSM) — иначе кэши растут вечно."""
+    истории, ни среди живых (pinned / текущие в FSM) - иначе кэши растут вечно."""
+
     ss = st.session_state
     keep = {e["incident_id"] for e in ss.events}
     keep |= {inc.incident_id for inc in ss.pinned.values()}
@@ -454,11 +485,12 @@ def _prune_incident_caches():
 
 
 def _log_event(inc, stage):
-    """Первое возникновение (incident_id, stage) — из _on_escalation, один раз.
+    """Первое возникновение (incident_id, stage) - из _on_escalation, один раз.
 
     Дубль первичного обнаружения исключаем по (incident_id, stage). Повторные
     возникновения после квитирования (ре-наг) добавляются отдельной строкой
-    напрямую через _append_event — они НЕ блокируются этим guard'ом."""
+    напрямую через _append_event - они НЕ блокируются этим guard'ом."""
+
     ss = st.session_state
     if any(e["incident_id"] == inc.incident_id and e["stage"] == stage
            for e in ss.events):
@@ -470,6 +502,7 @@ def _find_event(incident_id, stage):
     """Последнее (новейшее) АКТИВНОЕ событие для (incident_id, stage).
 
     Квитируем именно текущее возникновение, а прежние (уже acked) не трогаем."""
+
     for e in reversed(st.session_state.events):
         if (e["incident_id"] == incident_id and e["stage"] == stage
                 and e["status"] == "active"):
@@ -479,8 +512,9 @@ def _find_event(incident_id, stage):
 
 def _refine_warning_type(pump_id, warming):
     """Тип отказа на ранней (слабой) сигнатуре часто неверен (склонен к «электрике»).
-    По мере развития дефекта классификатор уточняет тип; если он устойчиво сменился —
+    По мере развития дефекта классификатор уточняет тип; если он устойчиво сменился -
     пересобираем диагностику и текст предписания предупреждения под верный тип."""
+
     ss = st.session_state
     if warming:
         return
@@ -498,17 +532,17 @@ def _refine_warning_type(pump_id, warming):
     cand, cnt = ss._ft_cand.get(pump_id, (None, 0))
     cnt = cnt + 1 if cand == live_ft else 1
     ss._ft_cand[pump_id] = (live_ft, cnt)
-    if cnt < 6:                          # дебаунс: тип держится ~6 мин подряд
+    if cnt < 6: # дебаунс: тип держится ~6 мин подряд
         return
     ss._ft_cand.pop(pump_id, None)
     try:
-        sv = ss.backend.explain(pump_id, ss.sim_ts, 1)   # пересчёт на ТЕКУЩЕМ окне
+        sv = ss.backend.explain(pump_id, ss.sim_ts, 1) # пересчёт на ТЕКУЩЕМ окне
     except Exception:
         return
     inc.fault_type = live_ft
     ss._presc_ft[(inc.incident_id, 1)] = live_ft
     inc.symptom_vectors[1] = sv
-    inc.prescriptions.pop(1, None)       # текст перегенерируется в фоне
+    inc.prescriptions.pop(1, None) # текст перегенерируется на фоне
     inc.retrieval_traces.pop(1, None)
     try:
         ss.shap_frozen[(inc.incident_id, 1)] = ss.backend.shap_figures(pump_id)
@@ -518,8 +552,9 @@ def _refine_warning_type(pump_id, warming):
 
 
 def advance_stream(n_rows):
-    """Прогон n строк потока. На эскалации НЕ останавливаемся и НЕ прерываемся —
+    """Прогон n строк потока. На эскалации поток НЕ останавливается и НЕ прерывается -
     ползунок и графики продолжают идти; предписание формируется в фоне."""
+
     ss = st.session_state
     backend, fsm, player = ss.backend, ss.fsm, ss.player
     if player is None or player.finished:
@@ -532,7 +567,7 @@ def advance_stream(n_rows):
         tick = backend.process_tick(pump_id, row)
         ss.last_tick[pump_id] = tick
         # Пуск/простой (OFF=0, STARTUP=1) + мёртвая зона: обнуляем окно, пока
-        # пусковой ток не вернулся под порог, затем ещё короткий хвост — так весь
+        # пусковой ток не вернулся под порог, затем ещё короткий хвост - так весь
         # переходник (любой длины) вырезан из скоринга, а не только первые 5 строк.
         try:
             stt = int(float(row["state"]))
@@ -568,7 +603,7 @@ def advance_stream(n_rows):
             ss.anomaly_suppressed = ss.get("anomaly_suppressed", 0) + 1
         # дедуп аварии НЕЗАВИСИМО от ss.tripped: пока по агрегату жив неквитированный
         # аварийный инцидент (закреплён в ss.pinned, стадия 2) ИЛИ идёт останов/
-        # восстановление — повтор аварии НЕ заводим (это дрожание типа / повторный
+        # восстановление - повтор аварии НЕ заводим (это дрожание типа / повторный
         # трип того же события, а не новый инцидент).
         _pin = ss.pinned.get(pump_id)
         _alarm_live = _pin is not None and 2 in _pin.symptom_vectors
@@ -578,9 +613,9 @@ def advance_stream(n_rows):
                                         or _alarm_live)):
             _on_escalation(pump_id, trigger.stage)
             if trigger.stage == 2:
-                ss.tripped.add(pump_id)        # держит «Отказ» и ГЛУШИТ повторный трип
+                ss.tripped.add(pump_id) # держит «Отказ» и ГЛУШИТ повторный трип
                 if hasattr(player, "trip"):
-                    player.trip(pump_id)        # теперь ОТЛОЖЕННЫЙ останов (см. плеер)
+                    player.trip(pump_id) # теперь ОТЛОЖЕННЫЙ останов (см. плеер)
         # восстановление завершено, когда FSM реально вернулась в норму
         if pump_id in ss.recovering and fsm.state(pump_id) == 0:
             ss.recovering.discard(pump_id)
@@ -590,6 +625,8 @@ def advance_stream(n_rows):
 
 
 def minutes_since(ts_from, ts_to):
+    """Целое число sim-минут между двумя метками времени (0 при ошибке парсинга)."""
+
     try:
         d = pd.Timestamp(ts_to) - pd.Timestamp(ts_from)
         return max(0, int(d.total_seconds() // 60))
@@ -598,8 +635,11 @@ def minutes_since(ts_from, ts_to):
 
 
 def status_key_for(pump_id):
+    """Ключ статуса NAMUR NE 107 для плитки агрегата (good/out_of_spec/failure/
+    check/offline) с учётом аварийного останова, прогрева и восстановления."""
+
     ss = st.session_state
-    if pump_id in ss.tripped:            # авария: останов держит «Отказ» до квитирования
+    if pump_id in ss.tripped: # авария: останов держит «Отказ» до квитирования
         return "failure"
     tick = ss.last_tick.get(pump_id)
     if tick is None:
@@ -609,7 +649,7 @@ def status_key_for(pump_id):
         return "check"
     if not tick.ready:
         return "offline"
-    if pump_id in ss.recovering:         # квитировано: не показываем стейл-«Отказ»
+    if pump_id in ss.recovering: # квитировано: не показывает устаревший Отказ
         return "check"
     return SEV_TO_NE107[ss.fsm.state(pump_id)]
 
@@ -620,6 +660,9 @@ _SECTION_RE = re.compile(
 
 
 def split_sections(text):
+    """Разбить текст предписания на пары (заголовок раздела, тело) по _SECTION_RE
+    (СТАТУС/ДИАГНОЗ/ПРЕДПИСАНИЕ/…). Для рендера карточки тоста и истории."""
+
     if not text:
         return []
     idxs = [(m.start(), m.group(1)) for m in _SECTION_RE.finditer(text)]
@@ -637,6 +680,9 @@ def split_sections(text):
 
 
 def sections_html(text):
+    """Отрендерить предписание в HTML-разметку карточки (заголовки разделов +
+    экранированные тела). Заголовок __header__ пропускается."""
+
     parts = []
     for h, b in split_sections(text):
         if h == "__header__":
@@ -652,6 +698,10 @@ def sections_html(text):
 
 # Интерактивные графики оператора (Plotly: ось времени + ховер со значением)
 def _plotly_axis(xvals, series, thr, label, unit, time_axis, yrange=None):
+    """Построить Plotly-график одного параметра: линия + пунктиры порогов
+    warning/critical, ось реального времени (окно WINDOW_MIN) или «мин потока»,
+    фиксированный yrange. Возвращает go.Figure."""
+
     n = len(series)
     if yrange is not None:
         lo, hi = yrange
@@ -669,16 +719,16 @@ def _plotly_axis(xvals, series, thr, label, unit, time_axis, yrange=None):
         tv = thr[key]
         if lo <= tv <= hi:
             fig.add_hline(y=tv, line=dict(color=col, width=1, dash="dash"))
-    xaxis = dict(gridcolor="#23282e")
+    xaxis: dict = dict(gridcolor="#23282e")
     if time_axis:
         x_end = pd.Timestamp(xvals.iloc[-1] if hasattr(xvals, "iloc") else list(xvals)[-1])
         x_start = x_end - pd.Timedelta(minutes=WINDOW_MIN)
         xaxis.update(type="date", tickformat="%d.%m %H:%M",
-                     range=[x_start, x_end],        # окно фикс-ширины; линия едет влево    # type: ignore
-                     title=dict(text="Дата · время", font=dict(size=10)))  # type: ignore
+                     range=[x_start, x_end], # окно фикс-ширины, линия едет влево
+                     title=dict(text="Дата · время", font=dict(size=10)))
     else:
-        xaxis.update(range=[0, max(1, n - 1)],                      # type: ignore
-                     title=dict(text="мин потока", font=dict(size=10))) # type: ignore
+        xaxis.update(range=[0, max(1, n - 1)],
+                     title=dict(text="мин потока", font=dict(size=10)))
     fig.update_layout(template="plotly_dark", height=196,
                       margin=dict(l=46, r=10, t=6, b=30), showlegend=False,
                       paper_bgcolor="#0e1318", plot_bgcolor="#0e1318",
@@ -690,6 +740,8 @@ def _plotly_axis(xvals, series, thr, label, unit, time_axis, yrange=None):
 
 
 def value_badge(pump_id, param):
+    """HTML-бейдж с текущим значением параметра и его порогами (над графиком)."""
+
     h = st.session_state.history.get(pump_id, [])
     if not h:
         return ""
@@ -701,12 +753,15 @@ def value_badge(pump_id, param):
 
 
 def render_pump_graphs(pump_id, params):
+    """Сетка 2×N интерактивных графиков параметров агрегата (drill-down оператора);
+    fallback на st.line_chart, если Plotly недоступен."""
+
     h = st.session_state.history.get(pump_id, [])
     if len(h) < 2:
         st.info("Поток данных ещё не запущен.")
         return
     df = pd.DataFrame(h).tail(WINDOW_MIN)
-    # ось X — в единицах текущего (модельного) времени, если timestamp парсится
+    # ось X - в единицах текущего (модельного) времени, если timestamp парсится
     try:
         xvals = pd.to_datetime(df["timestamp"])
         time_axis = bool(xvals.notna().all())
@@ -731,10 +786,11 @@ def render_pump_graphs(pump_id, params):
 
 def render_active_prescription():
     """ОПЕРАТОРСКИЙ элемент (только внутри view_operator). Одна карточка НА КАЖДЫЙ
-    насос с активным инцидентом; в пределах насоса показывается СТАРШАЯ стадия —
+    насос с активным инцидентом; в пределах насоса показывается СТАРШАЯ стадия -
     авария вытесняет предупреждение. Карточки стопкой друг над другом в фикс-
     контейнере справа снизу: для разных насосов не перекрываются. В историю
     предписание попадает отдельно, поэтому вытеснённое предупреждение не теряется."""
+
     ss = st.session_state
     fsm = ss.fsm
 
@@ -743,17 +799,17 @@ def render_active_prescription():
     for pid in ss.history:
         inc = fsm.incident(pid)
         if inc is None and pid in ss.tripped:
-            inc = ss.pinned.get(pid)          # авария: показываем после закрытия в FSM
+            inc = ss.pinned.get(pid) # авария: показывается после закрытия в FSM
         if not (inc and inc.symptom_vectors):
             continue
         stage = max(inc.symptom_vectors.keys())
-        if (inc.incident_id, stage) in ss.acked:     # квитировано; ре-наг — в poll_renags
+        if (inc.incident_id, stage) in ss.acked: # квитировано, ре-наг - в poll_renags
             continue
         cards.append((inc, stage))
     if not cards:
         return
 
-    # порядок в стопке: сначала более тяжёлые, внутри тяжести — более свежие
+    # порядок в стопке: сначала более тяжёлые, внутри тяжести - более свежие
     cards.sort(key=lambda e: (e[1], e[0].incident_id), reverse=True)
 
     # динамическая подсветка рамки карточек по тяжести (жёлтый/красный)
@@ -767,39 +823,46 @@ def render_active_prescription():
             _render_toast_card(inc, stage)
 
 
-def _acknowledge_incident(inc, stage, text):
+def _acknowledge_incident(inc, stage):
+    """Квитировать инцидент оператором: снять «Отказ»/закрепление, отметить строку
+    истории как acked, дать генератору обратную связь (предупреждение - 50% шанс
+    восстановления, авария - останов и рестарт) и записать работу в журнал ТОиР."""
+
     ss = st.session_state
     ss.fsm.acknowledge(inc.pump_id, ss.sim_ts or "")
-    ss.pinned.pop(inc.pump_id, None)     # снимаем закрепление
+    ss.pinned.pop(inc.pump_id, None) # снимает закрепление
     ack_ts = ss.sim_ts or inc.stage_ts
-    ss.acked[(inc.incident_id, stage)] = ack_ts       # время (тост-гейтинг)
-    ev = _find_event(inc.incident_id, stage)          # помечаем ТУ ЖЕ запись истории
+    ss.acked[(inc.incident_id, stage)] = ack_ts # время (тост-гейтинг)
+    ev = _find_event(inc.incident_id, stage) # помечается та же запись истории
     if ev is not None:
         ev["status"] = "acked"
         ev["status_ts"] = ack_ts
     if hasattr(ss.player, "acknowledge"):
-        ss.player.acknowledge(inc.pump_id)        # предупреждение: 50%; авария: рестарт
+        ss.player.acknowledge(inc.pump_id) # предупреждение: 50%; авария: рестарт
     if stage == 2:
-        ss.tripped.discard(inc.pump_id)      # снимаем «Отказ», генератор перезапустит
-        ss.recovering.add(inc.pump_id)       # fsm.state=2 ещё ~4 тика стейл — гасим «Отказ»
+        ss.tripped.discard(inc.pump_id) # снимает «Отказ», генератор перезапустит
+        ss.recovering.add(inc.pump_id) # fsm.state=2 ещё ~4 тика стейл - гасится «Отказ»
         when = pd.Timestamp(ss.sim_ts or inc.stage_ts).strftime("%Y-%m-%d %H:%M")
         ss.toir_log.setdefault(inc.pump_id, []).insert(
             0, {"Дата": when,
                 "Работа": "Проведены внеплановые работы по ликвидации аварии",
                 "Тип": inc.fault_label, "Статус": "выполнено"})
-        ss._ft_cand.pop(inc.pump_id, None)   # снимаем «временную память» уточнителя типа
+        ss._ft_cand.pop(inc.pump_id, None) # снимает «временную память» уточнителя типа
             
 
 def _render_toast_card(inc, stage):
+    """Одна карточка-тост предписания: свёрнутый бейдж или развёрнутый текст с
+    кнопками «Квитировать»/«Свернуть»; пока текст не готов - частичный стрим."""
+
     ss = st.session_state
     pid = inc.pump_id
     stage_label = SEVERITY_LABELS.get(stage, stage)
     ready_text = inc.prescriptions.get(stage)
-    expanded = (pid in ss.toast_expanded) or (pid in ss.tripped)   # авария — всегда развёрнута
+    expanded = (pid in ss.toast_expanded) or (pid in ss.tripped) # авария - всегда развёрнута
 
     with st.container(key=f"toastcard_{pid}_{stage}"):
         if not expanded:
-            status = "✓ готово — развернуть" if ready_text else "⏳ формируется…"
+            status = "✓ готово - развернуть" if ready_text else "⏳ формируется…"
             c = st.columns([5, 2])
             c[0].markdown(
                 f"<div class='presc-head'>📋 {pid} · {stage_label} · {inc.fault_label}"
@@ -818,7 +881,7 @@ def _render_toast_card(inc, stage):
             st.markdown(sections_html(ready_text), unsafe_allow_html=True)
             c = st.columns([3, 2])
             if c[0].button("Квитировать", key=f"toast_ack_{pid}_{stage}", type="primary"):
-                _acknowledge_incident(inc, stage, ready_text)
+                _acknowledge_incident(inc, stage)
                 ss.toast_expanded.discard(pid)
                 st.rerun(scope="fragment")
             if c[1].button("Свернуть", key=f"toast_col_{pid}_{stage}"):
@@ -832,13 +895,10 @@ def _render_toast_card(inc, stage):
 
 
 # Сайдбар = левый «язычок»: история (с подсветкой) + сценарий-валидация
-def _hist_color(stage, acked):
-    if acked:
-        return ACK_COLOR
-    return SEV_COLOR.get(int(stage), "#5A5F66")
-
-
 def render_sidebar(op_page, en_page, nav):
+    """Левый сайдбар: переключатель Оператор/Инженер, история предписаний,
+    панель источника данных и воспроизведения (▶/⏸/⏭, скорость)."""
+
     ss = st.session_state
     with st.sidebar:
         is_op = (nav.url_path != "engineer")
@@ -853,7 +913,7 @@ def render_sidebar(op_page, en_page, nav):
         st.markdown("</div>", unsafe_allow_html=True)
         st.divider()
         st.markdown("### История предписаний")
-        _render_history()        # авто-обновление каждые REFRESH
+        _render_history() # авто-обновление каждые REFRESH
 
         st.divider()
         with st.expander("Сценарий и воспроизведение (валидация)",
@@ -874,15 +934,15 @@ def render_sidebar(op_page, en_page, nav):
                                           min_value=60, max_value=10000,
                                           value=2500, step=60)
                 st.caption("Парк из 5 насосов; отказы по типам генерируются "
-                           "случайно. Темп/вероятности — в RealtimeConfig.")
+                           "случайно. Темп/вероятности - в RealtimeConfig.")
                 build_label = "Запустить поток"
 
             if st.button(build_label, use_container_width=True):
                 try:
-                    fc = ss.backend.preproc.feature_cols      # единый контракт признаков
+                    fc = ss.backend.preproc.feature_cols # единый контракт признаков
                     if mode == "Датасет (демо)":
-                        ss.backend.preproc = OnlinePreprocessor(fc)   # строгий + 60-прогрев
-                        # Путь резолвим от КОРНЯ проекта, а не от CWD Streamlit
+                        ss.backend.preproc = OnlinePreprocessor(fc) # строгий + 60-прогрев
+                        # Путь разрешается от КОРНЯ проекта, а не от CWD Streamlit
                         # (CWD зависит от того, откуда запущен streamlit run).
                         ds_path = (dataset if os.path.isabs(dataset)
                                    else os.path.join(_PROJECT_ROOT, dataset))
@@ -890,17 +950,17 @@ def render_sidebar(op_page, en_page, nav):
                         ss.player = ScenarioPlayer(scen)
                         done = f"Готово: {len(scen)} мин, {scen['pump_id'].iloc[0]}"
                     else:
-                        ss.backend.preproc = RealtimeProgressivePreprocessor(fc)  # с 0-й мин
+                        ss.backend.preproc = RealtimeProgressivePreprocessor(fc) # с 0-й мин
                         ss.player = RealtimePlayer(LiveMultiPumpGenerator(),
                                                    horizon_minutes=int(horizon),
-                                                   warmup_rows=0)     # холодный старт
+                                                   warmup_rows=0) # холодный старт
                         done = (f"Поток запущен: {len(ss.player)} мин, "
                                 f"{len(ss.player.gen.pump_ids)} насосов")
-                    _reset_run_state()                # полный сброс накопителей прогона
-                    ss.playing = True                 # #8: поток стартует сразу
+                    _reset_run_state() # полный сброс накопителей прогона
+                    ss.playing = True # поток запускается сразу
                     ss.validation = ValidationCollector.from_settings()
-                    ss.backend.preproc.reset(None)    # буферы препроцессора  # type: ignore
-                    for row in ss.player.skip_warmup():    # realtime: пусто (warmup_rows=0)
+                    ss.backend.preproc.reset(None) # буферы препроцессора (сброс всех)
+                    for row in ss.player.skip_warmup(): # realtime: пусто (warmup_rows=0)
                         pid = str(row["pump_id"])
                         push_history(pid, row)
                         ss.last_tick[pid] = ss.backend.process_tick(pid, row)
@@ -911,17 +971,13 @@ def render_sidebar(op_page, en_page, nav):
             if ss.validation is not None and st.button("Сохранить графики валидации"):
                 log = ss.validation.to_frame()
                 if len(log):
-                    project_root = os.path.dirname(
-                        os.path.dirname(
-                            os.path.dirname(
-                                os.path.abspath(__file__))))
-                    graphs_dir = os.path.join(project_root, 'artifacts', 'graphs')
-                    paths = render_all(log, graphs_dir)
+                    graphs_dir = os.path.join(_PROJECT_ROOT, 'artifacts', 'graphs')
+                    render_all(log, graphs_dir)
                     st.success(f"Метрики: {summarize(log)}")
                 else:
-                    st.warning("Лог пуст — сначала прогоните поток.")
+                    st.warning("Лог пуст - сначала прогоните поток.")
 
-        _render_progress()        # авто-обновление пройденных минут
+        _render_progress() # авто-обновление пройденных минут
         if ss.player is not None:
             b = st.columns(3)
             if b[0].button("▶"): ss.playing = True
@@ -930,20 +986,17 @@ def render_sidebar(op_page, en_page, nav):
             ss.speed = st.slider("Минут за тик UI", 1, 20, ss.speed)
 
 
-def render_header():
-    st.markdown("<div class='app-title'>Платформа предиктивного обслуживания</div>"
-                "<div class='app-sub'>Интерфейс · NAMUR NE 129</div>",
-                unsafe_allow_html=True)
-
-
 def view_operator():
+    """Экран ОПЕРАТОРА: счётчики парка, карта плиток NAMUR NE 107, drill-down в
+    выбранный агрегат (графики) и стопка тостов-предписаний справа снизу."""
+
     ss = st.session_state
     fsm = ss.fsm
     pumps = sorted(ss.history.keys())
     st.subheader("Карта оборудования")
 
     if not pumps:
-        st.info("Запусти демо-сценарий в левой панели (открой её язычком »).")
+        st.info("Для начала работы необходимо запустить демо-сценарий/поток данных в левой боковой панели.")
         render_active_prescription()
         return
 
@@ -958,7 +1011,8 @@ def view_operator():
                     if e.kind == "transition" and ss.sim_ts
                     and minutes_since(getattr(e, "ts", ss.sim_ts), ss.sim_ts) <= 60)
     k[3].metric("Переходов/час", recent_tx,
-                help="Скользящее окно 60 мин. Норматив ISA 18.2 — ≤6 тревог/час.")
+                help=f"Скользящее окно 60 мин. Норматив ISA 18.2 - "
+                     f"≤{ISA_ALARM_RATE_LIMIT} тревог/час.")
 
     cols = st.columns(max(4, len(pumps)))
     for col, pid in zip(cols, pumps):
@@ -969,18 +1023,18 @@ def view_operator():
         prep = ss.backend.preproc
         raw_state = ss.history[pid][-1]["state"] if ss.history.get(pid) else 2
         tripped = pid in ss.tripped
-        recovering = pid in ss.recovering             # квитировано — идёт восстановление
+        recovering = pid in ss.recovering # квитировано - идёт восстановление
         warming = (not tripped) and hasattr(prep, "rows_seen") and prep.rows_seen(pid) < 15
-        # тип отказа — только при активной аварии/предупреждении, НЕ на прогреве/восстановлении
+        # тип отказа - только при активной аварии/предупреждении, НЕ на прогреве/восстановлении
         show_fault = tripped or (not warming and not recovering
                                  and inc is not None and fsm.state(pid) >= 1)
         extra = (FAULT_LABELS.get(inc.fault_type or "", "")
                  if (show_fault and inc and inc.fault_type) else "")
-        if tripped:                                   # авария важнее прогрева
+        if tripped: # авария важнее прогрева
             color, icon, label = s["color"], s["icon"], s["label"]
-        elif recovering:                              # стейл fsm.state=2 после ack — не «Отказ»
+        elif recovering: # не актуальный fsm.state=2 после ack - не «Отказ»
             color, icon, label = "#5A5F66", "◌", "Перезапуск · восстановление"
-        elif warming:                                 # понятный текст вместо «прогрев»
+        elif warming: # понятный текст вместо «прогрев»
             color, icon = "#5A5F66", "◌"
             label = ("Оборудование отключено" if int(raw_state) == 0
                      else "Пуск · накопление истории" if int(raw_state) == 1
@@ -1007,11 +1061,11 @@ def view_operator():
             sv = inc.symptom_vectors.get(1)
             pw = (sv.probabilities[1] * 100 if sv and len(sv.probabilities) > 2 else None)
             drv = (sv.fault_top_symptoms[0].feature
-                   if sv and getattr(sv, "fault_top_symptoms", None) else "—")
+                   if sv and getattr(sv, "fault_top_symptoms", None) else "-")
             st.warning(
                 f"Ранний сигнал деградации · {FAULT_LABELS.get(inc.fault_type or '', '')}"
                 f"{f' · P(деградация) {pw:.0f}%' if pw else ''}. "
-                f"Абсолютные значения параметров в пределах нормы — обнаружена "
+                f"Абсолютные значения параметров в пределах нормы - обнаружена "
                 f"статистическая сигнатура развивающегося дефекта "
                 f"(ведущий признак: {drv}). Порог не достигнут; требуются "
                 f"упреждающие действия, не аварийный останов.")
@@ -1022,6 +1076,7 @@ def view_operator():
 
 def _engineer_param_snapshot(pid):
     """Текущие значения параметров агрегата (контекст для состояния «Норма»)."""
+
     h = st.session_state.history.get(pid, [])
     if not h:
         return
@@ -1031,7 +1086,7 @@ def _engineer_param_snapshot(pid):
         thr = THRESHOLDS[p]
         v = cur.get(p)
         rows.append({"Параметр": PARAM_LABELS[p],
-                     "Текущее": round(float(v), 2) if v is not None else "—",
+                     "Текущее": round(float(v), 2) if v is not None else "-",
                      "Ед.": thr["unit"],
                      "Пред.": thr["warning"], "Авар.": thr["critical"]})
     st.markdown("**Текущие параметры**")
@@ -1039,6 +1094,10 @@ def _engineer_param_snapshot(pid):
 
 
 def view_engineer():
+    """Экран ИНЖЕНЕРА: выбор агрегата (сортировка по тяжести), для инцидента -
+    вкладки SHAP обеих моделей, таблицы симптомов, трассировка RAG, план/история
+    ТОиР; для «Нормы» - снимок текущих параметров."""
+
     ss = st.session_state
     fsm = ss.fsm
     st.subheader("Инженерная диагностика")
@@ -1050,28 +1109,36 @@ def view_engineer():
         return
 
     def _inc(pid):
+        """Текущий инцидент насоса: живой из FSM либо закреплённый (pinned)."""
         return fsm.incident(pid) or ss.pinned.get(pid)
 
     def _sev(pid):
-            if pid in ss.tripped:
-                return 2
-            if pid in ss.recovering:              # квитировано — стейл fsm.state=2 гасим
-                return 0
-            prep = getattr(ss.backend, "preproc", None)
-            if prep is not None and hasattr(prep, "rows_seen") and prep.rows_seen(pid) < 15:
-                return 0                          # прогрев после рестарта — это не авария
-            return fsm.state(pid)
+        """Тяжесть для сортировки/меток: 2 при аварийном останове, 0 при
+        восстановлении/прогреве, иначе подтверждённое состояние FSM."""
+
+        if pid in ss.tripped:
+            return 2
+        if pid in ss.recovering: # квитировано - устаревший fsm.state=2 гасится
+            return 0
+        prep = getattr(ss.backend, "preproc", None)
+        if prep is not None and hasattr(prep, "rows_seen") and prep.rows_seen(pid) < 15:
+            return 0 # прогрев после рестарта - это не авария
+        return fsm.state(pid)
 
     def _recency(pid):
+        """Ключ свежести для сортировки: id инцидента (новее = больше), -1 без него."""
+
         inc = _inc(pid)
         return inc.incident_id if inc else -1
 
     order = sorted(pumps, key=lambda p: (_sev(p), _recency(p)), reverse=True)
 
     def _label(pid):
+        """Подпись пункта selectbox: агрегат · состояние · тип отказа."""
+
         sev = _sev(pid)
         inc = _inc(pid)
-        ftype = inc.fault_label if (inc and sev >= 1) else "—"
+        ftype = inc.fault_label if (inc and sev >= 1) else "-"
         return f"{pid} · {SEVERITY_LABELS.get(sev, sev)} · {ftype}"
 
     pid = st.selectbox("Оборудование (отсортировано по тяжести состояния)",
@@ -1082,7 +1149,7 @@ def view_engineer():
     if sev == 0 or inc is None:
         c = st.columns(3)
         c[0].metric("Состояние", SEVERITY_LABELS.get(sev, sev))
-        c[1].metric("Тип отказа", "—")
+        c[1].metric("Тип отказа", "-")
         c[2].metric("Активный инцидент", "нет")
         st.success("Параметры агрегата в пределах нормы. Диагностический разбор "
                    "(SHAP, симптомы, трассировка RAG) формируется при переходе "
@@ -1091,9 +1158,9 @@ def view_engineer():
         return
 
     stage = inc.stage
-    # Уверенность типа и признаки на активном предупреждении считаем ЖИВО по текущему
-    # окну — они растут по мере развития дефекта. Зафиксированный при эскалации вектор
-    # замораживаем ТОЛЬКО при отказе (агрегат остановлен, новых данных нет) — как SHAP.
+    # Уверенность типа и признаки на активном предупреждении считаются ЖИВО по текущему
+    # окну - они растут по мере развития дефекта. Зафиксированный при эскалации вектор
+    # замораживается ТОЛЬКО при отказе (агрегат остановлен, новых данных нет) - как SHAP.
     sv = inc.symptom_vectors.get(stage) or \
         next((v for v in inc.symptom_vectors.values() if v is not None), None)
     if pid not in ss.tripped:
@@ -1107,10 +1174,10 @@ def view_engineer():
     c[2].metric("Уверенность типа", f"{getattr(sv, 'fault_confidence', 0):.0f}%")
     if stage == 1:
         st.caption("Стадия «Предупреждение»: абсолютные значения параметров могут "
-                   "быть в норме — сигнал в статистической сигнатуре, не в пороге.")
+                   "быть в норме - сигнал в статистической сигнатуре, не в пороге.")
     if 1 in inc.symptom_vectors and 2 in inc.symptom_vectors:
         st.caption("Агрегат прошёл «Предупреждение» → «Авария»; показан текущий "
-                   "(старший) этап. Ранние предписания — в истории (левый сайдбар).")
+                   "(старший) этап. Ранние предписания - в истории (левый сайдбар).")
 
     tabs = st.tabs(["Диагностика (SHAP)", "Симптомы", "Трассировка RAG",
                     "ТОиР: план и история"])
@@ -1119,7 +1186,7 @@ def view_engineer():
         if use_frozen:
             f_sev, f_fault = ss.shap_frozen.get((inc.incident_id, stage)) or (None, None)
         else:
-            # живой SHAP с троттлингом ~5 c: иначе медиафайлы плодятся каждые 2 c,
+            # живой SHAP с дросселированием ~5 c: иначе медиафайлы плодятся каждые 2 c,
             # старые вытесняются → MediaFileStorageError и картинка «замирает».
             ck = f"_shaplive_{inc.pump_id}"
             cached = ss.get(ck)
@@ -1138,9 +1205,9 @@ def view_engineer():
             gc[1].image(f_sev, use_container_width=True,
                         caption="Вклад признаков по классу «Авария» "
                                 "(удалённость от аварии)")
-        st.caption("SHAP зафиксирован на момент аварии — не пересчитывается после "
+        st.caption("SHAP зафиксирован на момент аварии - не пересчитывается после "
                    "останова." if use_frozen else
-                   "SHAP по текущему окну — обновляется каждые ~5 c, пока агрегат в работе.")
+                   "SHAP по текущему окну - обновляется каждые ~5 c, пока агрегат в работе.")
     with tabs[1]:
         for attr, title in (("fault_top_symptoms", "Признаки типа отказа"),
                             ("top_symptoms", "Признаки тяжести (класс «Авария»)")):
@@ -1148,8 +1215,8 @@ def view_engineer():
             if items:
                 st.markdown(f"**{title}**")
                 st.table(pd.DataFrame([
-                    {"Признак": getattr(s, "feature", "—"),
-                     "Датчик": getattr(s, "sensor", "—"),
+                    {"Признак": getattr(s, "feature", "-"),
+                     "Датчик": getattr(s, "sensor", "-"),
                      "Значение": round(float(getattr(s, "value", 0)), 3),
                      "SHAP": round(float(getattr(s, "shap_weight", 0)), 3)}
                     for s in items]))
@@ -1159,8 +1226,8 @@ def view_engineer():
              if sv is not None else [])
         if trace:
             st.dataframe(pd.DataFrame(trace), use_container_width=True, hide_index=True)
-            st.caption("Источники по разделам: диагноз — мануал/ГОСТ/вибродиагностика; "
-                       "предписание и ТОиР — регламент; плановый ремонт — график ППР.")
+            st.caption("Источники по разделам: диагноз - мануал/ГОСТ/вибродиагностика; "
+                       "предписание и ТОиР - регламент; плановый ремонт - график ППР.")
         else:
             st.caption("Трассировка формируется вместе с предписанием.")
     with tabs[3]:
@@ -1169,25 +1236,29 @@ def view_engineer():
         m = re.search(r"ПЛАНОВЫЙ РЕМОНТ:\s*(.+)", text, re.S)
         st.write(m.group(1).strip()[:400] if m
                  else ("⏳ формируется…" if stage not in inc.prescriptions
-                       else "— нет данных графика —"))
+                       else "- нет данных графика -"))
         st.markdown("**История работ по агрегату** _(подключается к системе ТОиР "
-                    "предприятия; здесь — демонстрационные данные)_")
+                    "предприятия; здесь - демонстрационные данные)_")
         log = ss.toir_log.get(inc.pump_id, [])
         demo = [
             {"Дата": "2026-02-11", "Работа": "ТО-1: замена смазки картера",
-             "Тип": "—", "Статус": "выполнено"},
+             "Тип": "-", "Статус": "выполнено"},
             {"Дата": "2025-11-03", "Работа": "ТО-2: лазерная центровка валов",
-             "Тип": "—", "Статус": "выполнено"},
+             "Тип": "-", "Статус": "выполнено"},
         ]
         st.dataframe(pd.DataFrame(log + demo), use_container_width=True, hide_index=True)
 
 
 def _engine_tick():
+    """Один шаг движка внутри фрагмента: по таймеру прогнать поток (advance_stream),
+    затем опросить фоновые генерации и ре-наги. Без глобального rerun/sleep."""
+
     ss = st.session_state
     now = time.monotonic()
     if ss.playing and ss.player is not None and not ss.player.finished:
-        if now - ss.get("_last_advance", 0.0) >= REFRESH * 0.8:   # темп задаёт таймер,
-            advance_stream(ss.speed)                              # а не клики
+        # темп прогона задаёт таймер REFRESH, а не клики пользователя
+        if now - ss.get("_last_advance", 0.0) >= REFRESH * 0.8:
+            advance_stream(ss.speed)
             ss._last_advance = now
     poll_generations()
     poll_renags()
@@ -1195,12 +1266,17 @@ def _engine_tick():
 
 @st.fragment(run_every=REFRESH)
 def _operator_live():
+    """Фрагмент экрана оператора: гонит движок и перерисовывается по таймеру
+    REFRESH (без глобального rerun - клики по тостам не перебиваются)."""
+
     _engine_tick()
     view_operator()
 
 
 @st.fragment(run_every=REFRESH)
 def _render_progress():
+    """Фрагмент прогресс-бара воспроизведения (пройдено sim-минут из горизонта)."""
+
     ss = st.session_state
     if ss.player is not None:
         st.progress(ss.player.progress,
@@ -1209,6 +1285,8 @@ def _render_progress():
 
 @st.fragment(run_every=REFRESH)
 def _engineer_live():
+    """Фрагмент экрана инженера: движок + перерисовка по таймеру REFRESH."""
+
     _engine_tick()
     view_engineer()
 
@@ -1222,6 +1300,7 @@ def _render_history():
     остаётся квитированной). Дублей первичного обнаружения нет (guard в
     _log_event). Статус (active/acked/resolved/escalated) выводится здесь;
     acked и resolved фиксируются с временем и больше не меняются."""
+
     ss = st.session_state
     events = ss.events
     GREY = "#5A5F66"
@@ -1240,15 +1319,15 @@ def _render_history():
     alarm_ids = {e["incident_id"] for e in events if e["stage"] == 2}
 
     def _kind(e):
-        """Текущий вид записи. acked/resolved — терминальные (фиксируются на месте)."""
+        """Текущий вид записи. acked/resolved - терминальные (фиксируются на месте)."""
         if e["status"] == "acked":
             return "acked"
         if e["status"] == "resolved":
             return "resolved"
-        # предупреждение, доросшее до аварии того же инцидента — не «норма», а эскалация
+        # предупреждение, доросшее до аварии того же инцидента - не «норма», а эскалация
         if e["stage"] == 1 and e["incident_id"] in alarm_ids:
             return "escalated"
-        if e["incident_id"] not in live_ids:          # инцидент закрыт → возврат в норму
+        if e["incident_id"] not in live_ids: # инцидент закрыт → возврат в норму
             e["status"] = "resolved"
             e["status_ts"] = ss.sim_ts
             return "resolved"
@@ -1280,6 +1359,7 @@ def _render_history():
         text = inc.prescriptions.get(stage) if inc is not None else None
 
         def _fmt(t):
+            """Метка времени → 'дд.мм ЧЧ:ММ' (или строкой, если не парсится)."""
             try: return pd.Timestamp(t).strftime("%d.%m %H:%M")
             except Exception: return str(t)
 
@@ -1302,15 +1382,19 @@ def _render_history():
 
 
 def page_operator():
+    """Страница st.navigation «Оператор» (url_path=operator)."""
     _operator_live()
 
 
 def page_engineer():
+    """Страница st.navigation «Инженер» (url_path=engineer)."""
     _engineer_live()
 
 
 def main():
-    ss = st.session_state
+    """Точка входа Streamlit: инициализация состояния и backend, мультистраничная
+    навигация Оператор/Инженер и сайдбар. Поток и перерисовка живут во фрагментах."""
+
     init_state()
     get_backend()
     op = st.Page(page_operator, title="Оператор", url_path="operator", default=True)
@@ -1319,7 +1403,7 @@ def main():
     render_sidebar(op, en, nav)
     nav.run()
     # Поток и переотрисовка живут во фрагментах (run_every). Глобального
-    # time.sleep/st.rerun НЕТ — иначе он перебивает фрагменты, съедает клики
+    # time.sleep/st.rerun НЕТ - иначе он перебивает фрагменты, съедает клики
     # (тосты «развернуть/квитировать»), кидает экран наверх и двоит тики.
 
 

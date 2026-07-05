@@ -76,7 +76,9 @@ predictive_alarm_platform/
 │   │   └── ai_agent_benchmark.py    # ГОТОВО — бенчмарк 3 LLM: 6 сценариев (fault×stage), 5 метрик
 │   └── validation/
 │       ├── rag_regression_guard_test.py # ГОТОВО — guard: fault_type+stage привязка SOP
-│       └── permutation_test.py          # ГОТОВО — sanity check: метки перемешаны → accuracy ~1/3
+│       ├── permutation_test.py          # ГОТОВО — sanity check: метки перемешаны → accuracy ~1/3
+│       ├── online_parity_test.py        # ГОТОВО — регрессия паритета препроцессоров (online == offline)
+│       └── protobackend_smoke_test.py   # ГОТОВО — smoke: контракт UI ↔ ProtoBackend заморожен
 │
 ├── config/
 │   ├── __init__.py
@@ -121,10 +123,8 @@ predictive_alarm_platform/
 │   │   ├── agent_plot1_performance.png          # Производительность (время + токены/с)
 │   │   ├── agent_plot2_quality_auto.png         # Профиль качества (дискриминирующие метрики)
 │   │   ├── agent_plot3_summary_heatmap.png      # Сводный хитмап (relative quality)
-│   │   ├── agent_plot4_expert_radar.png         # Радар экспертных оценок
-│   │   ├── agent_plot5_stage_breakdown.png      # Стадийный разрез (Warning vs Авария)
-│   │   ├── ui_waterfall_sev_MNHV_00X.png        # SHAP waterfall тяжести для инженерной вкладки UI (runtime, по насосам)
-│   │   ├── ui_waterfall_fault_MNHV_00X.png      # SHAP waterfall типа отказа для инженерной вкладки UI (runtime)
+│   │   ├── agent_plot4_stage_breakdown.png      # Стадийный разрез (Warning vs Авария)
+│   │   ├── agent_plot5_expert_radar.png         # Радар экспертных оценок
 │   │   ├── validation_avalanche.png             # Real-time валидация: лавина тревог (наивный vs система)
 │   │   ├── validation_alarm_rate.png            # Темп тревог во времени (норматив ISA 18.2)
 │   │   ├── validation_detection_latency.png     # Латентность обнаружения отказа
@@ -170,6 +170,9 @@ predictive_alarm_platform/
 
 > **Пути в коде.** Запуск модулей как `python -m src.<domain>.<module>` из корня
 > репозитория; `__main__`-блоки сами добавляют корень и `src/` в `sys.path`.
+> Все доменные подпакеты `src/<domain>/` — регулярные пакеты с пустым
+> `__init__.py`; поддиректории `experiments/` работают как namespace-пакеты
+> (это скрипты/тесты, `__init__.py` им не нужен).
 > Модели грузятся из `models/severity/severity_xgboost_model.joblib` и
 > `models/fault_type/fault_xgboost_model.joblib`; ChromaDB — из `artifacts/chroma_db`;
 > графики/таблицы пишутся в `artifacts/graphs` и `artifacts/tables`. Эти же пути
@@ -243,10 +246,10 @@ predictive_alarm_platform/
 - **`XAIExplainer(model_path, fault_model_path)`:** грузит ОБЕ модели — `shap.TreeExplainer` для XGBoost тяжести (`target_class_idx=2`, Авария) и для классификатора типа
 - Возвращает **`SymptomVector`** (dataclass): `predicted_class`, `probabilities`, `critical_probability`, `top_symptoms`, `shap_base_value`, `inferred_fault`, `true_fault`, а также поля fault-классификатора (`fault_top_symptoms`, `fault_confidence`, `fault_probabilities`)
 - Сортировка по `abs(shap_weight)` — признак -0.8 важнее признака +0.1
-- **`_infer_fault_type(contributions)`** — SHAP-эвристика определения типа отказа по долям положительного вклада датчиков (масштабонезависима): температура≥40% → overheat; ток≥40% при молчащих остальных → electrical; иначе cavitation. Точность валидируется `validate_fault_inference()`
+- **`_explain_fault_type(feature_row)`** — тип отказа определяется обученным классификатором (`fault_model.predict_proba`), SHAP объясняет выбор предсказанного класса; прежняя SHAP-эвристика (`_infer_fault_type`) удалена в пользу обучаемой модели (см. fault_classifier_pipeline.py)
 - Пороги ГОСТ из `config/settings/settings.py`
 - Визуализация вынесена в `src/visualisation/xai_visualisation.py`:
-  - `plot_severity_waterfall()`, `plot_severity_summary()`, `plot_severity_summary_by_fault_type()` → **severity-модель** (`shap_severity_plot1-4_*`)
+  - `plot_severity_waterfall()`, `plot_severity_summary_by_fault_type()` → **severity-модель** (`shap_severity_plot1-4_*`)
   - `plot_fault_waterfall()`, `plot_fault_summary_by_type()` → **fault-классификатор** (`shap_fault_plot1-4_*`)
 - **Выходы:** `shap_severity_plot1-4_*` (severity SHAP) + `shap_fault_plot1-4_*` (fault-classifier SHAP)
 
@@ -303,7 +306,7 @@ predictive_alarm_platform/
 - `_display_source(filename)` — имя файла → читаемое имя документа (из `DOC_DISPLAY_NAMES`)
 
 - **`__main__`:** цепочка XAI → RAG (4 канала) → LLM с последовательным прогоном трёх моделей
-- Три тестируемые модели: `qwen3.5:9b` (default), `phi4:14b`, `second_constantine/yandex-gpt-5-lite:8b`
+- Три тестируемые модели: `qwen3.5:9b`, `phi4:14b`, `second_constantine/yandex-gpt-5-lite:8b`; рабочая модель платформы задаётся `DEFAULT_LLM_MODEL` в `config/settings` (сейчас — `second_constantine/yandex-gpt-5-lite:8b`)
 
 ### 9. `experiments/logo_cv/xgboost_benchmark.py` — LOGO CV бенчмарк
 - **Leave-One-Group-Out Cross-Validation:** 5 фолдов, каждый раз один насос — тест, остальные 4 — обучение
@@ -401,6 +404,26 @@ predictive_alarm_platform/
   - `validation_alarm_rate.png` — темп тревог во времени (норматив ISA 18.2 ≤6/час), `validation_detection_latency.png` — латентность обнаружения, `validation_confusion.png` — матрица ошибок против истины генератора, `validation_timeline.png` — таймлайн состояний парка
 - Полностью автономен от моделей (есть самотест на синтетическом логе)
 
+### 22. `experiments/validation/online_parity_test.py` — Регрессия паритета препроцессоров
+- **Цель:** гарантировать, что потоковый расчёт признаков бит-в-бит совпадает с offline-расчётом, на котором обучены модели; любое расхождение = рассинхрон train/inference
+- **3 проверки:**
+  1. `verify_parity`: строгий `OnlinePreprocessor` == offline `DataPreprocessor` на каждой строке после прогрева (тот же `shift(1)`, `min_periods=w`, `diff_30`, `std` ddof=1) — иначе `AssertionError` с первой расходящейся колонкой
+  2. `RealtimeProgressivePreprocessor` == строгий препроцессор на ПОЛНОМ окне (≥ `WARMUP_ROWS`)
+  3. На частичном окне прогрессивный ВЫДАЁТ признаки, а строгий молчит — подтверждение разной политики прогрева (фича, не баг)
+- **Выравнивание индексов:** offline считается через `process(is_training=False)` — без dropna/reset_index, исходный индекс raw сохраняется
+- **Скорость:** берутся первые `HEAD_ROWS` строк каждого насоса, а не весь датасет 648k строк
+- Запуск: `pytest experiments/validation/online_parity_test.py -v` или `python experiments/validation/online_parity_test.py`
+- Это тот самый regression-тест, без которого запрещено менять контракт паритета в `online_preprocessor.py`
+
+### 23. `experiments/validation/protobackend_smoke_test.py` — Smoke-тест отката UI (ProtoBackend)
+- **Цель:** `app.py` при сбое инициализации боевого `PlatformBackend` молча падает на `ProtoBackend`; если прототип отстал от того, что дёргает UI, — дашборд рушится вместо graceful-демо. Тест ЗАМОРАЖИВАЕТ контракт UI ↔ backend
+- **Проверяемый контракт** (собран из `app.py`, держать в синхроне при правках UI):
+  - методы backend: `process_tick`, `explain`, `prescription_stream`, `retrieval_trace`, `shap_figures`; атрибут `preproc` с `.feature_cols` / `.reset()`
+  - поля SymptomVector: `probabilities[1]` (drill-down предупреждения!), `critical_probability`, `inferred_fault`, `fault_confidence`, `fault_probabilities`, `top_symptoms`, `fault_top_symptoms`; у элемента симптома — `feature/sensor/value/shap_weight`
+  - `retrieval_trace` → `list[dict]` с ключами для таблицы инженера
+- **Headless:** `app.py` не импортируется (там `st.set_page_config` на верхнем уровне) — контракт закодирован явными списками
+- Запуск: `pytest experiments/validation/protobackend_smoke_test.py -v` или `python experiments/validation/protobackend_smoke_test.py`
+
 ---
 
 ## Централизованная конфигурация (`config/`)
@@ -420,6 +443,7 @@ predictive_alarm_platform/
 | `EMBED_MODEL` | `intfloat/multilingual-e5-large` |
 | `RELEVANCE_THRESHOLD` | `1.2` — порог L2-расстояния для RAG |
 | `DOC_TYPES`, `CHUNK_CONFIG`, `DOC_TYPE_MAP` | Конфигурация базы знаний; `DOC_TYPE_MAP` содержит только `.md`-файлы |
+| `DOC_TYPE_SHORT_RU` | Короткие русские подписи типов документов для осей/ячеек хитмапов RAG-визуализации |
 | `DOC_DISPLAY_NAMES` | Читаемые имена документов для атрибуции в ответах агента |
 | `FAULT_CONFIDENCE_THRESHOLD` | `0.5` — порог уверенности классификатора типа; ниже → `stage='unknown'` |
 | `LLM_MODELS`, `DEFAULT_LLM_MODEL` | Список тестируемых Ollama-моделей |
@@ -430,6 +454,14 @@ predictive_alarm_platform/
 | `EMERGENCY_MARKERS` | Маркеры аварийного останова — недопустимы на стадии Предупреждение |
 | `DECISIVE_MARKERS` | Маркеры решительного действия — обязательны на стадии Авария |
 | `DIRECTIONS`, `FMT` | Направления метрик и форматы для хитмапа бенчмарка |
+| `ISA_ALARM_RATE_LIMIT` | Предел тревог/час (ISA 18.2, `=6`); единый для дашборда и графиков валидации |
+| `UI_REFRESH_SEC`, `UI_RENAG_MIN`, `UI_GEN_TIMEOUT_SEC`, `UI_MAX_EVENTS`, `UI_GRAPH_WINDOW_MIN` | Тюнинг runtime дашборда (`app.py`): период перерисовки, ре-наг, таймаут генерации, кап истории, окно трендов |
+| `UI_YRANGE`, `UI_SEVERITY_COLORS`, `UI_ACK_COLOR` | Диапазоны осей графиков оператора и цвета статусов тяжести/квитирования |
+| `SIM_AMBIENT_TEMP`, `SIM_HEALTHY_FIXED`, `SIM_START_DATE` | Физконстанты live-генератора парка (`experiments/realtime_validation/live_generator.py`) |
+
+> `app.py` импортирует UI-константы из `config.settings` через алиасы (короткие
+> локальные имена `REFRESH`/`RENAG_MIN`/… сохранены). `RealtimeConfig`
+> (тайминги/вероятности симуляции) остаётся отдельным конфиг-датаклассом.
 
 ### `config/prompts/diagnostic_agent.md`
 Системный промпт `DiagnosticAgent`. Загружается при импорте `src/agent/ai_agent.py`. Редактируется без изменения Python-кода.
@@ -448,25 +480,27 @@ predictive_alarm_platform/
 | `simulation_visualisation.py` | `plot_smart_episode(df, hours, save_dir)` | `data_generator.py` |
 | `ml_visualisation.py` | `plot_all(metrics, y_test, output_dir)`, `recall_plot(results, signatures, save_dir)`, `plot_fault_classifier(metrics, output_dir)` | `severity_classifier_pipeline.py`, `fault_recall_analysis.py`, `fault_classifier_pipeline.py` |
 | `rag_visualisation.py` | `plot_all_rag(kb, test_queries, save_dir)` → 5 графиков: `plot_knowledge_base_stats`, `plot_chunk_length_distribution`, `plot_retrieval_quality`, `plot_fault_coverage_heatmap`, `plot_fault_section_sourcing` | `rag_database.py` |
-| `xai_visualisation.py` | `plot_severity_waterfall()`, `plot_severity_summary()`, `plot_severity_summary_by_fault_type()` — severity; `plot_fault_waterfall()`, `plot_fault_summary_by_type()` — fault classifier | `xai_module.py`, `platform_backend.py` |
+| `xai_visualisation.py` | `plot_severity_waterfall()`, `plot_severity_summary_by_fault_type()` — severity; `plot_fault_waterfall()`, `plot_fault_summary_by_type()` — fault classifier | `xai_module.py`, `platform_backend.py` |
 | `ai_visualisation.py` | `plot_performance(df, save_dir)`, `plot_quality_auto(df, save_dir)`, `plot_summary_heatmap(summary_df, directions, fmt, save_dir)`, `plot_expert_radar(expert_scores, save_dir)`, `plot_stage_breakdown(df, save_dir)` | `experiments/llm_benchmark/ai_agent_benchmark.py`, автономно |
 | `realtime_val_visualisation.py` | `ValidationCollector`, `summarize(log)`, `render_all(log, outdir)` → `plot_avalanche`, `plot_alarm_rate`, `plot_detection_latency`, `plot_confusion`, `plot_state_timeline_all` | `app.py` (real-time режим), автономно (самотест) |
 
 ---
 
-## Что предстоит сделать / доработать
+## Статус проекта: ЗАВЕРШЁН
 
-Функционально проект **завершён**: аналитическое ядро (две модели, XAI, RAG, LLM-агент),
+Проект **полностью готов**: аналитическое ядро (две модели, XAI, RAG, LLM-агент),
 runtime-слой, двухуровневый Streamlit UI с двумя источниками данных (демо-датасет +
 живой режим реального времени) и подсистема real-time валидации с публикационными
-графиками — реализованы и работают.
+графиками — реализованы, валидированы и работают. Проведена финальная ревизия
+кодовой базы: комментарии и docstring'и синхронизированы с кодом, мёртвый код и
+неиспользуемые сущности удалены, все доменные подпакеты `src/` оформлены с
+`__init__.py`, регрессионные тесты (`online_parity_test.py`,
+`protobackend_smoke_test.py`) проходят.
 
-Остаточные (косметические / по желанию — **сейчас не трогаем**):
+Возможные направления развития за рамками дипломной работы:
 
-1. Доработка графиков, комментариев, чистка неиспользуемого контекста и мелкая полировка UI.
-2. **Регрессионный тест паритета** online/offline препроцессора (`verify_parity`) — оформить как запускаемый модуль (упомянут в docstring `online_preprocessor.py` как `scripts.test_online_parity`, файл пока отсутствует).
-3. Подключение реального источника ТОиР-истории вместо демо-данных в инженерной вкладке.
-4. Валидация на реальных промышленных данных (текущая — на физически достоверном синтетическом датасете и живом генераторе).
+1. Подключение реального источника ТОиР-истории вместо демо-данных в инженерной вкладке.
+2. Валидация на реальных промышленных данных (текущая — на физически достоверном синтетическом датасете и живом генераторе).
 
 **Режим инференса в UI (по одной строке):**
 ```python
@@ -519,6 +553,8 @@ if trigger is not None:                             # подтверждённа
 | 6 сценариев в бенчмарке (fault × stage) | Доказывает стадийную дифференциацию, а не только различение типов |
 | `stage_appropriate` как метрика | Автоматически проверяет, что на Предупреждение нет останова, на Аварию есть решительное действие |
 | `rag_regression_guard_test.py` | Защита от регрессии при перестройке базы; тест запускается перед любым изменением разметки SOP |
+| `online_parity_test.py` — регрессия паритета | Контракт online == offline препроцессора заморожен тестом; менять `shift(1)`/`min_periods`/`diff_30`/`ddof` без его прогона запрещено |
+| `protobackend_smoke_test.py` — замороженный контракт UI ↔ backend | Методы backend и поля SymptomVector, которые читает UI, закодированы явными списками; ProtoBackend не может молча отстать от боевого |
 | `agent_summary_table.csv` читается с `index_col=0` | `model` — индекс DataFrame; без этого хитмап показывает 0,1,2 вместо имён |
 | Слой `src/runtime/` между UI и ядром | `app.py` зависит только от `platform_backend`; смена источника данных и сигнатур модулей локализована |
 | `PlatformBackend` + `ProtoBackend` (один интерфейс) | UI тестируем и верстаем без Ollama/ChromaDB/моделей; автоматический откат на прототип при сбое инициализации |

@@ -1,16 +1,17 @@
-# -*- coding: utf-8 -*-
 """
-src/demo_stream.py
+Детерминированный демо-сценарий (Data Stream)
+=============================================
+experiments/data_stream/demo_stream.py
 
-Детерминированный демо-сценарий для валидации платформы (раздел 3.9).
+Демо-сценарий для валидации платформы (раздел 3.9).
 
 Подход: сценарий НЕ генерируется заново, а вырезается из уже
 существующего размеченного датасета industrial_pumps_dataset.csv.
 Это даёт три свойства, важных для защиты:
-  1. Воспроизводимость — один и тот же сегмент на каждом запуске;
-  2. Честность — данные те же, на которых валидированы модели
+  1. Воспроизводимость - один и тот же сегмент на каждом запуске;
+  2. Честность - данные те же, на которых валидированы модели
      (тестовый насос MNHV_005 по умолчанию -> unseen для моделей);
-  3. Гарантированный сюжет — Норма -> Предупреждение -> Авария
+  3. Гарантированный сюжет - Норма -> Предупреждение -> Авария
      выбранного физического типа отказа.
 
 Структура сценария:
@@ -18,12 +19,12 @@ src/demo_stream.py
       -> [полная фаза Degradation] -> [critical_minutes Critical]
 
 Warmup-префикс нужен потоковому препроцессору для заполнения окон
-(см. online_preprocessor.WARMUP_ROWS) — на дашборде он проигрывается
+(см. online_preprocessor.WARMUP_ROWS) - на дашборде он проигрывается
 ускоренно либо скрыто.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, cast
 
 import pandas as pd
 
@@ -35,6 +36,9 @@ WARMUP_MINUTES = 60
 
 
 def _state_series(df: pd.DataFrame) -> pd.Series:
+    """Столбец состояния FSM как int-Series: из числового 'state', иначе
+    маппингом текстового 'state_name' через STATE_NAMES."""
+
     if "state" in df.columns:
         return df["state"].astype(int)
     return df["state_name"].map(STATE_NAMES).astype(int)
@@ -59,9 +63,9 @@ def extract_demo_scenario(
     pumps = [pump_id] if pump_id else sorted(df["pump_id"].unique())
 
     for pid in pumps:
-        grp = df[df["pump_id"] == pid].reset_index(drop=True)
-        st = _state_series(grp).values  # type: ignore
-        ft = grp["fault_type"].values
+        grp = cast(pd.DataFrame, df[df["pump_id"] == pid]).reset_index(drop=True)
+        st = _state_series(grp).to_numpy()
+        ft = grp["fault_type"].to_numpy()
 
         i = 0
         need_prefix = WARMUP_MINUTES + healthy_minutes
@@ -69,7 +73,7 @@ def extract_demo_scenario(
             if st[i] == DEGRADATION and ft[i] == fault_type:
                 # начало деградации нужного типа
                 start_deg = i
-                # проверяем префикс Healthy
+                # проверка Healthy-префикса
                 if start_deg < need_prefix or not (
                     (st[start_deg - need_prefix:start_deg] == HEALTHY).all()
                 ):
@@ -111,7 +115,7 @@ def extract_demo_scenario(
 class ScenarioPlayer:
     """Плеер потока: выдаёт строки по одной, хранит позицию.
 
-    Состояние плеера живёт в st.session_state — интерфейс при каждом
+    Состояние плеера живёт в st.session_state - интерфейс при каждом
     rerun продолжает с того же места.
     """
 
@@ -120,13 +124,21 @@ class ScenarioPlayer:
     finished: bool = field(default=False)
 
     def __len__(self) -> int:
+        """Длина сценария в строках (sim-минутах)."""
+
         return len(self.scenario)
 
     @property
     def progress(self) -> float:
+        """Доля пройденного сценария [0..1] для прогресс-бара."""
+
         return self.pos / max(1, len(self.scenario))
 
     def next_rows(self, n: int = 1) -> List[pd.Series]:
+        """Выдать до n следующих строк сценария (по одной на sim-минуту).
+
+        По достижении конца выставляет finished=True и возвращает уже накопленное."""
+
         rows: List[pd.Series] = []
         for _ in range(n):
             if self.pos >= len(self.scenario):
@@ -138,6 +150,7 @@ class ScenarioPlayer:
 
     def skip_warmup(self) -> List[pd.Series]:
         """Прогнать warmup-префикс одним пакетом (для быстрого старта демо)."""
+        
         rows: List[pd.Series] = []
         if "demo_phase" not in self.scenario.columns:
             return rows

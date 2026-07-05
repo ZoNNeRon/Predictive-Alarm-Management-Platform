@@ -1,45 +1,47 @@
 """
-live_generator.py — живой мультинасосный генератор телеметрии (реальное время).
-================================================================================
+Живой мультинасосный генератор телеметрии (Live Generator)
+==========================================================
+experiments/realtime_validation/live_generator.py
+
 Назначение: валидация системы в режиме реального времени. В отличие от
 `data_generator.py` (пакетная генерация всего датасета) и `demo_stream.py`
 (воспроизведение готового эпизода из CSV), этот модуль генерирует данные
-ПОШАГОВО, «здесь и сейчас»: на каждый тик — по одной строке на каждый насос
+ПОШАГОВО, «здесь и сейчас»: на каждый тик - по одной строке на каждый насос
 парка, синхронно по единым модельным часам.
 
 ВЕРНОСТЬ АЛГОРИТМУ. Поминутные формулы AR(1), сигнатуры трёх типов отказа,
 startup-всплеск, аномалии датчиков и State Machine (Off/Startup/Healthy/
 Degradation/Critical = 0..4) перенесены ОДИН-В-ОДИН из `src/data/data_generator.py`
-(те же μ, φ, σ, linspace-тренды). Отличия — только структурные:
-  • поминутный шаг вместо пакетных циклов (нужно для real-time и квитирования);
-  • независимый RNG-поток на насос (`np.random.default_rng(seed)`) вместо
-    глобального `np.random.seed` — распределение тика идентично датасету,
+(те же μ, φ, σ, linspace-тренды). Отличия - только структурные:
+  - поминутный шаг вместо пакетных циклов (нужно для real-time и квитирования);
+  - независимый RNG-поток на насос (`np.random.default_rng(seed)`) вместо
+    глобального `np.random.seed` - распределение тика идентично датасету,
     значения не байт-в-байт (это и не требуется: модели обучены на распределении);
-  • ускоренные тайминги/вероятности (RealtimeConfig) — чтобы валидация шла
+  - ускоренные тайминги/вероятности (RealtimeConfig) - чтобы валидация шла
     минуты, а не дни.
 
 ВАЖНО про distribution. Деградация ускорена умеренно (90–150 sim-мин): при
 слишком короткой деградации linspace-тренд становится круче обучающего и
-`diff_30` уходит за обучающий диапазон (модель детектит раньше/резче). Ручка —
+`diff_30` уходит за обучающий диапазон (модель детектит раньше/резче). Ручка -
 `RealtimeConfig.degradation_min/max`.
 
 ЛАВИНА ТРЕВОГ. Аномалии датчиков (p из конфига, в реальном времени поднята до
-видимой частоты) и пусковые всплески — это материал «лавины», которую система
+видимой частоты) и пусковые всплески - это материал «лавины», которую система
 гасит окнами/состоянием. Здесь они ПРОИЗВОДЯТСЯ и помечаются флагами
 `anomaly_vibration/temperature/current`; подсчёт «сколько бы сработало наивно
-против подтверждённых» — задача слоя метрик (следующий модуль).
+против подтверждённых» - задача слоя метрик (следующий модуль).
 
 ПРОГРЕВ. Каждый насос стартует в устоявшейся Норме, а первый цикл принудительно
 нормальный (без отказа): первая возможная деградация наступает заметно позже
-прогрева препроцессора — отказ в «слепом окне» первых минут не возникает.
+прогрева препроцессора - отказ в «слепом окне» первых минут не возникает.
 
 КВИТИРОВАНИЕ (обратная связь от UI), действует по ТЕКУЩЕМУ физическому состоянию:
-  • Degradation + квитирование → с вер. 50% перевод в Healthy (AR(1) сам стянет
+  - Degradation + квитирование → с вер. 50% перевод в Healthy (AR(1) сам стянет
     значения к норме), иначе деградация продолжается;
-  • Critical + квитирование → 100% останов: Off (затухание) → Startup (всплеск,
+  - Critical + квитирование → 100% останов: Off (затухание) → Startup (всплеск,
     глушится состоянием) → Healthy («режим предотвращённых сигналов»).
 
-Схема строки (12 колонок) идентична датасету — `process_tick`/`push_history`
+Схема строки (12 колонок) идентична датасету - `process_tick`/`push_history`
 работают без правок:
   timestamp, pump_id, state, state_name, fault_type,
   vibration, temperature, current, pressure,
@@ -62,30 +64,29 @@ for _p in (_THIS_DIR, _PROJECT_ROOT):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from config.settings import (FAULT_TYPES, FAULT_WEIGHTS, PUMP_SEEDS, PUMPS)
+from config.settings import (FAULT_TYPES, FAULT_WEIGHTS, PUMP_SEEDS, PUMPS,
+                             SIM_AMBIENT_TEMP as AMBIENT_TEMP,
+                             SIM_HEALTHY_FIXED as _HEALTHY_FIXED,
+                             SIM_START_DATE)
 
 # Имена состояний State Machine (как в data_generator.py)
 _STATE_NAMES = {0: "Off", 1: "Startup", 2: "Healthy",
                 3: "Degradation", 4: "Critical"}
 OFF, STARTUP, HEALTHY, DEGRADATION, CRITICAL = 0, 1, 2, 3, 4
-
-AMBIENT_TEMP = 20.0
-
-# Устоявшиеся значения Healthy-AR(1) (неподвижные точки): для старта в Норме
-#   temp: x=0.9x+70*0.1   → 70 ;  vib: x=0.88x+1.8*0.12 → 1.8
-#   curr: x=0.9x+50*0.1   → 50 ;  press: x=0.85x+1.5*0.15 → 1.5
-_HEALTHY_FIXED = {"temperature": 70.0, "vibration": 1.8,
-                  "current": 50.0, "pressure": 1.5}
+# AMBIENT_TEMP и неподвижные точки Healthy-AR(1) (_HEALTHY_FIXED) - в config.settings
+# (SIM_*). Неподвижные точки: temp 0.9x+70·0.1→70, vib 0.88x+1.8·0.12→1.8,
+# curr 0.9x+50·0.1→50, press 0.85x+1.5·0.15→1.5.
 
 
 @dataclass
 class RealtimeConfig:
     """Ускоренные тайминги/вероятности для валидации (sim-минуты).
 
-    Ускоряем «скучные» части и частоту отказов; крутизну деградации держим
+    Ускоряются «скучные» части и частота отказов; крутизна деградации остаётся
     умеренной, чтобы diff-признаки не ушли за обучающий диапазон.
-    Все длительности — диапазоны [min, max) для rng.integers.
+    Все длительности - диапазоны [min, max) для rng.integers.
     """
+
     # длительности состояний (sim-мин)
     off_min: int = 5;          off_max: int = 16          # был 60..180
     healthy_norm_min: int = 130; healthy_norm_max: int = 221  # короче старого: насыщеннее событиями (пик переходов ~4/ч)
@@ -95,7 +96,7 @@ class RealtimeConfig:
     # startup как в оригинале (2..3 мин)
     startup_min: int = 2;       startup_max: int = 4
 
-    # вероятность того, что цикл — отказной. Подобрана под горизонт 480 мин /
+    # вероятность того, что цикл - отказной. Подобрана под горизонт 480 мин /
     # 5 насосов так, чтобы предупреждений было немного (≈3 на парк), а аварий ≤2.
     p_fault: float = 0.22
     # частота аппаратной аномалии датчика за минуту в Healthy (был 0.001).
@@ -107,16 +108,17 @@ class RealtimeConfig:
     # короткий останов после квитирования аварии перед рестартом (sim-мин)
     ack_off_min: int = 3;       ack_off_max: int = 8
 
-    # воспроизводимость: общий мастер-сид; на насос — производный поток
+    # воспроизводимость: общий мастер-сид; на насос - производный поток
     master_seed: int = 2026
 
 
 @dataclass
 class _PumpRuntime:
     """Состояние одного насоса: AR(1)-память + позиция в цикле State Machine."""
+
     pump_id: str
     rng: np.random.Generator
-    # AR(1)-состояние (храним НЕокруглённым — как self.last_* в оригинале)
+    # AR(1)-состояние (храним НЕокруглённым - как self.last_* в оригинале)
     temp: float
     vib: float
     curr: float
@@ -135,7 +137,7 @@ class _PumpRuntime:
     # учёт исходов квитирования (для будущих метрик)
     ack_recovered: int = 0
     ack_restarted: int = 0
-    # первый рабочий цикл после старта симуляции — гарантированно без отказа
+    # первый рабочий цикл после старта симуляции - гарантированно без отказа
     first_cycle: bool = False
 
 
@@ -145,7 +147,7 @@ class LiveMultiPumpGenerator:
     def __init__(self,
                  pump_ids: Optional[List[str]] = None,
                  config: Optional[RealtimeConfig] = None,
-                 start_date: str = "2026-04-01 00:00:00"):
+                 start_date: str = SIM_START_DATE):
         self.cfg = config or RealtimeConfig()
         self.pump_ids = list(pump_ids if pump_ids is not None else PUMPS)
         self.clock = datetime.strptime(start_date, "%Y-%m-%d %H:%M:%S")
@@ -155,7 +157,7 @@ class LiveMultiPumpGenerator:
         for pid in self.pump_ids:
             self.pumps[pid] = self._make_pump(pid)
 
-    # инициализация насоса в устоявшейся Норме (первый цикл — без отказа)
+    # инициализация насоса в устоявшейся Норме (первый цикл - без отказа)
 
     def _make_pump(self, pid: str) -> _PumpRuntime:
         # производный сид: из PUMP_SEEDS, если есть, иначе из мастер-потока
@@ -169,7 +171,7 @@ class LiveMultiPumpGenerator:
             curr=_HEALTHY_FIXED["current"] + rng.normal(0, 0.8),
             press=_HEALTHY_FIXED["pressure"] + rng.normal(0, 0.018),
         )
-        # старт симуляции — с ПУСКА оборудования (а не из середины работы):
+        # старт симуляции - с ПУСКА оборудования (а не из середины работы):
         # Пуск → Норма. Параметры не «появляются изнеоткуда». Первый рабочий
         # цикл гарантированно без отказа (флаг снимается в STARTUP→HEALTHY).
         p.state = STARTUP
@@ -186,7 +188,7 @@ class LiveMultiPumpGenerator:
         for pid in self.pump_ids:
             self.pumps[pid] = self._make_pump(pid)
 
-    # ---- переходы State Machine (тайминги/вероятности — из RealtimeConfig) ----
+    # переходы State Machine (тайминги/вероятности - из RealtimeConfig) 
 
     def _enter_next_state(self, p: _PumpRuntime) -> None:
         cfg, rng = self.cfg, p.rng
@@ -209,7 +211,7 @@ class LiveMultiPumpGenerator:
             p.press = _HEALTHY_FIXED["pressure"] + rng.normal(0, 0.018)
             if p.first_cycle:
                 p.first_cycle = False
-                p.cycle_is_failure = False        # первый рабочий цикл — без отказа
+                p.cycle_is_failure = False # первый рабочий цикл - без отказа
             else:
                 p.cycle_is_failure = bool(rng.random() < cfg.p_fault)
             if p.cycle_is_failure:
@@ -238,6 +240,7 @@ class LiveMultiPumpGenerator:
 
     def _begin_degradation(self, p: _PumpRuntime) -> None:
         """Готовит linspace-тренды деградации (один-в-один с data_generator)."""
+
         cfg, rng = self.cfg, p.rng
         dur = int(rng.integers(cfg.degradation_min, cfg.degradation_max))
         p.state = DEGRADATION
@@ -254,13 +257,13 @@ class LiveMultiPumpGenerator:
         else:  # electrical
             p.deg_trends = {"curr": ln(50.0, 72.0, dur)}
 
-    # ---- эмиссия одной минуты по текущему состоянию (формулы из оригинала) ----
+    # эмиссия одной минуты по текущему состоянию (формулы из оригинала) 
 
     def _emit(self, p: _PumpRuntime, ts: datetime) -> dict:
         rng = p.rng
         ft = "none"
         a_vib = a_temp = a_curr = 0
-        # выбросы-аномалии: ТОЛЬКО в выводе строки, AR(1)-память не трогаем
+        # выбросы-аномалии: ТОЛЬКО в выводе строки, AR(1)-память не трогает
         vib_out = temp_out = curr_out = None
 
         if p.state == HEALTHY:
@@ -269,9 +272,9 @@ class LiveMultiPumpGenerator:
             p.curr = p.curr * 0.9 + 50.0 * 0.1 + rng.normal(0, 0.8)
             p.press = p.press * 0.85 + 1.5 * 0.15 + rng.normal(0, 0.018)
             # Аппаратный сбой датчика: разовый выброс ТОЛЬКО в выводе строки,
-            # AR(1)-память не трогаем — иначе при поднятой частоте аномалий
+            # AR(1)-память не трогаем - иначе при поднятой частоте аномалий
             # базовая линия Healthy «уплывает» (ток/вибрация выше номинала).
-            # Это и физичнее: глитч датчика — мгновенное ложное показание.
+            # Это и физичнее: глитч датчика - мгновенное ложное показание.
             if rng.random() <= self.cfg.anomaly_rate:
                 sensor = rng.choice(np.array(["vib", "temp", "curr"], dtype=object))
                 if sensor == "vib":
@@ -312,7 +315,7 @@ class LiveMultiPumpGenerator:
                 p.vib = t["vib"][i] + rng.normal(0, 0.3)
                 p.curr = p.curr * 0.9 + 50.0 * 0.1 + rng.normal(0, 1.0)
                 p.press = t["press"][i] + rng.normal(0, 0.08)
-            else:  # electrical
+            else: # electrical
                 p.temp = p.temp * 0.9 + 72.0 * 0.1 + rng.normal(0, 0.6)
                 p.vib = p.vib * 0.88 + 2.0 * 0.12 + rng.normal(0, 0.15)
                 spike = rng.normal(0, 6.0) if rng.random() < 0.1 else 0.0
@@ -332,7 +335,7 @@ class LiveMultiPumpGenerator:
                 p.vib = p.vib * 0.8 + 9.0 * 0.2 + rng.normal(0, 0.5)
                 p.curr = p.curr * 0.9 + 52.0 * 0.1 + rng.normal(0, 1.0)
                 p.press = p.press * 0.8 + 0.7 * 0.2 + rng.normal(0, 0.06)
-            else:  # electrical
+            else: # electrical
                 p.temp = p.temp * 0.9 + 75.0 * 0.1 + rng.normal(0, 0.8)
                 p.vib = p.vib * 0.85 + 2.2 * 0.15 + rng.normal(0, 0.2)
                 p.curr = p.curr * 0.8 + 95.0 * 0.2 + rng.normal(0, 3.5)
@@ -356,7 +359,7 @@ class LiveMultiPumpGenerator:
             "anomaly_current": a_curr,
         }
 
-    # ---- публичное API ----
+    # публичное API 
 
     def step(self) -> List[dict]:
         """Один тик: по строке на каждый насос (единый timestamp), затем +1 мин."""
@@ -364,8 +367,8 @@ class LiveMultiPumpGenerator:
         rows: List[dict] = []
         for pid in self.pump_ids:
             p = self.pumps[pid]
-            if not p.halted:                       # #5: остановленный по аварии
-                if p.remaining <= 0:               # не переходит дальше — держим Off
+            if not p.halted: # остановленный по аварии
+                if p.remaining <= 0: # не переходит дальше - остаётся Off
                     self._enter_next_state(p)
             rows.append(self._emit(p, ts))
             if not p.halted:
@@ -376,7 +379,7 @@ class LiveMultiPumpGenerator:
 
     def trip(self, pump_id: str) -> None:
         """Защитный останов по ПОДТВЕРЖДЕНИЮ аварии моделью. Вызывается приложением
-        при срабатывании FSM stage=2 — то есть ПОСЛЕ того, как модель увидела
+        при срабатывании FSM stage=2 - то есть ПОСЛЕ того, как модель увидела
         аварию (а не по внутренней истине генератора). Насос уходит в Off и
         держится там до квитирования, не перезапускаясь автоматически (#5)."""
         p = self.pumps.get(pump_id)
@@ -391,7 +394,7 @@ class LiveMultiPumpGenerator:
     def acknowledge(self, pump_id: str) -> Optional[str]:
         """Квитирование по текущему физическому состоянию насоса.
 
-        Возвращает 'recovered' / 'continues' / 'restarted' / None — для метрик.
+        Возвращает 'recovered' / 'continues' / 'restarted' / None - для метрик.
         """
         p = self.pumps.get(pump_id)
         if p is None:
@@ -405,14 +408,14 @@ class LiveMultiPumpGenerator:
             p.cycle_is_failure = False
             p.fault = None
             p.deg_trends = {}
-            p.first_cycle = True       # рестарт = чистый пуск: первый цикл гарантированно
-                                       # без отказа (как старт симуляции и как в датасете)
+            p.first_cycle = True    # рестарт = чистый пуск: первый цикл гарантированно
+                                    # без отказа (как старт симуляции и как в датасете)
             p.remaining = int(rng.integers(self.cfg.ack_off_min, self.cfg.ack_off_max))
             p.ack_restarted += 1
             return "restarted"
         if p.state == DEGRADATION:
             if rng.random() < self.cfg.warning_recovery_prob:
-                # реальное устранение: возврат в Норму, AR(1) сам стянет значения
+                # реальное устранение: возврат в Норму
                 p.state = HEALTHY
                 p.cycle_is_failure = False
                 p.fault = None
@@ -421,7 +424,7 @@ class LiveMultiPumpGenerator:
                                                self.cfg.healthy_norm_max))
                 p.ack_recovered += 1
                 return "recovered"
-            return "continues"            # ложное квитирование — деградация идёт
+            return "continues" # ложное квитирование - деградация продолжается
         return None
 
 
@@ -461,7 +464,7 @@ if __name__ == "__main__":
           int(df[["anomaly_vibration", "anomaly_temperature",
                   "anomaly_current"]].sum().sum()))
 
-    # проверка квитирования: ставим насос в Degradation/Critical и квитируем
+    # проверка квитирования: ставит насос в Degradation/Critical и квитирует
     gp = gen.pumps[gen.pump_ids[0]]
     gp.state = DEGRADATION; gp.fault = "overheat"; gp.remaining = 50
     outcomes = {gen.acknowledge(gen.pump_ids[0]) for _ in range(1)}

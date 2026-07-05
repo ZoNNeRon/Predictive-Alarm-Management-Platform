@@ -4,13 +4,13 @@
 Ответственность модуля: математическое объяснение прогнозов двух моделей.
  
 Иерархия объяснений:
-  1. Модель ТЯЖЕСТИ (severity, 0/1/2) — SHAP объясняет «почему авария»:
+  1. Модель ТЯЖЕСТИ (severity, 0/1/2) - SHAP объясняет «почему авария»:
      какие признаки толкают агрегат к классу «Авария».
-  2. Модель ТИПА отказа (overheat/cavitation/electrical) — SHAP объясняет
+  2. Модель ТИПА отказа (overheat/cavitation/electrical) - SHAP объясняет
      «почему именно этот тип»: какие признаки определили выбор типа.
  
-Модель ничего не знает об агентах, промптах и RAG — это намеренно.
-На выходе — строго типизированный SymptomVector, который агентный модуль
+Модель ничего не знает об агентах, промптах и RAG - это намеренно.
+На выходе - строго типизированный SymptomVector, который агентный модуль
 использует для построения промпта.
 """
 
@@ -22,9 +22,8 @@ import os
 import sys
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Any, List, Optional, cast
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(_THIS_DIR))
 for _p in (_THIS_DIR, _PROJECT_ROOT):
@@ -36,7 +35,6 @@ from src.visualisation.xai_visualisation import (plot_severity_waterfall,
                                                  plot_severity_summary_by_fault_type,
                                                  plot_fault_waterfall, 
                                                  plot_fault_summary_by_type)
-
 
 # Типы данных
 
@@ -59,7 +57,7 @@ class SymptomContribution:
 @dataclass
 class SymptomVector:
     """
-    Структурированный вектор симптомов — выход XAIExplainer.
+    Структурированный вектор симптомов - выход XAIExplainer.
     Передаётся в агентный модуль для построения промпта и RAG-запроса.
     """
 
@@ -88,21 +86,22 @@ class XAIExplainer:
     Принимает строку признаков и возвращает SymptomVector с SHAP-значениями
     модели тяжести и (если состояние нештатное) модели типа отказа.
 
-    Промпты, RAG, форматирование для UI — в агентном модуле.
+    Промпты, RAG, форматирование для UI - в агентном модуле.
     """
 
     def __init__(self, model_path: str, fault_model_path: str):
         """
         Args:
-            model_path:       путь к модели ТЯЖЕСТИ (xgboost_pump_model.joblib).
+            model_path:       путь к модели ТЯЖЕСТИ (severity_xgboost_model.joblib).
             fault_model_path: путь к модели ТИПА отказа (fault_xgboost_model.joblib).
-                              Если None/не найден — объяснение типа отключается
+                              Если None/не найден - объяснение типа отключается
                               (inferred_fault='unknown'), модуль продолжает работать.
         """
 
         if not os.path.exists(model_path):
             raise FileNotFoundError(
-                f"Модель не найдена: {model_path}. Сначала запустите ml_pipeline.py"
+                f"Модель не найдена: {model_path}. "
+                f"Сначала запустите severity_classifier_pipeline.py"
             )
         self.model = joblib.load(model_path)
         # TreeExplainer: оптимизирован для деревьев, не требует background data
@@ -116,7 +115,7 @@ class XAIExplainer:
             self.fault_model = joblib.load(fault_model_path)
             self.fault_explainer = shap.TreeExplainer(self.fault_model)
         else:
-            print("[WARN] Модель типа отказа не загружена — тип будет 'unknown'. "
+            print("[WARN] Модель типа отказа не загружена - тип будет 'unknown'. "
                   "Запустите fault_classifier_pipeline.py и передайте fault_model_path.")
 
     # Вспомогательное: сборка вкладов признаков из вектора SHAP
@@ -153,7 +152,7 @@ class XAIExplainer:
         """
         
         obj = explainer(feature_row)
-        return obj.values[0, :, class_idx]  # type: ignore
+        return obj.values[0, :, class_idx]
 
     # Объяснение модели типа отказа
 
@@ -182,12 +181,12 @@ class XAIExplainer:
     # Главный метод
 
     def explain_prediction(self, feature_row: pd.DataFrame, pump_id: str = "Unknown",
-                           timestamp: str = None, true_fault: str = "unknown",  # type: ignore
+                           timestamp: Optional[str] = None, true_fault: str = "unknown",
                            top_k: int = 5) -> SymptomVector:
         """
         Объясняет прогноз обеих моделей.
 
-        timestamp обязателен: время возникновения инцидента — значимое
+        timestamp обязателен: время возникновения инцидента - значимое
         диагностическое данное, заглушки недопустимы.
         """
 
@@ -199,14 +198,16 @@ class XAIExplainer:
         predicted_class = int(np.argmax(probabilities))
         critical_prob = probabilities[self.target_class_idx]
 
-        # 2. SHAP модели тяжести по классу «Авария» («почему авария»)
-        base_val = (self.explainer.expected_value[self.target_class_idx]
-                    if isinstance(self.explainer.expected_value, (list, np.ndarray))
-                    else self.explainer.expected_value)
+        # 2. SHAP модели тяжести по классу «Авария» («почему авария»).
+        # expected_value TreeExplainer: скаляр (бинарная модель) либо массив баз
+        # по классам (мультикласс). cast(Any) - shap не типизирован; np.asarray+ravel
+        # приводит к 1-D, берётся база класса «Авария».
+        ev = np.asarray(cast(Any, self.explainer.expected_value), dtype=float).ravel()
+        base_val = float(ev[self.target_class_idx] if ev.size > 1 else ev[0])
         shap_vals_critical = self._shap_for_class(self.explainer, feature_row, self.target_class_idx)
         top_symptoms = self._build_contributions(feature_row, shap_vals_critical)[:top_k]
 
-        # 3. Модель типа: запускаем только на нештатных состояниях (Warning или Авария)
+        # 3. Модель типа: запускается только на нештатных состояниях (Warning или Авария)
         inferred_fault, fault_probabilities, fault_confidence, fault_top_symptoms = \
             ("unknown", [], 0.0, [])
         if predicted_class != 0:
@@ -220,7 +221,7 @@ class XAIExplainer:
             predicted_class=predicted_class,
             probabilities=[float(p) for p in probabilities],
             critical_probability=round(critical_prob * 100, 1),
-            shap_base_value=round(base_val, 4), # type: ignore
+            shap_base_value=round(base_val, 4),
             top_symptoms=top_symptoms,
             inferred_fault=inferred_fault,
             true_fault=true_fault,
@@ -249,10 +250,10 @@ if __name__ == "__main__":
 
     critical_cases = df[df['target'] == 2]
     if len(critical_cases) == 0:
-        print("В данных нет аварийных строк — проверьте датасет.")
+        print("В данных нет аварийных строк - проверьте датасет.")
         exit(1)
     if 'timestamp' not in critical_cases.columns:
-        raise KeyError("В датасете нет колонки 'timestamp' — проверьте препроцессор.")
+        raise KeyError("В датасете нет колонки 'timestamp' - проверьте препроцессор.")
 
     preprocessor = DataPreprocessor(window_sizes=[15, 30, 60])
     feature_cols = preprocessor.FEATURE_COLS
@@ -294,7 +295,7 @@ if __name__ == "__main__":
     print("Построение SHAP Beeswarm модели тяжести по типам аварий...")
     plot_severity_summary_by_fault_type(xai, df, feature_cols, plots_dir, max_display=15)
 
-    # Тест 4: объяснения модели ТИПА — waterfall и beeswarm по типам
+    # Тест 4: объяснения модели ТИПА - waterfall и beeswarm по типам
     print("\nПостроение объяснений модели ТИПА отказа...")
     plot_fault_waterfall(xai, sample_row, pump_id=pump_id_val,
                          save_path=os.path.join(plots_dir, 

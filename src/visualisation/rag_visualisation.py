@@ -1,17 +1,43 @@
 """
 Блок визуализации RAG-базы знаний
 =================================
-Три графика для диплома, вынесенные из KnowledgeBaseManager (SRP):
-  1. Состав базы знаний — доля чанков по типам документов (pie chart)
-  2. Распределение длин чанков — boxplot + strip plot по типам
-  3. Качество семантического поиска — L2-расстояния и доля релевантных результатов
+src/visualisation/rag_visualisation.py
 
-Вызов из rag_database.py:
-    from rag_visualisation import plot_all_rag
-    plot_all_rag(kb.chroma_dir, kb.embeddings, kb.EMBED_MODEL, test_queries, plots_dir)
+Строит пять графиков для оценки базы знаний (ChromaDB) и извлекающего
+пайплайна KnowledgeBaseManager. Вынесены из менеджера базы в отдельный 
+модуль по принципу SRP: логика RAG не зависит от matplotlib/seaborn.
 
-Автономный запуск:
-    python rag_visualisation.py
+Две группы графиков:
+
+- Статистика базы и поиска - работают напрямую с коллекцией ChromaDB
+  (chroma_dir + embeddings):
+  - plot_knowledge_base_stats - состав базы: доля чанков по типам документов
+    (doc_type), pie chart.
+  - plot_chunk_length_distribution - распределение длин чанков по типам
+    (boxplot + strip plot); красные линии - целевой chunk_size из
+    CHUNK_CONFIG, валидирует корректность чанкинга.
+  - plot_retrieval_quality - качество семантического поиска по тестовым
+    запросам: L2-расстояния (boxplot) и доля результатов ниже
+    RELEVANCE_THRESHOLD (bar chart).
+
+- Покрытие реальным пайплайном - вызывают методы kb (те же четыре
+  канала, что и агент: справочный контекст + действия оператора + работы ТОиР +
+  график ТО) на репрезентативных входах по каждому типу отказа
+  (overheat / cavitation / electrical):
+  - plot_fault_coverage_heatmap - матрица Категория отказа × Тип документа:
+    сколько чанков каждого doc_type извлёк пайплайн.
+  - plot_fault_section_sourcing - матрица Категория отказа × Раздел ответа
+    агента: какие doc_type питают каждый из четырёх каналов (разделение
+    источников).
+
+Выходные PNG именуются с префиксом rag_plot1-5_* (см. artifacts/graphs/).
+Пороги и конфигурация берутся из config.settings DOC_TYPES,
+CHUNK_CONFIG, RELEVANCE_THRESHOLD, EMBED_MODEL).
+
+Бэкенд matplotlib принудительно Agg (без GUI) - для серверного прогона
+скриптов. Точка входа plot_all_rag(kb, test_queries, save_dir) строит все
+пять графиков за один вызов; вызывается из src/rag/rag_database.py
+(батч-прогон __main__).
 """
 
 import os
@@ -32,8 +58,8 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(_THIS_DIR))
 for _p in (_THIS_DIR, _PROJECT_ROOT):
     if _p not in sys.path:
         sys.path.insert(0, _p)
-from config.settings import DOC_TYPES, CHUNK_CONFIG, RELEVANCE_THRESHOLD, EMBED_MODEL
-
+from config.settings import (DOC_TYPES, DOC_TYPE_SHORT_RU, CHUNK_CONFIG,
+                             RELEVANCE_THRESHOLD, EMBED_MODEL)
 
 # Вспомогательная функция поиска
 
@@ -50,20 +76,20 @@ def _search(chroma_dir: str, embeddings, query: str, k: int = 3) -> list:
 def plot_knowledge_base_stats(chroma_dir: str, embeddings, save_dir: str):
     """
     График 1: Состав базы знаний.
-    Доля чанков по типам документов — демонстрирует покрытие базы знаний.
+    Доля чанков по типам документов - демонстрирует покрытие базы знаний.
     """
 
     db = Chroma(persist_directory=chroma_dir, embedding_function=embeddings)
     all_meta = db._collection.get()['metadatas']
 
     if not all_meta:
-        print("[WARN] База пуста — нечего визуализировать.")
+        print("[WARN] База пуста - нечего визуализировать.")
         return
 
     type_counts: Dict[str, int] = {}
     for m in all_meta:
-        dt = m.get('doc_type', 'unknown')
-        type_counts[dt] = type_counts.get(dt, 0) + 1  # type: ignore
+        dt = str(m.get('doc_type', 'unknown'))
+        type_counts[dt] = type_counts.get(dt, 0) + 1
 
     all_colors = ['#4C72B0', '#55A868', '#C44E52', '#8172B2', '#CCB974']
     sorted_items = sorted(type_counts.items(), key=lambda x: x[1], reverse=True)
@@ -72,20 +98,25 @@ def plot_knowledge_base_stats(chroma_dir: str, embeddings, save_dir: str):
     colors = all_colors[:len(labels)]
 
     fig, ax = plt.subplots(figsize=(8, 7))
-    wedges, texts, autotexts = ax.pie(  # type: ignore
+    # autopct задан → pie возвращает (wedges, texts, autotexts); распаковываем
+    # через *rest, чтобы не зависеть от арности, объявленной в стабах matplotlib.
+    wedges, _texts, *rest = ax.pie(
         sizes, labels=None, autopct='%1.1f%%',
         colors=colors, startangle=90, counterclock=False,
         pctdistance=0.82, wedgeprops={'edgecolor': 'white', 'linewidth': 1.5}
     )
+    autotexts = rest[0] if rest else []
     for at in autotexts:
         at.set_fontsize(11)
         at.set_fontweight('bold')
-    ax.legend(wedges, [f"{l}\n({s} чанков)" for l, s in zip(labels, sizes)],
-              loc='lower center', bbox_to_anchor=(0.5, -0.22),
-              fontsize=9, framealpha=0.8)
+    # Легенда - единым столбцом (по одному документу в ряд) между названием и
+    # пайчартом; полные названия типов слишком длинны для горизонтальной полосы.
+    ax.legend(wedges, [f"{l} ({s} чанков)" for l, s in zip(labels, sizes)],
+              loc='lower center', bbox_to_anchor=(0.5, 1.0),
+              ncol=1, fontsize=9, framealpha=0.8)
     ax.set_title(
         f'Состав базы знаний RAG-системы\n(всего чанков: {sum(sizes)})',
-        fontsize=13, fontweight='bold', pad=6
+        fontsize=13, fontweight='bold', pad=95
     )
     os.makedirs(save_dir, exist_ok=True)
     path = os.path.join(save_dir, 'rag_plot1_kb_composition.png')
@@ -107,10 +138,12 @@ def plot_chunk_length_distribution(chroma_dir: str, embeddings, save_dir: str):
         print("[WARN] База пуста.")
         return
 
+    documents = collection['documents'] or []
+    metadatas = collection['metadatas'] or []
     docs_by_type: Dict[str, List[int]] = {}
-    for doc_text, meta in zip(collection['documents'], collection['metadatas']):  # type: ignore
+    for doc_text, meta in zip(documents, metadatas):
         clean = doc_text.replace('passage: ', '', 1)
-        dt = meta.get('doc_type', 'unknown')
+        dt = str(meta.get('doc_type', 'unknown'))
         docs_by_type.setdefault(dt, []).append(len(clean))
 
     fig, ax = plt.subplots(figsize=(11, 6))
@@ -136,10 +169,13 @@ def plot_chunk_length_distribution(chroma_dir: str, embeddings, save_dir: str):
                    color=palette[(i - 1) % len(palette)],
                    edgecolor='black', s=22, zorder=3, alpha=0.8)
 
-    for dt in types_sorted:
+    # Целевой chunk_size - вертикальной пунктирной линией цвета своего боксплота,
+    # чтобы было видно, к какому типу документа относится каждая граница.
+    for i, dt in enumerate(types_sorted):
         cfg = CHUNK_CONFIG.get(dt)
         if cfg:
-            ax.axvline(cfg['chunk_size'], color='red', lw=1.0, ls='--', alpha=0.4)
+            ax.axvline(cfg['chunk_size'], color=palette[i % len(palette)],
+                       lw=1.8, ls='--', alpha=0.9)
 
     ax.set_xlabel('Длина чанка (символов)', fontsize=11)
     ax.set_title('Распределение длин текстовых фрагментов (чанков)\n'
@@ -191,13 +227,13 @@ def plot_retrieval_quality(chroma_dir: str, embeddings,
     for patch, color in zip(bp['boxes'], colors_box):
         patch.set_facecolor(color)
         patch.set_alpha(0.7)
-    axes[0].axhline(RELEVANCE_THRESHOLD, color='orange', ls='--', lw=1.5,
-                    label=f'Порог релевантности ({RELEVANCE_THRESHOLD})')
-    axes[0].set_ylabel('L2-расстояние (меньше = лучше)', fontsize=10)
+    # Порог релевантности не рисуется - предел по Y выбирается автоматически по
+    # данным, чтобы боксплоты и их значения читались во всём диапазоне.
+    axes[0].set_ylabel('L2-расстояние (меньше = лучше)', fontsize=14)
     axes[0].set_title('Расстояния поиска по тестовым запросам\n'
-                      '(ниже порога = релевантный результат)', fontsize=11, fontweight='bold')
-    axes[0].legend(fontsize=9)
-    axes[0].tick_params(axis='x', rotation=25)
+                      '(меньше расстояние - точнее совпадение)',
+                      fontsize=15, fontweight='bold')
+    axes[0].tick_params(axis='x', rotation=25, labelsize=12)
     axes[0].grid(axis='y', alpha=0.35, ls='--')
 
     df['relevant'] = df['distance'] <= RELEVANCE_THRESHOLD
@@ -209,10 +245,10 @@ def plot_retrieval_quality(chroma_dir: str, embeddings,
     axes[1].axhline(100, color='green', ls='--', lw=1.2, 
                     alpha=0.5, label='100% релевантность')
     axes[1].set_ylim(0, 115)
-    axes[1].set_ylabel('% релевантных результатов', fontsize=10)
+    axes[1].set_ylabel('% релевантных результатов', fontsize=14)
     axes[1].set_title('Доля релевантных результатов\nпо каждому тестовому сценарию',
-                      fontsize=11, fontweight='bold')
-    axes[1].tick_params(axis='x', rotation=25)
+                      fontsize=15, fontweight='bold')
+    axes[1].tick_params(axis='x', rotation=25, labelsize=12)
     axes[1].grid(axis='y', alpha=0.35, ls='--')
     for bar, val in zip(bars, summary.values):
         axes[1].text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 2,
@@ -220,7 +256,7 @@ def plot_retrieval_quality(chroma_dir: str, embeddings,
 
     plt.suptitle(f'Оценка качества семантического поиска RAG-системы\n'
                  f'Модель эмбеддингов: {embed_model_name}',
-                 fontsize=12, fontweight='bold', y=1.02)
+                 fontsize=16, fontweight='bold', y=1.02)
     plt.tight_layout()
     os.makedirs(save_dir, exist_ok=True)
     path = os.path.join(save_dir, 'rag_plot3_retrieval_quality.png')
@@ -231,13 +267,12 @@ def plot_retrieval_quality(chroma_dir: str, embeddings,
 
 def plot_fault_coverage_heatmap(kb, save_dir: str):
     """
-    Матрица: строки = типы отказов, столбцы = типы документов (doc_type).
-    Значение = число чанков данного doc_type, извлечённых РЕАЛЬНЫМ пайплайном
-    (справочный контекст + действия оператора + работы ТОиР + график ТО) для
-    репрезентативного входа по каждому типу отказа.
- 
-    В отличие от прежней версии (3 обобщённых запроса), здесь heatmap отражает
-    фактическое покрытие всех четырёх частей ответа агента.
+    График 4: Матрица покрытия базы знаний (Категория отказа × Тип документа).
+    Строки - типы отказов, столбцы - типы нормативных документов; значение в
+    ячейке - сколько чанков этого типа извлёк реальный 4-канальный пайплайн
+    (справочный контекст + действия оператора + работы ТОиР + график ТО) на
+    репрезентативном входе по данному типу отказа. Показывает, какими
+    документами обеспечен каждый сценарий диагностики.
     """
 
     # Репрезентативные входы по типам отказа (сигнатуры из tm_regulation.md).
@@ -273,8 +308,8 @@ def plot_fault_coverage_heatmap(kb, save_dir: str):
             },
         },
     }
-    # График ТО извлекается lookup'ом по pump_id и не зависит от типа отказа —
-    # берём представительный агрегат с ближайшим предиктивным риском.
+    # График ТО извлекается lookup'ом по pump_id и не зависит от типа отказа -
+    # берётся представительный агрегат с ближайшим предиктивным риском.
     PROBE_PUMP_ID = 'MNHV_005'
  
     # Фиксированный порядок столбцов: gost и schedule присутствуют всегда.
@@ -300,7 +335,10 @@ def plot_fault_coverage_heatmap(kb, save_dir: str):
     df_heatmap = (pd.DataFrame(coverage).T
                   .reindex(columns=doc_type_order)
                   .fillna(0).astype(int))
- 
+    # Русские подписи столбцов вместо технических doc_type-ключей.
+    df_heatmap = df_heatmap.rename(
+        columns=lambda c: DOC_TYPE_SHORT_RU.get(c, c))
+
     # Визуализация (светлая академическая тема, как в исходнике).
     LIGHT_BG, TEXT_CLR = '#FFFFFF', '#222222'
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -311,13 +349,13 @@ def plot_fault_coverage_heatmap(kb, save_dir: str):
         df_heatmap, annot=True, fmt='d', cmap='Blues',
         linewidths=1, linecolor='#DDDDDD',
         cbar_kws={'label': 'Кол-во чанков, извлечённых пайплайном'},
-        ax=ax, annot_kws={'size': 12, 'weight': 'bold'},
+        ax=ax, annot_kws={'size': 14, 'weight': 'bold'},
     )
-    ax.set_title('Матрица покрытия базы знаний (Fault Type × Doc Type)\n'
+    ax.set_title('Матрица покрытия базы знаний (Категория отказа × Тип документа)\n'
                  'Реальный 4-канальный пайплайн: контекст + предписание + ТОиР + график',
                  color=TEXT_CLR, fontsize=14, fontweight='bold', pad=15)
     ax.set_ylabel('Категория отказа', color=TEXT_CLR, fontsize=12, fontweight='bold')
-    ax.set_xlabel('Тип нормативного документа (doc_type)',
+    ax.set_xlabel('Тип нормативного документа',
                   color=TEXT_CLR, fontsize=12, fontweight='bold')
     ax.tick_params(colors=TEXT_CLR, labelsize=11)
     plt.yticks(rotation=0)
@@ -331,9 +369,11 @@ def plot_fault_coverage_heatmap(kb, save_dir: str):
 
 def plot_fault_section_sourcing(kb, save_dir: str):
     """
-    Строки = типы отказов; столбцы = 4 раздела ответа агента.
-    В ячейке — какой(ие) doc_type извлечены реальным каналом пайплайна и сколько
-    чанков. Цвет — число чанков. Демонстрирует разделение источников по разделам.
+    График 5: Источники по разделам ответа (Категория отказа × Раздел ответа).
+    Строки - типы отказов, столбцы - четыре раздела ответа агента. В ячейке -
+    какие типы документов извлёк соответствующий канал пайплайна и сколько
+    чанков; цвет кодирует число чанков. Показывает разделение источников по
+    разделам (предписание/ТОиР - из регламента, график - из расписания).
     """
 
     FAULT_PROBES = {
@@ -375,12 +415,14 @@ def plot_fault_section_sourcing(kb, save_dir: str):
             'График\nТО':           kb.search_maintenance_schedule(PROBE_PUMP_ID, k=2),
         }
         for sec, res in channels.items():
-            dts = [d.metadata.get('doc_type', 'unknown') for d, _ in res]
+            dts = [str(d.metadata.get('doc_type', 'unknown')) for d, _ in res]
             counts.loc[fault, sec] = len(dts)
             uniq = sorted(set(dts))
-            # Каждый doc_type — на своей строке (чтобы подпись не выходила за ячейку).
-            annot.loc[fault, sec] = ('\n'.join(uniq) + f"\n({len(dts)} чанк.)"
-                                     if dts else '—')
+            # Русское имя каждого типа - на своей строке (чтобы подпись не
+            # выходила за границы ячейки).
+            names_ru = [DOC_TYPE_SHORT_RU.get(x, x) for x in uniq]
+            annot.loc[fault, sec] = ('\n'.join(names_ru) + f"\n({len(dts)} чанк.)"
+                                     if dts else '-')
  
     LIGHT_BG, TEXT_CLR = '#FFFFFF', '#222222'
     fig, ax = plt.subplots(figsize=(11, 6))
@@ -389,9 +431,9 @@ def plot_fault_section_sourcing(kb, save_dir: str):
     sns.heatmap(counts, annot=annot.values, fmt='', cmap='Blues', vmin=0,
                 linewidths=1, linecolor='#DDDDDD',
                 cbar_kws={'label': 'Число извлечённых чанков'},
-                annot_kws={'size': 10, 'weight': 'bold'}, ax=ax)
-    ax.set_title('Источники по разделам предписания (Fault Type x Раздел ответа)\n'
-                 'Разделение источников: предписание/ТОиР — регламент, график — расписание',
+                annot_kws={'size': 12, 'weight': 'bold'}, ax=ax)
+    ax.set_title('Источники по разделам предписания (Категория отказа × Раздел ответа)\n'
+                 'Разделение источников: предписание/ТОиР - регламент, график - расписание',
                  color=TEXT_CLR, fontsize=13, fontweight='bold', pad=14)
     ax.set_ylabel('Категория отказа', color=TEXT_CLR, fontsize=12, fontweight='bold')
     ax.set_xlabel('Раздел ответа агента', color=TEXT_CLR, fontsize=12, fontweight='bold')
@@ -403,7 +445,6 @@ def plot_fault_section_sourcing(kb, save_dir: str):
     plt.savefig(p, dpi=150, bbox_inches='tight', facecolor=LIGHT_BG)
     plt.close(fig)
     print(f"График 5 сохранён: {p}")
-
 
 # Точка входа (все три графика за один вызов)
 

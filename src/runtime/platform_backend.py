@@ -1,27 +1,29 @@
 """
+Адаптер UI ↔ аналитическое ядро (Platform Backend)
+==================================================
+src/runtime/platform_backend.py
+
 Единственная точка интеграции интерфейса с аналитическим ядром.
 
-Дашборды (app.py) НЕ импортируют ml_pipeline / xai_module / rag_database /
-ai_agent напрямую — только этот адаптер. Поэтому:
-  * замена источника данных (демо-CSV -> реальная SCADA) не трогает UI;
-  * изменение сигнатур внутренних модулей локализовано в одном файле;
-  * UI тестируем без поднятых Ollama/ChromaDB (см. ProtoBackend ниже).
-
-РАСПОЛОЖЕНИЕ: src/app/. Project root = три уровня вверх. На sys.path
-кладём И корень (для пакетов config / validation / src.*), И src/
-(для «голых» импортов data_preprocessor, как внутри самого ml_pipeline).
+Дашборды (app.py) НЕ импортируют severity_classifier_pipeline / xai_module /
+rag_database / ai_agent напрямую - только этот адаптер. Поэтому:
+  - замена источника данных (демо-CSV -> реальная SCADA) не трогает UI;
+  - изменение сигнатур внутренних модулей локализовано в одном файле;
+  - UI тестируем без поднятых Ollama/ChromaDB (см. ProtoBackend ниже).
 """
 
 import os
 import sys
+import time
+import tempfile
 from dataclasses import dataclass
-from typing import Iterator, List, Optional, Tuple
+from types import SimpleNamespace
+from typing import Dict, Iterator, List, Optional, Tuple, cast
 
 import joblib
 import pandas as pd
-import tempfile
 
-# разрешение путей (файл лежит в src/app/) 
+# разрешение путей (файл лежит в src/runtime/)
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(_THIS_DIR))
 for _p in (_THIS_DIR, _PROJECT_ROOT):
@@ -34,13 +36,16 @@ from src.ml.severity_classifier_pipeline import AlarmManager
 from src.xai.xai_module import XAIExplainer
 from src.rag.rag_database import KnowledgeBaseManager, resolve_stage
 from src.agent.ai_agent import DiagnosticAgent
-from src.runtime.online_preprocessor import OnlinePreprocessor
+from src.runtime.online_preprocessor import OnlinePreprocessor, PARAMS, WINDOWS
+from src.visualisation.xai_visualisation import (plot_severity_waterfall,
+                                                 plot_fault_waterfall)
 
 _preprocessor = DataPreprocessor(window_sizes=WINDOW_SIZES)
 FEATURE_COLS = _preprocessor.FEATURE_COLS
 
-# Пороги для линий на трендах. Источник истины — config/settings;
-# значения ниже — fallback, совпадающий с нормативной базой работы.
+# Пороги для линий на трендах UI. Вибрация/температура дублируют
+# config.settings.THRESHOLDS (ГОСТ); ток/давление в ГОСТ не нормированы
+# (в settings - None), поэтому их уставки, единицы и источники заданы здесь.
 THRESHOLDS = {
     "vibration":   {"warning": 3.0,  "critical": 8.0,  "unit": "мм/с",
                     "source": "ГОСТ 32601-2013 / паспорт МНХВ"},
@@ -68,6 +73,8 @@ _DOC_DISPLAY = {
 
 
 def _doc_display(source: str) -> str:
+    """Имя файла-источника → читаемое название документа для трассировки (инженер)."""
+
     stem = os.path.splitext(os.path.basename(str(source)))[0]
     return _DOC_DISPLAY.get(stem, stem or "неизвестный источник")
 
@@ -89,6 +96,9 @@ class PlatformBackend:
     """Боевой адаптер: реальные модели, RAG и LLM-агент."""
 
     def __init__(self):
+        """Загружает модель тяжести + AlarmManager, XAIExplainer (обе модели),
+        базу знаний и LLM-агента; инициализирует потоковый препроцессор и кеши."""
+
         self.feature_cols = list(FEATURE_COLS)
         self.preproc = OnlinePreprocessor(self.feature_cols)
 
@@ -98,8 +108,8 @@ class PlatformBackend:
         _chroma_dir = os.path.join(_PROJECT_ROOT, 'artifacts', "chroma_db")
         _kb_dir = os.path.join(_PROJECT_ROOT, "knowledge_base")
 
-        # severity-модель грузим отдельно (нужна AlarmManager и для proba);
-        # XAIExplainer внутри сам грузит обе модели — fault_model берём у него.
+        # severity-модель грузится отдельно (нужна AlarmManager и для proba);
+        # XAIExplainer внутри сам грузит обе модели - fault_model берётся у него.
         self.severity_model = joblib.load(_sev_path)
         self.alarm_manager = AlarmManager(self.severity_model)
         self.xai = XAIExplainer(_sev_path, _fault_path)
@@ -111,15 +121,22 @@ class PlatformBackend:
         self._last_trace: List[dict] = []  # трасса последнего RAG-извлечения
 
     def process_tick(self, pump_id: str, raw_row: pd.Series) -> TickResult:
+        """Дешёвый инференс на один тик телеметрии (вызывается на каждой строке).
+
+        Считает признаки потоковым препроцессором, прогоняет модель тяжести с
+        контекстной фильтрацией (Off/Startup → 0) и, если состояние нештатное, -
+        классификатор типа отказа. Возвращает TickResult (ready=False на прогреве).
+        """
+
         raw = raw_row.to_dict() if hasattr(raw_row, "to_dict") else dict(raw_row)
-        feats = self.preproc.push(pump_id, raw) # type: ignore
+        feats = self.preproc.push(pump_id, cast(Dict[str, float], raw))
         if feats is None:
             return TickResult(ready=False)
         self._last_features[pump_id] = feats
 
         raw_state = int(raw_row.get("state", 2))
 
-        # контекстная фильтрация (Off/Startup -> 0); raw_pred — до фильтра
+        # контекстная фильтрация (Off/Startup -> 0); raw_pred - до фильтра
         severity = int(self.alarm_manager.predict_with_context(feats, raw_state))
         raw_pred = int(self.severity_model.predict(feats)[0])
         proba = self.severity_model.predict_proba(feats)[0].tolist()
@@ -133,7 +150,7 @@ class PlatformBackend:
             idx_to_name = {0: "overheat", 1: "cavitation", 2: "electrical"}
             fault_proba = {idx_to_name.get(int(c), str(c)): float(p)
                            for c, p in zip(classes, fp)}
-            fault_type = max(fault_proba, key=fault_proba.get)  # type: ignore
+            fault_type = max(fault_proba, key=lambda k: fault_proba[k])
 
         return TickResult(ready=True, severity=severity, raw_severity=raw_pred,
                           suppressed=suppressed, severity_proba=proba,
@@ -142,7 +159,7 @@ class PlatformBackend:
     def explain(self, pump_id: str, ts: str, severity: int):
         """SymptomVector для текущего инцидента (XAI обеих моделей).
 
-        severity не передаётся в XAI — модель тяжести сама вычисляет класс
+        severity не передаётся в XAI - модель тяжести сама вычисляет класс
         по predict_proba; аргумент оставлен в сигнатуре ради единого
         вызова из UI.
         """
@@ -201,16 +218,16 @@ class PlatformBackend:
                     "block": block,
                     "doc": _doc_display(meta.get("source", "")),
                     "distance": round(float(dist), 3) if dist is not None else None,
-                    "fault_type": meta.get("fault_type", "—"),
-                    "sop_part": meta.get("sop_part", "—"),
-                    "stage": meta.get("stage", "—"),
+                    "fault_type": meta.get("fault_type", "-"),
+                    "sop_part": meta.get("sop_part", "-"),
+                    "stage": meta.get("stage", "-"),
                 })
         return rows
 
     def prescription_stream(self, symptom_vector, stage: str) -> Iterator[str]:
         """Потоковая генерация предписания (Ollama stream=True).
 
-        stage in {'warning','critical'} — стадийная выборка действий оператора;
+        stage in {'warning','critical'} - стадийная выборка действий оператора;
         агент дополнительно резолвит стадию через resolve_stage(sv).
         """
 
@@ -222,7 +239,7 @@ class PlatformBackend:
     def retrieval_trace(self, symptom_vector, stage: str) -> List[dict]:
         """Трасса последнего извлечения (заполняется в prescription_stream).
 
-        Если стрим ещё не запускался — ретривим контекст здесь, чтобы
+        Если стрим ещё не запускался - контекст извлекается здесь, чтобы
         инженерная вкладка не пустовала.
         """
 
@@ -233,20 +250,20 @@ class PlatformBackend:
     def shap_figures(self, pump_id: str) -> Tuple[Optional[bytes], Optional[bytes]]:
         """PNG-байты waterfall-графиков (модель тяжести, модель типа) В ПАМЯТИ.
 
-        Рисуем во временный файл, читаем байты, файл сразу удаляем — на диск
-        ничего не оседает (artifacts/graphs не засоряется). UI показывает байты
-        через st.image. None — если график не построился.
+        График рисуется во временный файл, байты читаются, файл сразу удаляется -
+        на диск ничего не оседает (artifacts/graphs не засоряется). UI показывает
+        байты через st.image. None - если график не построился.
         """
+
         feats = self._last_features.get(pump_id)
         if feats is None:
             return None, None
-        try:
-            from src.visualisation.xai_visualisation import (plot_severity_waterfall,
-                                                             plot_fault_waterfall)
-        except Exception:
-            return None, None
 
         def _to_bytes(plot_fn):
+            """
+            Рисует один waterfall через временный файл и возвращает PNG-байты (или None).
+            """
+            
             tmp_path = None
             try:
                 with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
@@ -273,12 +290,13 @@ class ProtoBackend(PlatformBackend):
 
     Тяжесть и тип берутся из меток датасета (state, fault_type),
     предписание имитируется. Позволяет верстать и прогонять демо-сценарий
-    на любой машине. НЕ для защиты — только для разработки/вёрстки.
+    на любой машине. НЕ для защиты - только для разработки/вёрстки.
     """
 
-    def __init__(self):  # намеренно не зовём super().__init__
-        from src.runtime.online_preprocessor import (OnlinePreprocessor,
-                                                     PARAMS, WINDOWS)
+    def __init__(self):
+        """Лёгкая инициализация без моделей/RAG/Ollama: намеренно НЕ вызывает
+        super().__init__, поднимает только препроцессор и кеши для вёрстки UI."""
+
         cols = []
         for p in PARAMS:
             for w in WINDOWS:
@@ -291,7 +309,10 @@ class ProtoBackend(PlatformBackend):
         self._last_trace = []
 
     def process_tick(self, pump_id: str, raw_row: pd.Series) -> TickResult:
-        feats = self.preproc.push(pump_id, raw_row.to_dict())   # type: ignore
+        """Тик-заглушка: тяжесть и тип берутся из меток датасета (state, fault_type),
+        вероятности - фиксированные таблицы. ML не вызывается."""
+
+        feats = self.preproc.push(pump_id, cast(Dict[str, float], raw_row.to_dict()))
         if feats is None:
             return TickResult(ready=False)
         self._last_features[pump_id] = feats
@@ -312,9 +333,10 @@ class ProtoBackend(PlatformBackend):
                           severity_proba=proba, fault_type=ft, fault_proba=fp)
 
     def explain(self, pump_id, ts, severity):
-        # имитация SymptomVector ровно с теми полями, что у боевого (xai_module):
-        # UI читает probabilities[1] (drill-down предупреждения) — без него падает.
-        from types import SimpleNamespace
+        """Имитация SymptomVector ровно с теми полями, что читает UI (см. боевой
+        xai_module). Важно: UI обращается к probabilities[1] (drill-down
+        предупреждения) - без него экран падает."""
+
         label, ft = self._last_label.get(pump_id, (0, None))
         proba = [[0.97, 0.025, 0.005],
                  [0.10, 0.85, 0.05],
@@ -338,10 +360,12 @@ class ProtoBackend(PlatformBackend):
         return sym
 
     def prescription_stream(self, sv, stage):
-        import time
+        """Потоковая заглушка предписания: отдаёт фиксированный текст по словам
+        с задержкой, имитируя стриминг LLM (без обращения к Ollama)."""
+
         self._last_trace = self.retrieval_trace(sv, stage)
         text = (
-            "ДИАГНОЗ И ОБОСНОВАНИЕ: [имитация — ProtoBackend]\n\n"
+            "ДИАГНОЗ И ОБОСНОВАНИЕ: [имитация - ProtoBackend]\n\n"
             "ПРЕДПИСАНИЕ ОПЕРАТОРУ:\n1. Шаг 1…\n2. Шаг 2…\n\n"
             "РЕКОМЕНДАЦИИ ТОиР: …\n\nПЛАНОВЫЙ РЕМОНТ: …\n\n"
             "ИСТОЧНИКИ: Регламент ТО; ГОСТ 32601-2013."
@@ -351,10 +375,14 @@ class ProtoBackend(PlatformBackend):
             yield tok + " "
 
     def retrieval_trace(self, sv, stage):
+        """Заглушка трассы RAG-извлечения: одна демо-строка для таблицы инженера."""
+
         return [{"block": "ПРЕДПИСАНИЕ (оператор)",
                  "doc": "Регламент ТО (имитация)", "distance": 0.24,
-                 "fault_type": getattr(sv, "inferred_fault", "—"),
+                 "fault_type": getattr(sv, "inferred_fault", "-"),
                  "sop_part": "operator", "stage": stage}]
 
     def shap_figures(self, pump_id):
+        """SHAP-графики недоступны в прототипе (нет моделей) - всегда (None, None)."""
+
         return None, None

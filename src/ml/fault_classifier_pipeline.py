@@ -1,26 +1,28 @@
 """
-Классификатор ТИПА отказа (Fault-Type Classifier) — вторая модель платформы
+Классификатор ТИПА отказа (Fault-Type Classifier) - вторая модель платформы
 ===========================================================================
-Второй этап иерархической классификации. Первый этап (ml_pipeline.py) определяет
-ТЯЖЕСТЬ (0=Норма / 1=Warning / 2=Авария). Этот модуль обучает модель, которая на
-аварийных строках называет ФИЗИЧЕСКИЙ ТИП отказа: overheat / cavitation / electrical.
+src/ml/fault_classifier_pipeline.py
+
+Второй этап иерархической классификации. Первый этап (severity_classifier_pipeline.py) 
+определяет ТЯЖЕСТЬ (0=Норма / 1=Warning / 2=Авария). Этот модуль обучает модель, которая 
+на аварийных строках называет ФИЗИЧЕСКИЙ ТИП отказа: overheat / cavitation / electrical.
 
 Зачем отдельная модель, а не SHAP-эвристика:
     Прежняя эвристика по SHAP-сигнатуре давала точность ~0.61 (перегрев массово
-    утекал в кавитацию) — пороги в шкале SHAP не имеют физического смысла и
+    утекал в кавитацию) - пороги в шкале SHAP не имеют физического смысла и
     «плывут» при переобучении. Обучаемый классификатор на тех же признаках 
     убирает ручные пороги и даёт измеримую, защищаемую точность.
 
-Дисциплина эксперимента:
+Основные моменты:
     - Group Split по агрегату: обучение на MNHV_001..004, тест на MNHV_005
-      (как в ml_pipeline.py) — доказывает обобщение на новый насос.
-    - Только предупредительные/аварийные строки (target==1 & ==2) — 
+      (как в severity_classifier_pipeline.py) - доказывает обобщение на новый насос.
+    - Только предупредительные/аварийные строки (target==1 & ==2) - 
       согласование train/inference.
     - Веса классов 'balanced': перегрев (~52%) не должен задавить электрику (~20%).
 
 Метрики (отличаются от модели тяжести):
     Здесь классы умеренно несбалансированы (нет редкого класса ~0.2%), поэтому
-    главные метрики — macro-F1 и balanced accuracy (не дают мажорному классу
+    главные метрики - macro-F1 и balanced accuracy (не дают мажорному классу
     доминировать), плюс per-class recall и confusion matrix. PR-AUC, критичный
     для модели тяжести, здесь вторичен.
 """
@@ -30,6 +32,7 @@ import sys
 import warnings
 warnings.filterwarnings('ignore')
 
+from typing import cast
 import pandas as pd
 import joblib
 
@@ -40,7 +43,6 @@ from sklearn.metrics import (classification_report, confusion_matrix,
                              balanced_accuracy_score)
 from sklearn.utils.class_weight import compute_sample_weight
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(_THIS_DIR))
 for _p in (_THIS_DIR, _PROJECT_ROOT):
@@ -65,32 +67,33 @@ def evaluate_fault_model(name: str, short_name: str, model,
     """
     Полный набор метрик для классификатора типа отказа.
 
-    macro-F1 — среднее F1 по типам без учёта их размера (главная метрика).
-    balanced accuracy — среднее recall по классам; устойчиво к дисбалансу типов.
-    per-class recall — какую долю каждого типа модель называет верно (важно для
+    macro-F1 - среднее F1 по типам без учёта их размера (главная метрика).
+    balanced accuracy - среднее recall по классам; устойчиво к дисбалансу типов.
+    per-class recall - какую долю каждого типа модель называет верно (важно для
                        редкой электрики).
-    confusion matrix — конкретные перепутывания (например, перегрев↔кавитация).
+    confusion matrix - конкретные перепутывания (например, перегрев↔кавитация).
     """
 
     y_true = y_test.to_numpy()
     y_pred = model.predict(X_test)
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1, 2])
-    report = classification_report(y_true, y_pred, labels=[0, 1, 2],
-                                   target_names=TARGET_NAMES, 
-                                   output_dict=True, zero_division=0)
+    report = cast(dict, classification_report(y_true, y_pred, labels=[0, 1, 2],
+                                              target_names=TARGET_NAMES,
+                                              output_dict=True, zero_division=0))
     
     # Раздельно по стадии: 1=Warning (раннее), 2=Critical (авария)
     stage = stage_test.to_numpy()
     stage_recall = {}
     for sv, sname in [(1, 'warning'), (2, 'critical')]:
         mask = stage == sv
-        rep = classification_report(y_true[mask], y_pred[mask], labels=[0, 1, 2],
-                                    target_names=TARGET_NAMES, 
-                                    output_dict=True, zero_division=0)
-        stage_recall[sname] = {ft: rep[FAULT_LABELS[ft]]['recall'] for ft in FAULT_TYPES} # type: ignore
+        rep = cast(dict, classification_report(y_true[mask], y_pred[mask],
+                                               labels=[0, 1, 2],
+                                               target_names=TARGET_NAMES,
+                                               output_dict=True, zero_division=0))
+        stage_recall[sname] = {ft: rep[FAULT_LABELS[ft]]['recall'] for ft in FAULT_TYPES}
 
 
-    print("\nМатрица ошибок (строки — факт, столбцы — предсказание):")
+    print("\nМатрица ошибок (строки - факт, столбцы - предсказание):")
     header = "            " + "  ".join(f"{n[:12]:>12s}" for n in TARGET_NAMES)
     print(header)
     for i, row in enumerate(cm):
@@ -100,9 +103,9 @@ def evaluate_fault_model(name: str, short_name: str, model,
     print(classification_report(y_test, y_pred, labels=[0, 1, 2],
                                 target_names=TARGET_NAMES))
 
-    macro_f1 = report['macro avg']['f1-score']                  # type: ignore
+    macro_f1 = report['macro avg']['f1-score']
     bal_acc = balanced_accuracy_score(y_test, y_pred)
-    per_class_recall = {ft: report[FAULT_LABELS[ft]]['recall']  # type: ignore
+    per_class_recall = {ft: report[FAULT_LABELS[ft]]['recall']
                         for ft in FAULT_TYPES}
 
     print(f"macro-F1:          {macro_f1:.4f}")
@@ -158,7 +161,7 @@ if __name__ == "__main__":
     # 3. Веса для компенсации дисбаланса типов (перегрев >> электрика)
     sample_weights = compute_sample_weight(class_weight='balanced', y=y_train)
 
-    # 4. Обучение трёх моделей (тот же набор, что для модели тяжести — для сопоставимости)
+    # 4. Обучение трёх моделей (тот же набор, что для модели тяжести - для сопоставимости)
     print("\nОбучение моделей классификации типа отказа...")
 
     lr_model = LogisticRegression(
@@ -210,7 +213,7 @@ if __name__ == "__main__":
     best = max(metrics, key=lambda m: m['macro_f1'])
     print(f"\nЛучшая модель по macro-F1: {best['name']} ({best['macro_f1']:.4f})")
 
-    # 7. Сохранение всех трёх моделей (XGBoost — для интеграции в XAI)
+    # 7. Сохранение всех трёх моделей (XGBoost - для интеграции в XAI)
     joblib.dump(lr_model, os.path.join(models_dir, 'fault_lr_model.joblib'))
     joblib.dump(rf_model, os.path.join(models_dir, 'fault_rf_model.joblib'))
     joblib.dump(xgb_model, os.path.join(models_dir, 'fault_xgboost_model.joblib'))
@@ -218,9 +221,10 @@ if __name__ == "__main__":
     graphs_dir = os.path.join(project_root, 'artifacts', 'graphs')
     tables_dir = os.path.join(project_root, 'artifacts', 'tables')
     os.makedirs(tables_dir, exist_ok=True)
-    summary.to_csv(os.path.join(tables_dir, 'ML_fault_classifier_summary.csv'))
+    summary_path = os.path.join(tables_dir, 'ML_fault_classifier_summary.csv')
+    summary.to_csv(summary_path)
     print(f"\nМодели сохранены в: {models_dir}")
-    print(f"Сводная таблица: {os.path.join(tables_dir, 'fault_classifier_summary.csv')}")
+    print(f"Сводная таблица: {summary_path}")
 
     # 8. Построение графиков
-    plot_fault_classifier(metrics, graphs_dir)   # лучшую модель выберет по macro-F1
+    plot_fault_classifier(metrics, graphs_dir) # лучшую модель выберет по macro-F1

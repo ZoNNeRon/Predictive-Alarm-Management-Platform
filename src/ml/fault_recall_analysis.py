@@ -1,27 +1,29 @@
 """
-Анализ Recall по типам отказа — Fault Recall Analysis
+Анализ Recall по типам отказа - Fault Recall Analysis
 ======================================================
+src/ml/fault_recall_analysis.py
+
 Доказывает, что XGBoost различает три физических сценария отказа,
 а не работает по тривиальному правилу «все параметры выросли → авария».
 
-Запускать ПОСЛЕ ml_pipeline.py (нужна обученная модель и preprocessed_pumps_dataset.csv).
+Запускать ПОСЛЕ severity_classifier_pipeline.py (нужна обученная модель
+и preprocessed_pumps_dataset.csv).
 fault_type сохраняется в preprocessed_pumps_dataset.csv (data_preprocessor.py его не удаляет),
-если же он отсутствует — автоматически присоединяется из raw-данных.
+если же он отсутствует - автоматически присоединяется из raw-данных.
 
 Что доказывается:
-  Recall(Critical) — доля строк state=4 данного типа, предсказанных как класс 2.
-  Recall(Warning) — доля строк state=3 данного типа, предсказанных как ≥1.
-  Тепловая карта сигнатур — средние значения датчиков в Critical-состоянии по типу отказа.
+  Recall(Critical) - доля строк state=4 данного типа, предсказанных как класс 2.
+  Recall(Warning) - доля строк state=3 данного типа, предсказанных как ≥1.
+  Тепловая карта сигнатур - средние значения датчиков в Critical-состоянии по типу отказа.
   Если Recall(Тип В) близок к Recall(Тип А), модель работает не по «всё выросло».
 """
 
 import os
 import sys
-from typing import Optional
+from typing import Optional, cast
 import pandas as pd
 import joblib
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(_THIS_DIR))
 for _p in (_THIS_DIR, _PROJECT_ROOT):
@@ -43,8 +45,9 @@ def analyze_fault_recall(model, df_test: pd.DataFrame, feature_cols: list,
     Args:
         model:         Обученная модель (XGBoost или любая sklearn-совместимая).
         df_test:       Тестовый датасет (уже отфильтрован по pump_id).
-        feature_cols:  Список признаков (FEATURE_COLS из DataPreprocessor).
-        save_dir:      Директория для сохранения графика.
+        feature_cols:    Список признаков (FEATURE_COLS из DataPreprocessor).
+        save_graphs_dir: Директория для сохранения графика.
+        save_tables_dir: Директория для сохранения CSV-таблицы результатов.
         raw_data_path: Путь к industrial_pumps_dataset.csv. Нужен если fault_type
                        отсутствует в df_test (автозагрузка для джойна).
 
@@ -55,7 +58,7 @@ def analyze_fault_recall(model, df_test: pd.DataFrame, feature_cols: list,
     # Проверка наличия fault_type
     if 'fault_type' not in df_test.columns:
         if raw_data_path and os.path.exists(raw_data_path):
-            print("  [INFO] fault_type отсутствует в processed — присоединяю из raw...")
+            print("  [INFO] fault_type отсутствует в processed - присоединяю из raw...")
             raw_types = pd.read_csv(raw_data_path,
                                     usecols=['timestamp', 'pump_id', 'fault_type'])
             df_test = df_test.merge(raw_types, on=['timestamp', 'pump_id'], how='left')
@@ -69,7 +72,7 @@ def analyze_fault_recall(model, df_test: pd.DataFrame, feature_cols: list,
     df_test = df_test.copy()
     df_test['pred'] = preds
 
-    # Вычисляем метрики по типам отказа
+    # Вычисление метрик по типам отказа
     results = []
     for ft in FAULT_TYPES:
         ft_mask = df_test['fault_type'] == ft
@@ -93,7 +96,6 @@ def analyze_fault_recall(model, df_test: pd.DataFrame, feature_cols: list,
             'n_warning': n_warn,
         })
 
-    # Вывод в консоль
     print("\n" + "=" * 60)
     print("RECALL ПО ТИПАМ ОТКАЗА (тестовая выборка)")
     print("=" * 60)
@@ -116,7 +118,7 @@ def analyze_fault_recall(model, df_test: pd.DataFrame, feature_cols: list,
                   if all(c in df_test.columns for c in ['vibration', 'temperature', 'current', 'pressure'])
                   else None)
 
-    # Если сырых значений нет в df_test, пробуем из raw
+    # Если сырых значений нет в df_test, берётся из raw
     if signatures is None and raw_data_path and os.path.exists(raw_data_path):
         pump_id = df_test['pump_id'].iloc[0] if 'pump_id' in df_test.columns else None
         raw_df = pd.read_csv(raw_data_path)
@@ -141,7 +143,7 @@ if __name__ == "__main__":
         os.path.dirname(
             os.path.dirname(
                 os.path.abspath(__file__))))
-    model_path = os.path.join(project_root, 'models', 'severity_xgboost_model.joblib')
+    model_path = os.path.join(project_root, 'models', 'severity', 'severity_xgboost_model.joblib')
     data_path = os.path.join(project_root, 'data', 'processed', 'preprocessed_pumps_dataset.csv')
     raw_path = os.path.join(project_root, 'data', 'raw', 'industrial_pumps_dataset.csv')
     save_graphs_dir = os.path.join(project_root, 'artifacts', 'graphs')
@@ -151,8 +153,8 @@ if __name__ == "__main__":
 
     pre = DataPreprocessor(window_sizes=[15, 30, 60])
     df = pd.read_csv(data_path)
-    df_test = df[df['pump_id'] == 'MNHV_005'].copy()
+    df_test = cast(pd.DataFrame, df[df['pump_id'] == 'MNHV_005'].copy())
     model = joblib.load(model_path)
 
-    analyze_fault_recall(model, df_test, pre.FEATURE_COLS, save_graphs_dir,    # type: ignore
+    analyze_fault_recall(model, df_test, pre.FEATURE_COLS, save_graphs_dir,
                          save_tables_dir, raw_data_path=raw_path)

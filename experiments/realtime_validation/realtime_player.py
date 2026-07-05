@@ -1,24 +1,27 @@
 """
-realtime_player.py — драйвер тика для режима реального времени.
-================================================================
+Драйвер тика реального времени (Realtime Player)
+================================================
+experiments/realtime_validation/realtime_player.py
+
 Тонкая обёртка над LiveMultiPumpGenerator, повторяющая интерфейс
 ScenarioPlayer (next_rows / finished / progress / pos / __len__ / skip_warmup),
 поэтому встаёт НА МЕСТО плеера в app.py без переписывания UI: весь существующий
 контур (advance_stream, прогресс-бар, ▶/⏸/⏭, графики, тосты) работает как есть.
 
 Отличия от ScenarioPlayer:
-  • данные не вырезаются из CSV, а генерируются на лету по всему парку;
-  • за один тик — по строке на КАЖДЫЙ насос (общий timestamp), поэтому
+  - данные не вырезаются из CSV, а генерируются на лету по всему парку;
+  - за один тик - по строке на КАЖДЫЙ насос (общий timestamp), поэтому
     next_rows(n) отдаёт n тиков × N насосов; pos считает sim-минуты (тики);
-  • acknowledge(pump_id) пробрасывает квитирование в генератор (обратная связь
+  - acknowledge(pump_id) пробрасывает квитирование в генератор (обратная связь
     50% восстановление / 100% останов-рестарт).
 
 ПРОГРЕВ. Строгий OnlinePreprocessor выдаёт признаки только после WARMUP_ROWS
 (60) строк истории на насос. Поэтому skip_warmup() прогоняет WARMUP_ROWS тиков
-форсированно-нормальной Нормы и заполняет буферы — значения видны на графиках
+форсированно-нормальной Нормы и заполняет буферы - значения видны на графиках
 (populated-старт, а не «телепорт в пустоту»), и модель готова с первого видимого
-тика. Когда подключим прогрессивный realtime-препроцессор (следующий модуль),
-плеер создаётся с warmup_rows=0 → честный «холодный старт» с 0-й минуты.
+тика. С прогрессивным realtime-препроцессором (realtime_preprocessor.py) плеер
+создаётся с warmup_rows=0 → честный «холодный старт» с 0-й минуты (skip_warmup
+ничего не делает).
 """
 
 from __future__ import annotations
@@ -33,19 +36,15 @@ for _p in (_THIS_DIR, _PROJECT_ROOT):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from experiments.realtime_validation.live_generator import (  # noqa: E402
+from experiments.realtime_validation.live_generator import (
     LiveMultiPumpGenerator, RealtimeConfig)
-
-try:
-    from src.runtime.online_preprocessor import WARMUP_ROWS  # noqa: E402
-except Exception:
-    WARMUP_ROWS = 60  # фолбэк = max(WINDOWS)
+from src.runtime.online_preprocessor import WARMUP_ROWS
 
 
 class RealtimePlayer:
     """Drop-in вместо ScenarioPlayer поверх живого мультинасосного генератора."""
 
-    TRIP_DELAY_TICKS = 5    # держим аварию в потоке N мин до защитного останова
+    TRIP_DELAY_TICKS = 5 # авария держится в потоке N мин до защитного останова
 
     def __init__(self,
                  generator: Optional[LiveMultiPumpGenerator] = None,
@@ -55,10 +54,10 @@ class RealtimePlayer:
         self.gen = generator or LiveMultiPumpGenerator(config=config)
         self.horizon = int(horizon_minutes)
         self.warmup_rows = int(warmup_rows)
-        self.pos = 0  # пройдено sim-минут (тиков) ВИДИМОГО потока
-        self._pending_trips: dict[str, int] = {}   # pid -> тиков до фактического Off
+        self.pos = 0 # пройдено sim-минут (тиков) ВИДИМОГО потока
+        self._pending_trips: dict[str, int] = {} # pid -> тиков до фактического Off
 
-    # ---- интерфейс, совпадающий со ScenarioPlayer ----
+    # интерфейс, совпадающий со ScenarioPlayer 
 
     def __len__(self) -> int:
         return self.horizon
@@ -75,20 +74,22 @@ class RealtimePlayer:
         """Заполнить буферы препроцессора: warmup_rows тиков Нормы.
 
         Строки отдаются вызывающему (app.py пушит их в историю и process_tick),
-        но в pos НЕ засчитываются — это подготовка, не видимый прогон.
+        но в pos НЕ засчитываются - это подготовка, не видимый прогон.
         При warmup_rows=0 (прогрессивный препроцессор) не делает ничего.
         """
+
         for _ in range(self.warmup_rows):
             for row in self.gen.step():
                 yield row
 
     def next_rows(self, n: int) -> Iterator[dict]:
-        """n sim-минут потока: на каждый тик — по строке на насос."""
+        """n sim-минут потока: на каждый тик - по строке на насос."""
+
         for _ in range(int(n)):
             if self.finished:
                 return
-            # отложенный защитный останов: гасим агрегат через TRIP_DELAY_TICKS мин
-            # ПОСЛЕ подтверждения аварии — аварийные тики копятся в потоке (статистика)
+            # отложенный защитный останов: агрегат гасится через TRIP_DELAY_TICKS мин
+            # ПОСЛЕ подтверждения аварии - аварийные тики копятся в потоке (статистика)
             for _pid in list(self._pending_trips):
                 self._pending_trips[_pid] -= 1
                 if self._pending_trips[_pid] <= 0:
@@ -98,16 +99,18 @@ class RealtimePlayer:
                 yield row
             self.pos += 1
 
-    # ---- расширение: обратная связь квитирования (UI → генератор) ----
+    # расширение: обратная связь квитирования (UI → генератор) 
 
     def acknowledge(self, pump_id: str) -> Optional[str]:
         """Квитирование из UI → генератор. 'recovered'/'continues'/'restarted'/None."""
+
         return self.gen.acknowledge(pump_id)
 
     def trip(self, pump_id: str) -> None:
         """Защитный останов с ЗАДЕРЖКОЙ: после подтверждения аварии агрегат ещё
         TRIP_DELAY_TICKS мин остаётся в потоке (аварийные тики копятся → статистика),
         затем уходит в Off. Фактический gen.trip выполняется в next_rows()."""
+        
         self._pending_trips.setdefault(pump_id, self.TRIP_DELAY_TICKS)
 
 

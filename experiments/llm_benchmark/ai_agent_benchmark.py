@@ -1,16 +1,37 @@
 """
-Многосценарный бенчмарк LLM-моделей для AI-агента
-=================================================
-Прогоняет три модели (qwen3.5:9b, phi4:14b, yandex-gpt-5-lite:8b) покрывающих 
-КАЖДЫЙ тип отказа на ОБЕИХ стадиях (Предупреждение / Авария), собирает объективные
-метрики и строит графики.
+Многосценарный бенчмарк LLM-агента
+==================================
+experiments/llm_benchmark/ai_agent_benchmark.py
 
-  - План сценариев = {overheat, cavitation, electrical} x {warning, critical} (до 6 шт.),
-    чтобы можно было СРАВНИВАТЬ поведение по стадиям, а не только по типам.
-  - Каждый сценарий несёт и контекст по симптомам (с подмешиванием типа отказа),
-    и график ТОиР по pump_id — чтобы тестировать агента на полном входе.
-  - Автометрики: соблюдение формата, атрибуция источника, число шагов предписания.
-  - Усреднение метрик по сценариям x повторам.
+Сравнивает три локальные LLM (Qwen 3.5 9B, Phi-4 14B, YandexGPT-5 8B) в роли
+диагностического агента на едином наборе сценариев и собирает объективные
+метрики качества и скорости - это обоснование выбора модели для платформы.
+
+План сценариев = {overheat, cavitation, electrical} × {warning, critical}
+(до 6 шт.): каждый тип отказа проверяется на ОБЕИХ стадиях, что позволяет
+сравнивать поведение по стадиям, а не только по типам. Каждый сценарий подаётся
+на полном 4-канальном входе агента (справочный контекст + действия оператора +
+работы ТОиР + график ТОиР по pump_id), как в боевом пайплайне.
+
+Пять автометрик (на каждый ответ):
+  - check_format            - присутствуют все обязательные разделы;
+  - check_attribution       - есть явная ссылка на нормативный источник;
+  - count_action_steps      - число нумерованных пунктов в ПРЕДПИСАНИИ;
+  - check_toir_is_works     - в разделе ТОиР ремонтные работы, а не дата;
+  - check_stage_appropriate - стадийная уместность (нет аварийного останова
+    на Предупреждении; есть решительное действие на Аварии).
+
+Каждая модель прогоняется с прогревом, метрики усредняются по сценариям × повторам.
+
+Выходы (см. artifacts/):
+  - tables/agent_benchmark_multi.csv   - сырые прогоны (строка = один прогон);
+  - tables/agent_summary_table.csv     - сводка по моделям (index = модель);
+  - tables/agent_summary_by_stage.csv  - сводка model × stage;
+  - graphs/agent_plot1-5_*.png         - графики (src/visualisation/ai_visualisation).
+
+Пороги/маркеры метрик и список моделей берутся из config.settings.
+Предусловие: обучены обе модели (severity + fault_type), собрана база ChromaDB,
+запущен локальный Ollama с нужными моделями.
 """
 
 import os
@@ -18,7 +39,6 @@ import sys
 import re
 import pandas as pd
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(_THIS_DIR))
 for _p in (_THIS_DIR, _PROJECT_ROOT):
@@ -32,15 +52,11 @@ from src.rag.rag_database import KnowledgeBaseManager, resolve_stage
 from config.settings import (LLM_MODELS, MODEL_LABELS, TOIR_WORK_MARKERS,
                              REQUIRED_SECTIONS, SOURCE_MARKERS, WINDOW_SIZES,
                              DIRECTIONS, FMT, EMERGENCY_MARKERS, DECISIVE_MARKERS)
-from src.visualisation.ai_visualisation import (ai_vis_order, plot_performance, 
+from src.visualisation.ai_visualisation import (ai_vis_order, plot_performance,
                                                 plot_quality_auto, plot_summary_heatmap,
                                                 plot_stage_breakdown)
 
-_EMERGENCY_MARKERS = EMERGENCY_MARKERS
-_DECISIVE_MARKERS = DECISIVE_MARKERS
-
-
-# Автоматические метрики качества 
+# Автоматические метрики качества
 
 def check_format(text: str) -> bool:
     """Все 4 обязательных раздела присутствуют в ответе."""
@@ -78,7 +94,7 @@ def count_action_steps(text: str) -> int:
 
 
 def check_toir_is_works(text: str) -> bool:
-    """В РЕКОМЕНДАЦИЯХ ТОиР — ремонтные работы, а не дата планового ремонта."""
+    """В РЕКОМЕНДАЦИЯХ ТОиР - ремонтные работы, а не дата планового ремонта."""
 
     m = re.search(r'РЕКОМЕНДАЦИИ ТОиР.*?(?=ПЛАНОВЫЙ|ИНФОРМАЦИЯ|$)', text, re.S | re.I)
 
@@ -101,13 +117,13 @@ def check_stage_appropriate(text: str, stage: str) -> bool:
     block = _prescription_block(text).lower()
 
     if stage == 'warning':
-        return not any(w in block for w in _EMERGENCY_MARKERS)
-    
+        return not any(w in block for w in EMERGENCY_MARKERS)
+
     if stage == 'unknown':
         low = text.lower()
         return ('ручная инспекция' in low) and (count_action_steps(text) == 0)
-    
-    return any(w in block for w in _DECISIVE_MARKERS)
+
+    return any(w in block for w in DECISIVE_MARKERS)
 
 
 # Подготовка сценариев 
@@ -118,7 +134,7 @@ def build_scenarios(xai, df, preprocessor, kb) -> list:
     fc = preprocessor.FEATURE_COLS
     for col in ('timestamp', 'fault_type', 'target'):
         if col not in df.columns:
-            raise KeyError(f"В датасете нет колонки '{col}' — проверьте препроцессор.")
+            raise KeyError(f"В датасете нет колонки '{col}' - проверьте препроцессор.")
  
     faults = [('overheat', 'перегрев'), ('cavitation', 'кавитация'),
               ('electrical', 'электрика')]
@@ -127,14 +143,14 @@ def build_scenarios(xai, df, preprocessor, kb) -> list:
     plan = []
     for fault_type, fault_ru in faults:
         for target, stage_ru in stages:
-            plan.append((target, fault_type, f"{stage_ru} — {fault_ru}"))
+            plan.append((target, fault_type, f"{stage_ru} - {fault_ru}"))
  
     scenarios = []
     for target, fault_type, label in plan:
         sub = df[(df['target'] == target) & (df['fault_type'] == fault_type)]
         if len(sub) == 0:
             print(f"  [WARN] нет строк для «{label}» "
-                  f"(target={target}, fault_type={fault_type}) — пропущен.")
+                  f"(target={target}, fault_type={fault_type}) - пропущен.")
             continue
         rec = sub.iloc[-1]
         row = sub.iloc[-1:][fc]
@@ -168,6 +184,13 @@ def _make_scenario(sv, kb, label) -> dict:
 
 
 def run_benchmark(scenarios: list, n_repeats: int = 3) -> pd.DataFrame:
+    """
+    Прогоняет каждую модель по всем сценариям с n_repeats повторами и считает
+    автометрики на каждый ответ. Перед замерами модель прогревается (первый
+    сценарий, результат не учитывается). Возвращает «длинный» DataFrame: одна
+    строка = один прогон (модель × сценарий × повтор).
+    """
+
     rows = []
     for model in LLM_MODELS:
         label = MODEL_LABELS.get(model, model)
@@ -188,7 +211,7 @@ def run_benchmark(scenarios: list, n_repeats: int = 3) -> pd.DataFrame:
                                                    sc['schedule'], sc['repair'],
                                                    sc['operator'])
                 if resp.error:
-                    print(f"  [{sc['label']}] rep{rep}: ОШИБКА — {resp.error}")
+                    print(f"  [{sc['label']}] rep{rep}: ОШИБКА - {resp.error}")
                     continue
  
                 fmt = check_format(resp.raw_text)
@@ -246,7 +269,7 @@ if __name__ == "__main__":
     kb = KnowledgeBaseManager(data_dir=kb_dir, chroma_dir=chroma_dir)
  
     scenarios = build_scenarios(xai, df, pre, kb)
-    print(f"Сформировано сценариев: {len(scenarios)} — {[s['label'] for s in scenarios]}")
+    print(f"Сформировано сценариев: {len(scenarios)} - {[s['label'] for s in scenarios]}")
  
     results = run_benchmark(scenarios, n_repeats=3)
     results.to_csv(os.path.join(save_tables_dir, 'agent_benchmark_multi.csv'), index=False)
@@ -255,7 +278,7 @@ if __name__ == "__main__":
     plot_quality_auto(results, save_graphs_dir)
     plot_stage_breakdown(results, save_graphs_dir)
  
-    # Сводка по моделям (как раньше) + добавлена метрика стадийной уместности.
+    # Сводка по моделям (усреднение по всем прогонам), включая стадийную уместность.
     print("\n" + "=" * 55)
     print("СВОДНАЯ ТАБЛИЦА (среднее по всем прогонам)")
     print("=" * 55)
@@ -273,7 +296,7 @@ if __name__ == "__main__":
     print(summary.to_string())
     summary.to_csv(os.path.join(save_tables_dir, 'agent_summary_table.csv'))
  
-    # НОВОЕ: разбиение метрик по стадиям (model × stage) — для стадийных графиков диплома.
+    # Разбиение метрик по стадиям (model × stage) - для стадийных графиков.
     print("\n" + "=" * 55)
     print("СВОДКА ПО СТАДИЯМ (model x stage)")
     print("=" * 55)

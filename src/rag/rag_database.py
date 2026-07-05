@@ -1,8 +1,41 @@
 """
 Модуль формирования RAG-базы знаний (Knowledge Base Manager)
 =============================================================
-Стек: LangChain + ChromaDB + multilingual-e5-large (HuggingFace)
-Платформа: macOS M2, локальный запуск без GPU (MPS-ускорение через PyTorch)
+src/rag/rag_database.py
+
+Собирает и обслуживает векторную базу знаний, из которой LLM-агент берёт
+нормативный контекст. Стек: LangChain + ChromaDB + multilingual-e5-large
+(HuggingFace). 
+
+Пайплайн построения (``KnowledgeBaseManager.build_database``):
+документы (.md/.txt и опционально PDF) → чанки с параметрами под тип документа
+→ эмбеддинги e5 → батчевая запись в ChromaDB.
+
+Ключевые решения:
+
+- **Allowlist по ``DOC_TYPE_MAP``** - загружаются только явно перечисленные
+  файлы. Большие исходные PDF (ГОСТ, мануал) заменены вручную подготовленными
+  ``*_extract.md``; PDF-загрузчик оставлен как расширение, но в текущей сборке
+  не задействован.
+- **Префиксы e5** - ``passage:`` при индексации чанка, ``query:`` при поиске;
+  обязательны для корректной работы multilingual-e5-large.
+- **Структурный чанкинг регламента SOP** (``_chunk_sop_document``) - сценарии
+  режутся на подразделы ``operator`` / ``repair`` / ``reference`` с метаданными
+  ``fault_type`` (overheat/cavitation/electrical) и ``stage``
+  (warning/critical). Это позволяет детерминированно фильтровать выдачу по типу
+  отказа и стадии, а не только по семантической близости.
+
+Публичный API поиска (используется агентом и бенчмарком):
+
+- ``resolve_stage(symptom_vector)`` - единый резолвер стадии
+  (warning/critical/unknown) по предсказанию классификатора.
+- ``search(...)`` - базовый семантический поиск с фильтрами по метаданным и
+  отключаемой отсечкой по ``RELEVANCE_THRESHOLD``.
+- ``search_by_symptoms(...)`` - справочный контекст для ДИАГНОЗА (multi-query).
+- ``search_operator_actions(fault, stage)`` - предписание для ОПЕРАТОРА
+  (строго по типу и стадии, с лестницей фолбэков).
+- ``search_repair_works(fault)`` - работы ТОиР по типу отказа.
+- ``search_maintenance_schedule(pump_id)`` - плановый график ТО по агрегату.
 """
 
 import sys
@@ -10,7 +43,7 @@ import os
 import shutil
 import re
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import Any, List, Dict, Optional, Tuple
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(_THIS_DIR))
@@ -32,7 +65,7 @@ from langchain_chroma import Chroma
 _FAULT_KEYS = set(FAULT_TYPES)
 _FAULT_RU = {'overheat': 'перегрев', 'cavitation': 'кавитация',
              'electrical': 'электрическая неисправность'}
-# Явный тег в заголовке сценария — самый надёжный путь.
+# Явный тег в заголовке сценария - самый надёжный путь.
 _FAULT_TAG_RE = re.compile(r'\[fault_type:\s*([a-z_]+)\s*\]', re.I)
 # Строка-заголовок сценария (для carry-forward по чанкам).
 _SCENARIO_HEADER_RE = re.compile(r'(?:^|\n)#{2,3}\s+Сценари[йяе][^\n]*', re.I)
@@ -59,25 +92,25 @@ _REF_RES = (
 def _stage_from(word):
     """Слово из заголовка → метка стадии. Без явной метки = 'critical'."""
 
-    if not word:    # Вывод по умолчанию
+    if not word:    # заголовок без явной стадии → трактуется как авария
         return 'critical'
-    
+
     w = word.lower()
     if w.startswith('предупрежд'):
         return 'warning'
-    
+
     if w.startswith('авари'):
         return 'critical'
-    
-    return 'critical'   # Вывод при отсутствии тегов
+
+    return 'critical'   # неизвестная формулировка → безопасный дефолт (авария)
 
 
 def resolve_stage(symptom_vector, conf_threshold: float = FAULT_CONFIDENCE_THRESHOLD) -> str:
     """
     Единый резолвер стадии для агента и бенчмарка. Возвращает:
-      'warning'  — класс 1 и тип уверенно определён;
-      'critical' — класс 2 и тип уверенно определён;
-      'unknown'  — класс вне {1,2} ЛИБО уверенность типа ниже порога.
+      'warning'  - класс 1 и тип уверенно определён;
+      'critical' - класс 2 и тип уверенно определён;
+      'unknown'  - класс вне {1,2} ЛИБО уверенность типа ниже порога.
     """
 
     pc = getattr(symptom_vector, 'predicted_class', None)
@@ -147,7 +180,13 @@ class TextKnowledgeLoader:
     SUPPORTED_EXTENSIONS = {'.md', '.txt'}
 
     def load_file(self, file_path: str, doc_type: str = 'manual') -> List[Document]:
-        
+        """
+        Читает один .md/.txt файл в единственный Document.
+
+        Возвращает пустой список, если расширение не поддерживается, файл не
+        читается или содержимое слишком короткое (< 50 символов).
+        """
+
         path = Path(file_path)
         if path.suffix.lower() not in self.SUPPORTED_EXTENSIONS:
             return []
@@ -169,8 +208,12 @@ class TextKnowledgeLoader:
         )]
 
     def load_directory(self, data_dir: str,
-                       doc_type_map: Dict[str, str] = None) -> List[Document]:  # type: ignore
-        
+                       doc_type_map: Optional[Dict[str, str]] = None) -> List[Document]:
+        """
+        Загружает из директории только те .md/.txt файлы, что перечислены в
+        doc_type_map (allowlist). Тип документа берётся из карты, иначе 'manual'.
+        """
+
         doc_type_map = doc_type_map or {}
         all_documents: List[Document] = []
 
@@ -198,10 +241,10 @@ class StructuredPDFLoader:
     Загрузчик PDF на базе pymupdf4llm.
     Конвертирует PDF в Markdown, сохраняя:
       - заголовки разделов (## Раздел 4.2)
-      - таблицы (таблица неисправностей — ключевой источник для RAG)
+      - таблицы (таблица неисправностей - ключевой источник для RAG)
       - нумерованные списки (пошаговые инструкции)
 
-    Fallback: если pymupdf4llm не извлёк текст (сканированный PDF) —
+    Fallback: если pymupdf4llm не извлёк текст (сканированный PDF) -
     используется pdfplumber с постраничным разбиением.
     """
 
@@ -239,7 +282,7 @@ class StructuredPDFLoader:
         except Exception:
             pass  # Fallback ниже
 
-        # Fallback: pdfplumber — постраничный текст
+        # Fallback: pdfplumber - постраничный текст
         try:
             with pdfplumber.open(pdf_path) as pdf:
                 for page_num, page in enumerate(pdf.pages, 1):
@@ -261,13 +304,13 @@ class StructuredPDFLoader:
         return documents
 
     def load_directory(self, data_dir: str,
-                       doc_type_map: Dict[str, str] = None) -> List[Document]:  # type: ignore
+                       doc_type_map: Optional[Dict[str, str]] = None) -> List[Document]:
         """
         Загружает PDF-файлы, явно перечисленные в doc_type_map.
 
         Args:
             data_dir:     Путь к директории с PDF.
-            doc_type_map: Словарь {имя_файла: doc_type} — загружаются только эти файлы.
+            doc_type_map: Словарь {имя_файла: doc_type} - загружаются только эти файлы.
 
         Returns:
             Список всех Document из указанных файлов.
@@ -313,12 +356,12 @@ class KnowledgeBaseManager:
     EMBED_MODEL = EMBED_MODEL
 
     def __init__(self, data_dir: str, chroma_dir: str,
-                 doc_type_map: Dict[str, str] = None):  # type: ignore
+                 doc_type_map: Optional[Dict[str, str]] = None):
         """
         Args:
             data_dir:     Директория с документами (PDF + MD/TXT).
             chroma_dir:   Директория для хранения ChromaDB.
-            doc_type_map: {имя_файла: doc_type} — загружаются только перечисленные файлы.
+            doc_type_map: {имя_файла: doc_type} - загружаются только перечисленные файлы.
         """
 
         self.data_dir = data_dir
@@ -341,7 +384,7 @@ class KnowledgeBaseManager:
         Полный пайплайн: PDF → чанки → ChromaDB.
 
         Args:
-            reset: True — удалить существующую базу и пересобрать.
+            reset: True - удалить существующую базу и пересобрать.
 
         Returns:
             Объект Chroma (vectorstore).
@@ -355,7 +398,7 @@ class KnowledgeBaseManager:
         print("Шаг 1: Загрузка документов")
         print(f"{'─'*55}")
 
-        # Текстовые файлы (.md, .txt) загружаются первыми — они содержат
+        # Текстовые файлы (.md, .txt) загружаются первыми - они содержат
         # вручную подготовленные выжимки из больших PDF (gost_extract.md и т.п.)
         text_docs = self.text_loader.load_directory(
             self.data_dir,
@@ -393,9 +436,9 @@ class KnowledgeBaseManager:
     def _detect_chunk_fault(self, raw_text: str, current):
         """
         Определяет fault_type для чанка SOP по заголовкам сценариев в нём.
-        carry-forward: если в чанке нет заголовка — наследуется тип предыдущего
+        carry-forward: если в чанке нет заголовка - наследуется тип предыдущего
         (под-чанки длинного сценария теряют заголовок при сплите, но не привязку).
-        Берёт последний заголовок в чанке — корректно для границы сценариев.
+        Берёт последний заголовок в чанке - корректно для границы сценариев.
         """
 
         found = current
@@ -455,7 +498,7 @@ class KnowledgeBaseManager:
             print(f"  [{doc_type:8s}] {len(docs)} блок(ов) → {len(chunks)} чанков "
                 f"(size={cfg['chunk_size']}, overlap={cfg['chunk_overlap']}{extra})")
             if doc_type == 'sop' and tagged == 0:
-                print("  [WARN] Сценарии SOP не размечены fault_type — проверьте заголовки "
+                print("  [WARN] Сценарии SOP не размечены fault_type - проверьте заголовки "
                     "'### Сценарий ... [fault_type: ...]'.")
         return all_chunks
     
@@ -463,13 +506,13 @@ class KnowledgeBaseManager:
         """
         Режет регламент на регионы → подразделы → чанки с метаданными 
         fault_type / sop_part / stage.
-        Возвращает list[Document] (без passage-префикса — он добавится в _split_documents).
+        Возвращает list[Document] (без passage-префикса - он добавится в _split_documents).
         """
         
         text = doc.page_content
         base = dict(doc.metadata)
 
-        # 1) Регионы: '### Сценарий ...' → сценарий с типом; '## ...' → общий (fault=None).
+        # 1. Регионы: '### Сценарий ...' → сценарий с типом; '## ...' → общий (fault=None).
         regions, cur_fault, buf = [], None, []
 
         def _flush():
@@ -490,7 +533,7 @@ class KnowledgeBaseManager:
                 buf.append(line)
         _flush()
 
-        # 2) Подразделы (для сценариев) / целиком (для общих секций) → чанки с метаданными.
+        # 2. Подразделы (для сценариев) / целиком (для общих секций) → чанки с метаданными.
         out = []
         for fault, region in regions:
             segs = _subsection_segments(region) if fault else [('reference', None, region)]
@@ -501,7 +544,7 @@ class KnowledgeBaseManager:
                     meta = dict(base)
                     meta['sop_part'] = sop_part
                     if stage: 
-                        meta['stage'] = stage   # тег стадии — только на operator-чанках
+                        meta['stage'] = stage # тег стадии - только на operator-чанках
                     if fault:
                         meta['fault_type'] = fault
                     out.append(Document(page_content=ch, metadata=meta))
@@ -515,7 +558,10 @@ class KnowledgeBaseManager:
         ChromaDB может зависнуть при одновременной записи >1000 документов.
         """
 
-        db = None
+        if not chunks:
+            raise ValueError("Нет чанков для записи в ChromaDB - база пуста.")
+
+        db: Optional[Chroma] = None
         for i in range(0, len(chunks), batch_size):
             batch = chunks[i: i + batch_size]
             if db is None:
@@ -528,24 +574,32 @@ class KnowledgeBaseManager:
                 db.add_documents(batch)
             print(f"  Записано {min(i + batch_size, len(chunks))}/{len(chunks)} чанков...")
 
-        return db # type: ignore
+        assert db is not None # гарантировано непустым chunks выше
+        return db
 
     # Поиск 
 
     def search(self, query, k=4, doc_type_filter=None,
            metadata_filter=None, apply_threshold=True):
         """
-        Семантический поиск. Добавлены:
-        metadata_filter: доп. условия по метаданным (например {'fault_type': 'cavitation'});
-        apply_threshold: отключаемая отсечка по RELEVANCE_THRESHOLD — нужна для
-                        сценарного фолбэка (тип уже гарантирован метаданными,
-                        дистанция вторична).
-        Обратная совместимость: старые вызовы search(q, k, doc_type_filter) не меняются.
+        Базовый семантический поиск по ChromaDB.
+
+        Параметры:
+          doc_type_filter: ограничение по типу документа (например 'sop');
+          metadata_filter: доп. условия по метаданным
+                           (например {'fault_type': 'cavitation'});
+          apply_threshold: отключаемая отсечка по RELEVANCE_THRESHOLD - нужна для
+                           сценарного фолбэка, где тип уже гарантирован
+                           метаданными, а дистанция вторична.
+
+        Несколько условий объединяются оператором ChromaDB '$and'. Обратная
+        совместимость сохранена: вызовы search(q, k, doc_type_filter) работают
+        как раньше.
         """
 
         db = Chroma(persist_directory=self.chroma_dir,
                     embedding_function=self.embeddings)
-        prefixed_query = f"query: {query}"           # e5: prefix для запроса
+        prefixed_query = f"query: {query}" # e5: prefix для запроса
 
         conds = []
         if doc_type_filter:
@@ -554,14 +608,14 @@ class KnowledgeBaseManager:
             for kk, vv in metadata_filter.items():
                 conds.append({kk: vv})
 
-        search_kwargs = {'k': k}
+        search_kwargs: Dict[str, Any] = {'k': k}
         if len(conds) == 1:
             search_kwargs['filter'] = conds[0]
         elif len(conds) > 1:
-            search_kwargs['filter'] = {'$and': conds} # type: ignore
+            search_kwargs['filter'] = {'$and': conds}
 
-        results = db.similarity_search_with_score(prefixed_query, **search_kwargs) # type: ignore
-        
+        results = db.similarity_search_with_score(prefixed_query, **search_kwargs)
+
         if not apply_threshold:
             return results
         relevant = [(doc, score) for doc, score in results
@@ -571,13 +625,14 @@ class KnowledgeBaseManager:
                 f"(distance > {RELEVANCE_THRESHOLD})")
         return relevant
 
+
     def search_by_symptoms(self, symptom_vector_dict: dict, k: int = 4) -> List[Tuple[Document, float]]:
         """
         Поиск по симптомам из XAI-модуля через multi-query retrieval.
 
         Делает ДВА запроса:
-        1. Описательный — находит пороги/нормативы (что превышено).
-        2. Прескриптивный — находит причины и действия (что делать).
+        1. Описательный - находит пороги/нормативы (что превышено).
+        2. Прескриптивный - находит причины и действия (что делать).
         Это устраняет проблему, когда поиск находит только уставки,
         но не находит раздел "Действия оператора".
         """
@@ -587,8 +642,7 @@ class KnowledgeBaseManager:
         sensor_map = {'vibration': 'вибрация', 'temperature': 'температура',
                     'current': 'ток', 'pressure': 'давление'}
         inferred_fault = symptom_vector_dict.get('inferred_fault')
-        fault_ru = {'overheat': 'перегрев', 'cavitation': 'кавитация',
-                    'electrical': 'электрическая неисправность'}.get(inferred_fault, '') # type: ignore
+        fault_ru = _FAULT_RU.get(inferred_fault, '') if inferred_fault else ''
 
         # Запрос 1: описание состояния (пороги, нормативы)
         parts = [f"Вероятность аварии: {prob}%."]
@@ -611,7 +665,7 @@ class KnowledgeBaseManager:
         print(f"  Запрос 1 (состояние): {query_descriptive[:90]}...")
         print(f"  Запрос 2 (действия):  {query_prescriptive[:90]}...")
 
-        # Объединяем результаты с дедупликацией по содержимому
+        # Объединение результатов обоих запросов с дедупликацией по содержимому
         seen = set()
         combined = []
         for q in (query_descriptive, query_prescriptive):
@@ -621,9 +675,9 @@ class KnowledgeBaseManager:
                     seen.add(key)
                     combined.append((doc, score))
 
-        # Справочный контекст — ТОЛЬКО для обоснования диагноза: убираем из него
-        # подразделы «действия оператора» и «работы ТОиР» любого сценария, чтобы
-        # модель не перенесла их в ПРЕДПИСАНИЕ/ТОиР (замечание №5). Фильтр стоит
+        # Справочный контекст - ТОЛЬКО для обоснования диагноза: из него
+        # исключаются подразделы «действия оператора» и «работы ТОиР» любого
+        # сценария, чтобы модель не перенесла их в ПРЕДПИСАНИЕ/ТОиР. Фильтр стоит
         # ИМЕННО здесь, а не в общем search(), иначе ломаются operator/repair-поиски.
         combined = [(d, s) for (d, s) in combined
                     if d.metadata.get('sop_part') not in ('operator', 'repair')]
@@ -631,11 +685,12 @@ class KnowledgeBaseManager:
 
         return combined[:k]
     
+
     def search_maintenance_schedule(self, pump_id: str, k: int = 2):
         """
         Прямой поиск графика ТО по агрегату (отдельно от поиска по симптомам).
         График привязан к pump_id, а не к симптомам датчиков, поэтому
-        поиск по симптомам его не находит — нужен прямой запрос.
+        поиск по симптомам его не находит - нужен прямой запрос.
         """
 
         SCHEDULE_THRESHOLD = 1.5 # Мягче основного threshold
@@ -647,8 +702,9 @@ class KnowledgeBaseManager:
         )
         return [(doc, score) for doc, score in results if score <= SCHEDULE_THRESHOLD]
     
+
     def search_repair_works(self, fault_type, k=2):
-        """«Связанные работы ТОиР» — ТОЛЬКО из сценария верного типа отказа."""
+        """«Связанные работы ТОиР» - ТОЛЬКО из сценария верного типа отказа."""
 
         fault_ru = _FAULT_RU.get(fault_type, '')
         if not fault_ru:
@@ -670,6 +726,7 @@ class KnowledgeBaseManager:
             return res
         return self.search(query, k=k, doc_type_filter='sop')
     
+
     def search_operator_actions(self, fault_type, stage='critical', k=2):
         """
         «Действия оператора» строго из нужного сценария И нужной СТАДИИ.
@@ -710,7 +767,6 @@ class KnowledgeBaseManager:
         if res:
             return res
         return self.search(query, k=k, doc_type_filter='sop')
-
 
 # Точка входа 
 
@@ -766,7 +822,7 @@ if __name__ == "__main__":
             print(f"\n[{i}] Distance: {score:.4f} | "
                   f"Тип: {doc.metadata.get('doc_type')} | "
                   f"Источник: {doc.metadata.get('source')}")
-            # Убираем prefix перед выводом
+            # Префикс passage: убирается перед выводом
             clean_text = doc.page_content.replace('passage: ', '', 1)
             print(f"    {clean_text[:250]}...")
 
@@ -783,6 +839,6 @@ if __name__ == "__main__":
             print(f"\n[{i}] Distance: {score:.4f} | "
                   f"Тип: {doc.metadata.get('doc_type')} | "
                   f"Источник: {doc.metadata.get('source')}")
-            # Убираем prefix перед выводом
+            # Префикс passage: убирается перед выводом
             clean_text = doc.page_content.replace('passage: ', '', 1)
             print(f"    {clean_text[:250]}...")

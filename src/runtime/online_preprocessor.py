@@ -1,5 +1,7 @@
 """
-Потоковый (stateful) препроцессор для режима реального времени.
+Потоковый stateful-препроцессор реального времени (Online Preprocessor)
+======================================================================
+src/runtime/online_preprocessor.py
 
 Назначение: принимать сырые строки телеметрии по одной и вычислять
 тот же самый вектор признаков FEATURE_COLS, что и offline-модуль
@@ -22,7 +24,7 @@ warmup-префикс до содержательной части.
 """
 
 from collections import deque
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, cast
 
 import numpy as np
 import pandas as pd
@@ -41,7 +43,7 @@ class OnlinePreprocessor:
 
     def __init__(self, feature_cols: Sequence[str]):
         # FEATURE_COLS импортируется вызывающей стороной из
-        # data_preprocessor — единый источник истины для train и inference.
+        # data_preprocessor - единый источник истины для train и inference.
         self.feature_cols: List[str] = list(feature_cols)
         # buffer хранит ТОЛЬКО предыдущие строки (история до момента T)
         self._buffers: Dict[str, deque] = {}
@@ -80,19 +82,20 @@ class OnlinePreprocessor:
             for w in WINDOWS:
                 window = series[-w:]
                 out[f"{p}_mean_{w}"] = float(window.mean())
-                # ddof=1 — как pandas .rolling().std() по умолчанию
+                # ddof=1 - как pandas .rolling().std() по умолчанию
                 out[f"{p}_std_{w}"] = float(window.std(ddof=1))
                 out[f"{p}_max_{w}"] = float(window.max())
             # diff_30: x[T-1] - x[T-31]
             out[f"{p}_diff_30"] = float(series[-1] - series[-31])
         row = pd.DataFrame([out])
-        # Жёсткая фиксация порядка колонок по контракту FEATURE_COLS
-        return row[self.feature_cols]   # type: ignore
+        # Жёсткая фиксация порядка колонок по контракту FEATURE_COLS.
+        # cast: pandas-stubs выводят DataFrame[list] как Series - здесь это DataFrame.
+        return cast(pd.DataFrame, row[self.feature_cols])
 
 
 # Регрессионная проверка паритета online == offline.
 # Запускать один раз при изменении любого из препроцессоров:
-#   python -m scripts.test_online_parity
+#   python experiments/validation/online_parity_test.py
 def verify_parity(
     raw_df: pd.DataFrame,
     offline_features: pd.DataFrame,
@@ -103,8 +106,8 @@ def verify_parity(
 ) -> bool:
     """Сверяет потоковый расчёт с offline-матрицей признаков.
 
-    raw_df            — сырой датасет (industrial_pumps_dataset.csv)
-    offline_features  — результат offline data_preprocessor для тех же строк,
+    raw_df            - сырой датасет (industrial_pumps_dataset.csv)
+    offline_features  - результат offline data_preprocessor для тех же строк,
                         с сохранённым исходным индексом raw_df.
     Возвращает True при совпадении; иначе бросает AssertionError
     с первой расходящейся колонкой.
@@ -116,7 +119,7 @@ def verify_parity(
         proc.reset(pump_id)
         n = 0
         for idx, raw in grp.iterrows():
-            feats = proc.push(pump_id, raw.to_dict())   # type: ignore
+            feats = proc.push(pump_id, cast(Dict[str, float], raw.to_dict()))
             if feats is None or idx not in offline_features.index:
                 continue
             ref = offline_features.loc[idx, feature_cols].astype(float).values

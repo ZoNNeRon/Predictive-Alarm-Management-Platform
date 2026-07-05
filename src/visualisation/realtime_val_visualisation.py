@@ -1,28 +1,30 @@
 """
-realtime_validation_viz.py — визуализация результатов real-time валидации.
-==========================================================================
+Метрики и графики real-time валидации (Validation Viz)
+======================================================
+src/visualisation/realtime_val_visualisation.py
+
 Назначение: из лога прогона реального времени строить ПУБЛИКАЦИОННЫЕ графики
 для текста диссертации и защиты, а также считать сводные метрики. Главный из
-них — «лавина тревог»: сколько сигналов сгенерировал бы наивный пороговый
+них - «лавина тревог»: сколько сигналов сгенерировал бы наивный пороговый
 алармер и сколько из них система погасила окнами / состоянием / дебаунсом,
 оставив оператору лишь подтверждённые тревоги. Это прямое доказательство цели
 работы.
 
-КОНТРАКТ ВХОДА — единый per-tick лог (pandas.DataFrame), колонки:
-    timestamp        datetime  — модельное время тика
+КОНТРАКТ ВХОДА - единый per-tick лог (pandas.DataFrame), колонки:
+    timestamp        datetime  - модельное время тика
     pump_id          str
-    true_state       int 0..4  — ИСТИНА генератора (Off/Startup/Healthy/
+    true_state       int 0..4  - ИСТИНА генератора (Off/Startup/Healthy/
                                  Degradation/Critical)
-    true_fault       str       — overheat/cavitation/electrical/none
-    sev_detected     int       — что выдала модель: 0/1/2; -1 если тик не готов
-    suppressed       bool      — сигнал подавлен (пуск/простой и т.п.)
-    suppress_reason  str       — 'anomaly'/'startup_idle'/'debounce'/'' 
-    raw_fire         bool      — наивный пороговый алармер сработал бы на этом тике
-    escalated        bool      — FSM подтвердил НОВЫЙ переход в тревогу на этом тике
+    true_fault       str       - overheat/cavitation/electrical/none
+    sev_detected     int       - что выдала модель: 0/1/2; -1 если тик не готов
+    suppressed       bool      - сигнал подавлен (пуск/простой и т.п.)
+    suppress_reason  str       - 'anomaly'/'startup_idle'/'debounce'/'' 
+    raw_fire         bool      - наивный пороговый алармер сработал бы на этом тике
+    escalated        bool      - FSM подтвердил НОВЫЙ переход в тревогу на этом тике
 
 Лог накапливается коллектором ValidationCollector по ходу прогона (хедлесс-
 харнесс или advance_stream), затем передаётся в построители. Визуализатор
-полностью автономен от моделей — на нём же гоняется самотест на синтетике.
+полностью автономен от моделей - на нём же гоняется самотест на синтетике.
 """
 
 from __future__ import annotations
@@ -30,13 +32,14 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, cast
 
 import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.artist import Artist
 from matplotlib.patches import Patch
 from matplotlib.lines import Line2D
 
@@ -46,13 +49,15 @@ for _p in (_THIS_DIR, _PROJECT_ROOT):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+from config.settings import ISA_ALARM_RATE_LIMIT   # предел тревог/час (ISA 18.2)
+
 # Палитра, согласованная с интерфейсом (NE 107 / тяжесть)
 C_NORM, C_WARN, C_ALARM = "#1E8A3C", "#E0A800", "#C62828"
 C_GRAY, C_BLUE = "#5A5F66", "#1565C0"
 SEV_COLORS = {0: C_NORM, 1: C_WARN, 2: C_ALARM}
 SEV_LABELS = {0: "Норма", 1: "Предупреждение", 2: "Авария"}
 # Истинное состояние генератора → класс тяжести (как в обучении)
-STATE_TO_SEV = {2: 0, 3: 1, 4: 2}   # Off/Startup (0,1) — не оцениваются
+STATE_TO_SEV = {2: 0, 3: 1, 4: 2}   # Off/Startup (0,1) - не оцениваются
 
 LOG_COLUMNS = ["timestamp", "pump_id", "true_state", "true_fault",
                "sev_detected", "suppressed", "suppress_reason",
@@ -74,7 +79,7 @@ def _style():
 class ValidationCollector:
     """Накопитель per-tick лога. Вызывается по ходу прогона.
 
-    Пороговые значения — для расчёта «наивного» raw_fire (что сработало бы без
+    Пороговые значения - для расчёта «наивного» raw_fire (что сработало бы без
     окон/дебаунса/состояния). Берутся из config.settings.THRESHOLDS.
     """
     vib_warn: float = 3.0
@@ -124,7 +129,6 @@ class ValidationCollector:
     def to_frame(self) -> pd.DataFrame:
         return pd.DataFrame(self._rows, columns=LOG_COLUMNS)
 
-
 # Сводные метрики
 
 def summarize(log: pd.DataFrame) -> dict:
@@ -146,7 +150,7 @@ def summarize(log: pd.DataFrame) -> dict:
         "raw_fire": raw, "confirmed": confirmed, "suppressed": suppressed,
         "suppress_ratio_pct": round(ratio, 1),
         "peak_alarms_per_hour": peak_rate,
-        "isa_18_2_ok": peak_rate <= 6,
+        "isa_18_2_ok": peak_rate <= ISA_ALARM_RATE_LIMIT,
         "fault_episodes": len(lat),
         "detected_episodes": len(det), "missed_episodes": len(miss),
         "median_latency_min": (round(float(np.median([e["latency_min"] for e in det])), 1)
@@ -157,9 +161,9 @@ def summarize(log: pd.DataFrame) -> dict:
 def detection_latencies(log: pd.DataFrame) -> List[dict]:
     """Задержка детектирования по каждому эпизоду деградации.
 
-    Эпизод — непрерывный участок true_state==3 (Degradation) на насосе.
+    Эпизод - непрерывный участок true_state==3 (Degradation) на насосе.
     Задержка = время от начала эпизода до первого sev_detected>=1.
-    None — пропуск (FN).
+    None - пропуск (FN).
     """
     out: List[dict] = []
     for pid, g in log.sort_values("timestamp").groupby("pump_id"):
@@ -179,11 +183,11 @@ def detection_latencies(log: pd.DataFrame) -> List[dict]:
                         "onset": onset, "latency_min": lat})
     return out
 
-
-# Построители графиков
+# Построение графиков
 
 def plot_avalanche(log: pd.DataFrame):
     """ГЛАВНЫЙ график: воронка лавины + разбивка подавленного по причинам."""
+
     _style()
     raw = int(log["raw_fire"].sum())
     confirmed = int(log["escalated"].sum())
@@ -218,7 +222,7 @@ def plot_avalanche(log: pd.DataFrame):
     if by_reason.sum() > 0:
         total = int(by_reason.sum())
         colors = [reason_color.get(k, "#9AA0A6") for k in by_reason.index]
-        # Проценты — на крупных секторах; подписи причин — в легенде снизу
+        # Проценты - на крупных секторах; подписи причин - в легенде снизу
         # (вертикальный список): мелкие сектора 1–6% радиальными подписями
         # налезали друг на друга. Легенда исключает наложение by design.
         wedges, _t, _a = ax2.pie(
@@ -226,7 +230,7 @@ def plot_avalanche(log: pd.DataFrame):
             autopct=lambda p: f"{p:.0f}%" if p >= 8 else "",
             pctdistance=0.62, wedgeprops={"linewidth": 1, "edgecolor": "white"},
             textprops={"fontsize": 13, "fontweight": "bold", "color": "white"})
-        legend_labels = [f"{names.get(str(k), str(k))} — {v / total * 100:.0f}%"
+        legend_labels = [f"{names.get(str(k), str(k))} - {v / total * 100:.0f}%"
                          for k, v in by_reason.items()]
         ax2.legend(wedges, legend_labels, loc="upper center",
                    bbox_to_anchor=(0.5, -0.02), fontsize=11.5, frameon=False,
@@ -240,6 +244,7 @@ def plot_avalanche(log: pd.DataFrame):
 
 def plot_alarm_rate(log: pd.DataFrame):
     """Интенсивность тревог в час против норматива ISA 18.2 (≤6/ч)."""
+
     _style()
     s = (log.assign(_a=log["escalated"].astype(int))
          .set_index("timestamp")["_a"].sort_index())
@@ -247,9 +252,11 @@ def plot_alarm_rate(log: pd.DataFrame):
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.plot(per_hour.index, per_hour.values, color=C_BLUE, lw=1.8,
             label="Подтверждённые тревоги / час")
-    ax.axhline(6, color=C_ALARM, ls="--", lw=1.6, label="Предел ISA 18.2 (6/ч)")
-    ax.fill_between(per_hour.index, per_hour.values, 6,
-                    where=(per_hour.values > 6), color=C_ALARM, alpha=0.18)
+    lim = ISA_ALARM_RATE_LIMIT
+    ax.axhline(lim, color=C_ALARM, ls="--", lw=1.6,
+               label=f"Предел ISA 18.2 ({lim}/ч)")
+    ax.fill_between(per_hour.index, per_hour.values, lim,
+                    where=(per_hour.values > lim), color=C_ALARM, alpha=0.18)
     ax.set_title("Интенсивность тревог (ISA 18.2)")
     ax.set_ylabel("Тревог за скользящий час")
     ax.set_xlabel("Время")
@@ -261,6 +268,7 @@ def plot_alarm_rate(log: pd.DataFrame):
 
 def plot_detection_latency(log: pd.DataFrame):
     """Задержка детектирования по эпизодам, сгруппированная по типу отказа."""
+
     _style()
     lat = [e for e in detection_latencies(log) if e["latency_min"] is not None]
     fig, ax = plt.subplots(figsize=(9, 4.2))
@@ -291,6 +299,7 @@ def plot_detection_latency(log: pd.DataFrame):
 
 def plot_confusion(log: pd.DataFrame):
     """Матрица ошибок: истинная тяжесть vs детектированная (по неподавленным)."""
+
     _style()
     d = log[(~log["suppressed"]) & (log["sev_detected"] >= 0) &
             (log["true_state"].isin(STATE_TO_SEV))].copy()
@@ -318,40 +327,9 @@ def plot_confusion(log: pd.DataFrame):
     return fig
 
 
-def plot_state_timeline(log: pd.DataFrame, pump_id: Optional[str] = None):
-    """Таймлайн насоса: истинное состояние vs детектированная тяжесть."""
-    _style()
-    if pump_id is None:
-        pump_id = log["pump_id"].iloc[0]
-    g = log[log["pump_id"] == pump_id].sort_values("timestamp") # type: ignore
-    t = g["timestamp"].values
-    true_sev = g["true_state"].map(STATE_TO_SEV).fillna(-1).values  # -1 = пуск/простой
-    det = g["sev_detected"].values
-
-    fig, ax = plt.subplots(figsize=(11, 2.8))
-    def band(y, series, h=0.8):
-        for i in range(len(series)):
-            v = series[i]
-            color = SEV_COLORS.get(int(v), C_GRAY) if v >= 0 else "#2B2F36"
-            ax.axvspan(t[i], t[min(i + 1, len(t) - 1)], ymin=y, ymax=y + h * 0.45,
-                       color=color, lw=0)
-    band(0.52, true_sev)
-    band(0.04, det)
-    ax.set_ylim(0, 1); ax.set_yticks([0.27, 0.75])
-    ax.set_yticklabels(["Детектировано", "Истина"])
-    ax.set_title(f"Таймлайн состояния — {pump_id}")
-    ax.set_xlabel("Время"); ax.grid(False)
-    leg = [Patch(facecolor=SEV_COLORS[k], label=SEV_LABELS[k]) for k in (0, 1, 2)]
-    leg.append(Patch(facecolor=C_GRAY, label="Пуск / простой"))
-    ax.legend(handles=leg, ncol=4, loc="upper center",
-              bbox_to_anchor=(0.5, -0.28), frameon=False, fontsize=9)
-    fig.autofmt_xdate()
-    fig.tight_layout()
-    return fig
-
-
 def plot_state_timeline_all(log: pd.DataFrame):
-    """Таймлайн по ВСЕМ насосам парка: на каждый насос — пара полос истина/детект."""
+    """Таймлайн по ВСЕМ насосам парка: на каждый насос - пара полос истина/детект."""
+
     _style()
     pumps = sorted(log["pump_id"].unique())
     n = len(pumps)
@@ -359,12 +337,12 @@ def plot_state_timeline_all(log: pd.DataFrame):
     if n == 1:
         axes = [axes]
     for ax, pid in zip(axes, pumps):
-        g = log[log["pump_id"] == pid].sort_values("timestamp") # type: ignore
+        g = cast(pd.DataFrame, log[log["pump_id"] == pid]).sort_values("timestamp")
         t = g["timestamp"].values
         true_sev = g["true_state"].map(STATE_TO_SEV).fillna(-1).values
         det = g["sev_detected"].astype(float).values
-        # на остановленном агрегате детект честно показываем как «отключён»:
-        # после аварии/останова модель не «читает норму» — насос физически off
+        # на остановленном агрегате детект честно отображается как «отключён»:
+        # после аварии/останова модель не «читает норму» - насос физически off
         det = np.where(true_sev < 0, -1.0, det)
 
         def band(y, series, h=0.40):
@@ -391,20 +369,22 @@ def plot_state_timeline_all(log: pd.DataFrame):
         for sp in ax.spines.values():
             sp.set_visible(False)
     axes[-1].set_xlabel("Дата (мм-дд) Время (час)", fontsize=14)
-    leg = [Patch(facecolor=SEV_COLORS[k], label=SEV_LABELS[k]) for k in (0, 1, 2)]
+    leg: List[Artist] = [Patch(facecolor=SEV_COLORS[k], label=SEV_LABELS[k])
+                         for k in (0, 1, 2)]
     leg.append(Patch(facecolor=C_GRAY, label="Пуск / простой"))
     leg.append(Line2D([0], [0], marker="o", color="white", markerfacecolor="#8E24AA",
-                      markersize=8, label="Аномалия (истина)", linewidth=0))    # type: ignore
+                      markersize=8, label="Аномалия (истина)", linewidth=0))
     fig.legend(handles=leg, ncol=5, loc="lower center",
                bbox_to_anchor=(0.5, 0.0), frameon=False, fontsize=10)
     fig.suptitle("Таймлайн состояния по насосам парка", fontweight="bold", fontsize=16)
     fig.autofmt_xdate()
-    fig.tight_layout(rect=[0, 0.04, 1, 0.97])   # type: ignore
+    fig.tight_layout(rect=(0, 0.04, 1, 0.97))
     return fig
 
 
 def render_all(log: pd.DataFrame, outdir: str) -> Dict[str, str]:
     """Строит и сохраняет все графики; возвращает {имя: путь}."""
+
     os.makedirs(outdir, exist_ok=True)
     figs = {
         "avalanche": plot_avalanche(log),
@@ -420,7 +400,6 @@ def render_all(log: pd.DataFrame, outdir: str) -> Dict[str, str]:
         plt.close(fig)
         paths[name] = p
     return paths
-
 
 # Самотест на синтетическом логе
 

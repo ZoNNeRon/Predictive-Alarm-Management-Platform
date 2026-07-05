@@ -1,44 +1,45 @@
 """
-realtime_preprocessor.py — прогрессивный потоковый препроцессор (реальное время).
-================================================================================
+Прогрессивный потоковый препроцессор (Realtime Progressive Preprocessor)
+=======================================================================
+experiments/realtime_validation/realtime_preprocessor.py
+
 Назначение: в режиме реального времени выдавать вектор признаков FEATURE_COLS
 С ПЕРВОЙ ЖЕ строки, а не после 60-минутного прогрева. Это снимает «слепое окно»
 на старте демо: модель оценивает состояние сразу, на частичных (расширяющихся)
 окнах, а по мере накопления истории окна становятся полноразмерными.
 
-ОТЛИЧИЕ ОТ СТРОГОГО OnlinePreprocessor — ТОЛЬКО политика прогрева. Наследуемся
+ОТЛИЧИЕ ОТ СТРОГОГО OnlinePreprocessor - ТОЛЬКО политика прогрева. Наследуется
 от него, чтобы переиспользовать __init__/reset/feature_cols и НЕ трогать его
 паритет-контракт и regression-тест verify_parity (offline == online на полном
 окне остаётся в силе для обучающего пайплайна).
 
 Прогрессивные окна (mean/max/std/diff) считаются так:
-  • mean, max — по min(len_буфера, w) последним точкам (расширяющееся → скользящее
-    окно). Пока строк меньше 15, окна 15/30/60 численно совпадают — это и есть
-    поведение «считаем по тому, что есть»;
-  • std — 0 при <2 точках (волатильности ещё нет), иначе по доступным (ddof=1,
+  - mean, max - по min(len_буфера, w) последним точкам (расширяющееся → скользящее
+    окно). Пока строк меньше 15, окна 15/30/60 численно совпадают - это и есть
+    поведение «считается по тому, что есть»;
+  - std - 0 при <2 точках (волатильности ещё нет), иначе по доступным (ddof=1,
     как pandas .rolling().std());
-  • diff_30 — 0 при <31 строке (нет 30-шаговой истории → нет тренда), иначе
+  - diff_30 - 0 при <31 строке (нет 30-шаговой истории → нет тренда), иначе
     точный x[T-1] − x[T-31].
 
 СОХРАНЯЕТСЯ:
-  • shift(1): признаки момента T считаются ТОЛЬКО по строкам [T-w .. T-1];
+  - shift(1): признаки момента T считаются ТОЛЬКО по строкам [T-w .. T-1];
     текущая сырая строка в окно не входит (защита от утечки, как в offline);
-  • порядок и имена колонок строго по FEATURE_COLS (контракт признаков);
-  • ПАРИТЕТ НА ПОЛНОМ ОКНЕ: начиная с 60-й строки результат бит-в-бит совпадает
+  - порядок и имена колонок строго по FEATURE_COLS (контракт признаков);
+  - ПАРИТЕТ НА ПОЛНОМ ОКНЕ: начиная с 60-й строки результат бит-в-бит совпадает
     со строгим OnlinePreprocessor (и, следовательно, с offline-обучением).
 
 Компромисс (осознанный, согласован): первые ~15 минут признаки построены на
 частичных окнах и слегка вне обучающего распределения. Поскольку Норма стартует
 с устоявшихся значений, mean/max почти не отличаются от полных; шумят std/diff,
 но diff на старте обнулён. На плитках первые минуты помечаются «прогрев»
-(см. rows_seen) — оценка идёт, но честно отмечена как предварительная.
+(см. rows_seen) - оценка идёт, но честно отмечена как предварительная.
 """
-
-from collections import deque
-from typing import Dict, Optional
 
 import os
 import sys
+from collections import deque
+from typing import Dict, Optional, cast
 
 import numpy as np
 import pandas as pd
@@ -58,19 +59,26 @@ class RealtimeProgressivePreprocessor(OnlinePreprocessor):
 
     def push(self, pump_id: str, raw_row: Dict[str, float]) -> Optional[pd.DataFrame]:
         # ЧИСТЫЙ контракт (бит-в-бит со строгим). Обнуление окна на пуске/простое
-        # делает приложение явным вызовом reset() — см. advance_stream: там надёжно
-        # доступно состояние агрегата, не зависим от того, доходит ли "state" сюда.
+        # делает приложение явным вызовом reset() - см. advance_stream: там надёжно
+        # доступно состояние агрегата, независимо от того, доходит ли "state" сюда.
         buf = self._buffers.setdefault(pump_id, deque(maxlen=WARMUP_ROWS + 1))
-        # shift(1): считаем ПО буферу ДО добавления текущей строки.
-        # Отличие от строгого — порог: с 1-й строки истории, а не с 60-й.
+        # shift(1): расчёт ПО буферу ДО добавления текущей строки.
+        # Отличие от строгого - порог: с 1-й строки истории, а не с 60-й.
         features = self._compute(buf) if len(buf) >= 1 else None
         buf.append({p: float(raw_row[p]) for p in PARAMS})
         return features
 
-    def reset(self, pump_id: str) -> None:
-        """Явный сброс окна агрегата (вызывается приложением при трипе/квитировании
-        аварии). Дублирует авто-сброс на OFF, на случай досрочного перезапуска."""
-        self._buffers.pop(pump_id, None)
+
+    def reset(self, pump_id: Optional[str] = None) -> None:
+        """Сброс окна: конкретного агрегата (трип/квитирование аварии) либо всех
+        буферов при pump_id=None. Сигнатура совместима с базовым OnlinePreprocessor
+        (LSP); дублирует авто-сброс на OFF на случай досрочного перезапуска."""
+
+        if pump_id is None:
+            self._buffers.clear()
+        else:
+            self._buffers.pop(pump_id, None)
+
 
     def _compute(self, buf: deque) -> pd.DataFrame:
         hist = {p: np.array([r[p] for r in buf], dtype=float) for p in PARAMS}
@@ -79,7 +87,7 @@ class RealtimeProgressivePreprocessor(OnlinePreprocessor):
         for p in PARAMS:
             series = hist[p]
             for w in WINDOWS:
-                window = series[-w:]                       # min(n, w) точек
+                window = series[-w:] # min(n, w) точек
                 out[f"{p}_mean_{w}"] = float(window.mean())
                 out[f"{p}_max_{w}"] = float(window.max())
                 # std требует >=2 точек; иначе волатильности ещё нет
@@ -89,10 +97,14 @@ class RealtimeProgressivePreprocessor(OnlinePreprocessor):
             out[f"{p}_diff_30"] = (float(series[-1] - series[-31])
                                    if n >= 31 else 0.0)
         row = pd.DataFrame([out])
-        return row[self.feature_cols]   # жёсткий порядок колонок по контракту  # type: ignore
+        # Жёсткий порядок колонок по контракту FEATURE_COLS.
+        # cast: pandas-stubs выводят DataFrame[list] как Series - здесь это DataFrame.
+        return cast(pd.DataFrame, row[self.feature_cols])
+
 
     def rows_seen(self, pump_id: str) -> int:
-        """Накоплено строк истории по насосу — для бейджа «прогрев» на плитке."""
+        """Накоплено строк истории по насосу - для бейджа «прогрев» на плитке."""
+
         buf = self._buffers.get(pump_id)
         return len(buf) if buf else 0
 
@@ -125,8 +137,9 @@ if __name__ == "__main__":
             strict_first = i
         if prog_first is None and fp is not None:
             prog_first = i
-        if fs is not None:  # где строгий даёт результат — прогрессивный обязан совпасть
-            d = np.abs(fs[fc].values - fp[fc].values)   # type: ignore
+        if fs is not None: # где строгий даёт результат - прогрессивный обязан совпасть
+            assert fp is not None, "прогрессивный молчит там, где строгий дал результат"
+            d = np.abs(fs[fc].to_numpy() - fp[fc].to_numpy())
             if not np.all(d <= 1e-9):
                 mism += 1
     print(f"первый признак: progressive с тика {prog_first}, strict с тика {strict_first}")

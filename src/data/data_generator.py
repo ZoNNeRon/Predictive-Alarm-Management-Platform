@@ -1,6 +1,8 @@
 """
 Генератор имитационных данных насоса МНХВ
 ==========================================
+src/data/data_generator.py
+
 Конечный автомат (State Machine) + AR(1)-процессы + три типа отказа.
 
 Состояния:
@@ -11,17 +13,17 @@
     4 - Critical    : критический отказ, устойчивое нарушение порогов
 
 Типы отказа (fault_type):
-    overheat    (Тип А, ~55%) — перегрев + рост нагрузки:
+    overheat    (Тип А, ~55%) - перегрев + рост нагрузки:
         температура растёт к 93+°C, ток растёт и волатилен,
         вибрация умеренно растёт, давление в норме.
         Причина: износ подшипника, несоосность.
 
-    cavitation  (Тип Б, ~30%) — критическая вибрация + падение давления:
+    cavitation  (Тип Б, ~30%) - критическая вибрация + падение давления:
         вибрация растёт к 8+ мм/с, давление падает/пульсирует,
         температура и ток в норме.
         Причина: кавитация, повреждение рабочего колеса.
 
-    electrical  (Тип В, ~15%) — аномалии тока без роста вибрации и температуры:
+    electrical  (Тип В, ~15%) - аномалии тока без роста вибрации и температуры:
         ток скачет, растёт его дисперсия, вибрация и температура в зелёной зоне.
         Причина: электрика, изменение сопротивления сети.
 """
@@ -46,7 +48,7 @@ class PumpDataGenerator:
     Генератор данных на основе конечного автомата (State Machine).
     Каждый физический параметр моделируется AR(1)-процессом:
         x[t] = μ + φ·(x[t-1] - μ) + ε[t]
-    где φ — инерция сигнала, μ — целевое среднее, ε — белый шум,
+    где φ - инерция сигнала, μ - целевое среднее, ε - белый шум,
     t - текущий момент времени, t-1 - предыдущий момент времени.
     """
 
@@ -63,11 +65,6 @@ class PumpDataGenerator:
         self.start_date = datetime.strptime(start_date, '%Y-%m-%d %H:%M:%S')
         self.total_days = total_days
         self.total_minutes = total_days * 24 * 60
-
-        self.project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        self.raw_dir = os.path.join(self.project_root, 'data', 'raw')
-        self.processed_dir = os.path.join(self.project_root, 'data', 'processed')
-        self.graph_dir = os.path.join(self.project_root, 'data', 'graphs')
 
         self.ambient_temp = 20.0
         self.current_temp = self.ambient_temp
@@ -123,7 +120,7 @@ class PumpDataGenerator:
 
     def generate_off(self, duration_mins: int):
         """
-        Состояние 0 — оборудование выключено.
+        Состояние 0 - оборудование выключено.
         Температура экспоненциально остывает.
         Механические сигналы затухают через AR(1) с коэффициентом 0.5.
         """
@@ -139,7 +136,7 @@ class PumpDataGenerator:
 
     def generate_startup(self):
         """
-        Состояние 1 — пуск (2–3 мин).
+        Состояние 1 - пуск (2–3 мин).
         Резкий всплеск тока (~150 А, потом спадает), гидроудар давления,
         кратковременный рост вибрации до 4–5 мм/с.
         """
@@ -155,10 +152,10 @@ class PumpDataGenerator:
 
     def generate_healthy(self, duration_mins: int):
         """
-        Состояние 2 — штатная работа.
+        Состояние 2 - штатная работа.
         AR(1): x[t] = μ + φ·(x[t-1] - μ) + ε[t]
-        φ = 0.9 (сильная инерция), μ — физические базовые значения агрегата.
-        С вероятностью 0.1% — аппаратный сбой одного датчика (изолированный выброс).
+        φ = 0.9 (сильная инерция), μ - физические базовые значения агрегата.
+        С вероятностью 0.1% - аппаратный сбой одного датчика (изолированный выброс).
         """
 
         PHI = 0.9
@@ -175,7 +172,7 @@ class PumpDataGenerator:
             anom_vib = anom_temp = anom_curr = 0
             vib_out  = self.last_vib
             if np.random.rand() <= 0.001:
-                # Разовый аппаратный сбой — один из трёх датчиков
+                # Разовый аппаратный сбой - один из трёх датчиков
                 sensor = np.random.choice(['vib', 'temp', 'curr'])
                 if sensor == 'vib':
                     vib_out = np.random.normal(9.5, 0.5); anom_vib = 1
@@ -191,7 +188,7 @@ class PumpDataGenerator:
 
     def generate_degradation(self, duration_mins: int, fault_type: str):
         """
-        Состояние 3 — деградация по одному из трёх типов.
+        Состояние 3 - деградация по одному из трёх типов.
         Параметры, не участвующие в данном типе отказа, удерживаются у нормы.
         Это обеспечивает разные сигнатуры, которые XAI (SHAP) должен распознать.
         """
@@ -225,7 +222,7 @@ class PumpDataGenerator:
                 self.last_vib = vib_trend[i] + np.random.normal(0, 0.3)
                 self.last_curr = (self.last_curr * 0.9
                                   + 50.0 * 0.1 + np.random.normal(0, 1.0))
-                # Пульсация давления — высокая дисперсия на падающем тренде
+                # Пульсация давления - высокая дисперсия на падающем тренде
                 self.last_press = press_trend[i] + np.random.normal(0, 0.08)
                 self._append_row(3, self.last_vib, self.current_temp,
                                  self.last_curr, self.last_press, fault_type='cavitation')
@@ -247,20 +244,20 @@ class PumpDataGenerator:
                                  self.last_curr, self.last_press, fault_type='electrical')
 
     def generate_critical(self, duration_mins, fault_type):
-        """Критический отказ — устойчивое нарушение порогов с сохранением AR(1)-памяти."""
+        """Критический отказ - устойчивое нарушение порогов с сохранением AR(1)-памяти."""
 
-        PHI = 0.8   # память сигнала и в аварии: значения инерционны, не скачут случайно
+        PHI = 0.8   # память сигнала: значения инерционны, не скачут случайно
         for _ in range(duration_mins):
             # AR(1) с привязкой к типу аварии
             if fault_type == 'overheat':
                 self.current_temp = (self.current_temp * PHI 
-                                     + 96.0 * (1-PHI) + np.random.normal(0, 0.8))
+                                        + 96.0 * (1-PHI) + np.random.normal(0, 0.8))
                 self.last_vib = (self.last_vib * PHI 
-                                 + 8.5 * (1-PHI) + np.random.normal(0, 0.4))
+                                    + 8.5 * (1-PHI) + np.random.normal(0, 0.4))
                 self.last_curr = (self.last_curr * PHI 
-                                  + 78.0 * (1-PHI) + np.random.normal(0, 2.0))
+                                    + 78.0 * (1-PHI) + np.random.normal(0, 2.0))
                 self.last_press = (self.last_press * PHI 
-                                   + 1.3 * (1-PHI) + np.random.normal(0, 0.05))
+                                    + 1.3 * (1-PHI) + np.random.normal(0, 0.05))
 
             elif fault_type == 'cavitation':
                 self.current_temp = (self.current_temp * 0.9 
@@ -315,7 +312,7 @@ class PumpDataGenerator:
                     break
                 self.generate_critical(np.random.randint(10, 60), fault)
 
-        df: pd.DataFrame = pd.DataFrame(self.data).iloc[:self.total_minutes] # type: ignore[assignment]
+        df = pd.DataFrame(self.data).head(self.total_minutes)
         self._print_state_distribution(df)
         return df
 
@@ -350,7 +347,7 @@ if __name__ == "__main__":
                                       total_days=90)
         df = generator.generate_dataset()
 
-        # Демонстрационный график — только для первого насоса
+        # Демонстрационный график - только для первого насоса
         if pump_id == 'MNHV_001':
             print(f"Построение демонстрационного графика для {pump_id}...")
             plot_smart_episode(df, hours=60)

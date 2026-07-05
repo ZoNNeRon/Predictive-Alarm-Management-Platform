@@ -1,12 +1,14 @@
 """
 Блок визуализации фрагмента сырых данных из data_generator.py
 =============================================================
+src/visualisation/simulation_visualisation.py
+
 Строит 5-панельный график окна вокруг последнего зафиксированного отказа.
 Показывает переход Healthy → Degradation → Critical с аннотацией типа отказа
 и фоновой подсветкой по fault_type.
 Точками на графиках отображаются аппаратные сбои.
 Датчик давления не сбоит, т.к. промышленные мембранные преобразователи
-конструктивно защищенносты, а вязкая среда нефтепроводов обладает  
+конструктивно защищены, а вязкая среда нефтепроводов обладает
 демпфирующими свойствами, физически сглаживающими любые мгновенные помехи.
 
 Панели: Вибрация | Температура | Ток | Давление | Состояние
@@ -37,6 +39,17 @@ project_root = os.path.dirname(
 graph_dir = os.path.join(project_root, 'artifacts', 'graphs')
 
 def plot_smart_episode(df: pd.DataFrame, hours: int = 60):
+    """
+    5-панельный график окна вокруг последнего зафиксированного отказа.
+    Показывает переход Healthy → Degradation → Critical с аннотацией типа отказа
+    и фоновой подсветкой по fault_type.
+    Точками на графиках отображаются аппаратные сбои.
+    Датчик давления не сбоит, т.к. промышленные мембранные преобразователи
+    конструктивно защищены, а вязкая среда нефтепроводов обладает
+    демпфирующими свойствами, физически сглаживающими любые мгновенные помехи.
+
+    Панели: Вибрация | Температура | Ток | Давление | Состояние
+    """
 
     critical_indices = df[df['state'] == 4].index
     if len(critical_indices) > 0:
@@ -53,16 +66,16 @@ def plot_smart_episode(df: pd.DataFrame, hours: int = 60):
     fault_mode = sample[sample['fault_type'] != 'none']['fault_type'].mode()
     fault_label = fault_mode.iloc[0] if not fault_mode.empty else 'none'
     fault_display = {
-        'overheat':   'Тип А - перегрев (износ подшипника)',
-        'cavitation': 'Тип Б — кавитация (повреждение колеса)',
-        'electrical': 'Тип В — аномалия тока (электрика)',
+        'overheat':   'Тип А - перегрев',
+        'cavitation': 'Тип Б - кавитация',
+        'electrical': 'Тип В - аномалия тока',
     }.get(fault_label, 'нет отказа')
 
     fig, axs = plt.subplots(5, 1, figsize=(14, 15), sharex=True)
     fig.suptitle(
         f'Имитационная модель МНХВ: окно развития дефекта\n'
         f'{fault_display} | AR(1)-процессы с типизированными сигнатурами',
-        fontsize=13, fontweight='bold'
+        fontsize=16, fontweight='bold'
     )
 
     # Фоновая подсветка по типу отказа
@@ -84,7 +97,7 @@ def plot_smart_episode(df: pd.DataFrame, hours: int = 60):
     anom_temp = sample[sample['anomaly_temperature'] == 1]
     anom_curr = sample[sample['anomaly_current'] == 1]
 
-    # Панель 0 — Вибрация
+    # Панель 0 - Вибрация
     axs[0].plot(sample['timestamp'], sample['vibration'], color='steelblue', lw=0.8)
     axs[0].axhline(VIB_WARNING,  color='orange', ls='--', lw=1.2,
                     label=f'Warning ({VIB_WARNING} мм/с)')
@@ -93,11 +106,12 @@ def plot_smart_episode(df: pd.DataFrame, hours: int = 60):
     if not anom_vib.empty:
         axs[0].scatter(anom_vib['timestamp'], anom_vib['vibration'],
                         color='purple', zorder=5, s=30, label='Помеха датчика')
-    axs[0].set_ylabel('Вибрация (мм/с)')
-    axs[0].legend(fontsize=8)
+    axs[0].tick_params(axis='y', labelsize=10)
+    axs[0].set_ylabel('Вибрация (мм/с)', fontsize=12)
+    axs[0].legend(fontsize=10)
     axs[0].grid(True, alpha=0.4)
 
-    # Панель 1 — Температура
+    # Панель 1 - Температура
     axs[1].plot(sample['timestamp'], sample['temperature'], color='tomato', lw=0.8)
     axs[1].axhline(TEMP_WARNING,  color='orange',  ls='--', lw=1.2,
                     label=f'Warning ({TEMP_WARNING} °C)')
@@ -106,27 +120,30 @@ def plot_smart_episode(df: pd.DataFrame, hours: int = 60):
     if not anom_temp.empty:
         axs[1].scatter(anom_temp['timestamp'], anom_temp['temperature'],
                         color='purple', zorder=5, s=30, label='Помеха датчика')
-    axs[1].set_ylabel('Температура (°C)')
-    axs[1].legend(fontsize=8)
+    axs[1].tick_params(axis='y', labelsize=10)
+    axs[1].set_ylabel('Температура (°C)', fontsize=12)
+    axs[1].legend(fontsize=10)
     axs[1].grid(True, alpha=0.4)
 
-    # Панель 2 — Ток
+    # Панель 2 - Ток
     axs[2].plot(sample['timestamp'], sample['current'], color='darkorange', lw=0.8)
     if not anom_curr.empty:
         axs[2].scatter(anom_curr['timestamp'], anom_curr['current'],
                         color='purple', zorder=5, s=30, label='Помеха датчика')
-    axs[2].set_ylabel('Ток (А)')
-    axs[2].legend(fontsize=8)
+    axs[2].tick_params(axis='y', labelsize=10)
+    axs[2].set_ylabel('Ток (А)', fontsize=12)
+    axs[2].legend(fontsize=10)
     axs[2].grid(True, alpha=0.4)
 
-    # Панель 3 — Давление (ключевой сигнал для Типа Б)
+    # Панель 3 - Давление (ключевой сигнал для Типа Б)
     axs[3].plot(sample['timestamp'], sample['pressure'], color='seagreen', lw=0.8)
     axs[3].axhline(1.5, color='grey', ls=':', lw=1.0, label='Норма (1.5 МПа)')
-    axs[3].set_ylabel('Давление (МПа)')
-    axs[3].legend(fontsize=8)
+    axs[3].tick_params(axis='y', labelsize=10)
+    axs[3].set_ylabel('Давление (МПа)', fontsize=12)
+    axs[3].legend(fontsize=10)
     axs[3].grid(True, alpha=0.4)
 
-    # Панель 4 — Состояние конечного автомата
+    # Панель 4 - Состояние конечного автомата
     color_map = {0: 'grey', 1: 'blue', 2: 'green', 3: 'orange', 4: 'red'}
     for _, row in sample.iterrows():
         axs[4].axvline(row['timestamp'],
@@ -135,11 +152,13 @@ def plot_smart_episode(df: pd.DataFrame, hours: int = 60):
     axs[4].plot(sample['timestamp'], sample['state'],
                 color='black', drawstyle='steps-post', lw=1.5)
     axs[4].set_yticks([0, 1, 2, 3, 4])
-    axs[4].set_yticklabels(['Off', 'Startup', 'Healthy', 'Degradation', 'Critical'])
-    axs[4].set_ylabel('Состояние')
+    axs[4].set_yticklabels(['Off', 'Startup', 'Healthy', 'Degradation', 'Critical'],
+                           fontsize=10)
+    axs[4].set_ylabel('Состояние', fontsize=12)
     axs[4].grid(True, alpha=0.4)
 
     axs[0].set_xlim(sample['timestamp'].iloc[0], sample['timestamp'].iloc[-1])
+    axs[0].tick_params(axis='x', labelsize=10)
 
     plt.tight_layout()
 

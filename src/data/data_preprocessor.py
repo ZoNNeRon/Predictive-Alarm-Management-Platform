@@ -1,6 +1,8 @@
 """
 Модуль инженерной подготовки данных (Data Preprocessor)
 =======================================================
+src/data/data_preprocessor.py
+
 Трансформация сырой телеметрии насосного парка в обогащенную 
 матрицу признаков (Feature Matrix) для алгоритмов машинного обучения. 
 Разработан с учетом стандартов MLOps.
@@ -24,13 +26,11 @@
 
 Производный датасет (классификатор ТИПА отказа):
     build_fault_dataset() формирует выборку для второй модели из аварийных строк.
-    Таргет fault_target — индекс в FAULT_TYPES (0=overheat, 1=cavitation, 2=electrical).
+    Таргет fault_target - индекс в FAULT_TYPES (0=overheat, 1=cavitation, 2=electrical).
 """
-
 
 import sys
 import pandas as pd
-import numpy as np
 import os
 from typing import Optional
 
@@ -58,7 +58,7 @@ class DataPreprocessor:
         self.window_sizes = window_sizes or WINDOW_SIZES
         self.sensors = ['vibration', 'temperature', 'current', 'pressure']
 
-        # Явный список признаков для ML — сырые значения датчиков исключены намеренно.
+        # Явный список признаков для ML - сырые значения датчиков исключены намеренно.
         # Сырые колонки остаются в датасете для диагностики и визуализации,
         # но не попадают в обучение, чтобы одиночный выброс-помеха не влиял на модель.
         self.FEATURE_COLS = self._build_feature_cols()
@@ -84,18 +84,18 @@ class DataPreprocessor:
                           False → без dropna, без фильтрации Off/Startup (инференс)
 
         Returns:
-            Обработанный DataFrame. Список признаков для ML — self.FEATURE_COLS.
+            Обработанный DataFrame. Список признаков для ML - self.FEATURE_COLS.
         """
 
         # 1. Гарантируется хронологический порядок внутри каждого насоса
         df = df.sort_values(by=['pump_id', 'timestamp']).copy()
 
-        # 2. Rolling features — до фильтрации состояний, чтобы окно было непрерывным
+        # 2. Rolling features - до фильтрации состояний, чтобы окно было непрерывным
         df = self._calculate_rolling_features(df)
 
         # 3. Удаляются флаги аппаратных помех: модель не должна их знать,
         # она должна игнорировать помехи через сглаживание скользящим окном.
-        # fault_type намеренно сохраняется — нужен fault_recall_analysis.py для валидации;
+        # fault_type намеренно сохраняется - нужен fault_recall_analysis.py для валидации;
         # и build_fault_dataset() для классификатора типа; в ML тяжести не попадёт,
         # так как отсутствует в FEATURE_COLS
         df = df.drop(columns=[c for c in ['sensor_anomaly',
@@ -103,11 +103,11 @@ class DataPreprocessor:
                                            'anomaly_current']
                                if c in df.columns])
 
-        # 4. Маппинг таргета и фильтрация Off/Startup — только при обучении
+        # 4. Маппинг таргета и фильтрация Off/Startup - только при обучении
         if is_training and 'state' in df.columns:
             df = self._prepare_labels(df)
 
-        # 5. При обучении честно удаляем строки, где окно не накопило window_max точек
+        # 5. При обучении честно удаляются строки, где окно не накопило window_max точек
         if is_training:
             df = df.dropna(subset=self.FEATURE_COLS).reset_index(drop=True)
 
@@ -122,11 +122,11 @@ class DataPreprocessor:
         Принципы:
           - Только предупреждающие и аварийные строки (target == 2 & == 1). Тип отказа 
             определяется на предупреждении и аварии, и агент вызывает классификатор 
-            лишь при predicted_class == 2 или == 1 — это согласует распределение обучения 
+            лишь при predicted_class == 2 или == 1 - это согласует распределение обучения 
             с распределением инференса.
           - Признаки те же (self.FEATURE_COLS): никакого пересчёта rolling-фич,
             гарантия отсутствия дрейфа признаков между моделью тяжести и моделью типа.
-          - Таргет fault_target — индекс в FAULT_TYPES (0=overheat, 1=cavitation,
+          - Таргет fault_target - индекс в FAULT_TYPES (0=overheat, 1=cavitation,
             2=electrical), без магических чисел.
 
         Args:
@@ -150,7 +150,7 @@ class DataPreprocessor:
         fault_to_idx = {ft: i for i, ft in enumerate(FAULT_TYPES)}
         problem['fault_target'] = problem['fault_type'].map(fault_to_idx).astype(int)
 
-        # Стадия тяжести (1=Warning, 2=Critical) — НЕ признак, а колонка для
+        # Стадия тяжести (1=Warning, 2=Critical) - НЕ признак, а колонка для
         # стратификации отчёта; в X не попадёт, т.к. её нет в FEATURE_COLS.
         problem = problem.rename(columns={'target': 'severity_stage'})
 
@@ -171,28 +171,34 @@ class DataPreprocessor:
             res = pd.DataFrame(index=group.index)
 
             for col in self.sensors:
-                # shift(1): в строке T — значение T-1. Текущий момент исключён
+                # shift(1): в строке T - значение T-1. Текущий момент исключён
                 shifted = group[col].shift(1)
 
                 for w in self.window_sizes:
-                    # min_periods=w: пока окно не заполнено — NaN
+                    # min_periods=w: пока окно не заполнено - NaN
                     # dropna() уберёт эти строки при обучении
                     res[f'{col}_mean_{w}'] = shifted.rolling(window=w, min_periods=w).mean()
                     res[f'{col}_max_{w}'] = shifted.rolling(window=w, min_periods=w).max()
-                    # std требует минимум 2 точки; меньше — NaN
+                    # std требует минимум 2 точки; меньше - NaN
                     res[f'{col}_std_{w}'] = shifted.rolling(window=w, min_periods=2).std()
 
                 # Градиент за 30 минут: (T-1) − (T-31) = ровно 30 шагов
-                # Показывает скорость и направление тренда — ключевой признак для XGBoost
+                # Показывает скорость и направление тренда - ключевой признак для XGBoost
                 # при пограничных значениях (например, вибрация 3.0 мм/с, но быстро растёт)
                 res[f'{col}_diff_30'] = group[col].shift(1) - group[col].shift(31)
 
             return res
 
-        # groupby изолирует насосы: окно не перетекает с конца MNHV_001 на начало MNHV_002
-        rolling_features = (df.groupby('pump_id', group_keys=False)
-                            .apply(apply_rolling, include_groups=False)) # type: ignore
+        # groupby изолирует насосы: окно не перетекает с конца MNHV_001 на начало
+        # MNHV_002. apply_rolling вызывается напрямую по группам (не через
+        # GroupBy.apply) - это исключает устаревший include_groups (удалён в pandas 3.0)
+        # и капризы типизации GroupBy.apply в pandas-stubs. apply_rolling читает только
+        # self.sensors, лишние колонки группы игнорируются; reindex(df.index) выравнивает
+        # признаки к исходному порядку строк для concat по оси столбцов.
+        parts = [apply_rolling(group) for _, group in df.groupby('pump_id')]
+        rolling_features = pd.concat(parts).reindex(df.index)
         return pd.concat([df, rolling_features], axis=1)
+
 
     def _prepare_labels(self, df: pd.DataFrame) -> pd.DataFrame:
         """
@@ -206,7 +212,7 @@ class DataPreprocessor:
                   4 (Critical)    → 2 (Авария)
         """
 
-        df = df[df['state'].isin([2, 3, 4])].copy() # type: ignore
+        df = df.query("state in [2, 3, 4]").copy()
         df['target'] = df['state'].map({2: 0, 3: 1, 4: 2})
         return df
 
@@ -231,6 +237,7 @@ if __name__ == "__main__":
 
     df_raw = pd.read_csv(raw_data_path, parse_dates=['timestamp'])
 
+    # Сбор первого и основного предобработанного датасета
     print("\nИнициализация DataPreprocessor...")
     preprocessor = DataPreprocessor(window_sizes=[15, 30, 60])
 
