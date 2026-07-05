@@ -7,35 +7,35 @@ src/rag/rag_database.py
 нормативный контекст. Стек: LangChain + ChromaDB + multilingual-e5-large
 (HuggingFace). 
 
-Пайплайн построения (``KnowledgeBaseManager.build_database``):
+Пайплайн построения (KnowledgeBaseManager.build_database):
 документы (.md/.txt и опционально PDF) → чанки с параметрами под тип документа
 → эмбеддинги e5 → батчевая запись в ChromaDB.
 
 Ключевые решения:
 
-- **Allowlist по ``DOC_TYPE_MAP``** - загружаются только явно перечисленные
+- Allowlist по DOC_TYPE_MAP - загружаются только явно перечисленные
   файлы. Большие исходные PDF (ГОСТ, мануал) заменены вручную подготовленными
-  ``*_extract.md``; PDF-загрузчик оставлен как расширение, но в текущей сборке
+  *_extract.md; PDF-загрузчик оставлен как расширение, но в текущей сборке
   не задействован.
-- **Префиксы e5** - ``passage:`` при индексации чанка, ``query:`` при поиске;
+- Префиксы e5 - passage: при индексации чанка, query: при поиске;
   обязательны для корректной работы multilingual-e5-large.
-- **Структурный чанкинг регламента SOP** (``_chunk_sop_document``) - сценарии
-  режутся на подразделы ``operator`` / ``repair`` / ``reference`` с метаданными
-  ``fault_type`` (overheat/cavitation/electrical) и ``stage``
+- Структурный чанкинг регламента SOP (_chunk_sop_document) - сценарии
+  режутся на подразделы operator / repair / reference с метаданными
+  fault_type (overheat/cavitation/electrical) и stage
   (warning/critical). Это позволяет детерминированно фильтровать выдачу по типу
   отказа и стадии, а не только по семантической близости.
 
 Публичный API поиска (используется агентом и бенчмарком):
 
-- ``resolve_stage(symptom_vector)`` - единый резолвер стадии
+- resolve_stage(symptom_vector) - единый резолвер стадии
   (warning/critical/unknown) по предсказанию классификатора.
-- ``search(...)`` - базовый семантический поиск с фильтрами по метаданным и
-  отключаемой отсечкой по ``RELEVANCE_THRESHOLD``.
-- ``search_by_symptoms(...)`` - справочный контекст для ДИАГНОЗА (multi-query).
-- ``search_operator_actions(fault, stage)`` - предписание для ОПЕРАТОРА
+- search(...) - базовый семантический поиск с фильтрами по метаданным и
+  отключаемой отсечкой по RELEVANCE_THRESHOLD.
+- search_by_symptoms(...) - справочный контекст для ДИАГНОЗА (multi-query).
+- search_operator_actions(fault, stage) - предписание для ОПЕРАТОРА
   (строго по типу и стадии, с лестницей фолбэков).
-- ``search_repair_works(fault)`` - работы ТОиР по типу отказа.
-- ``search_maintenance_schedule(pump_id)`` - плановый график ТО по агрегату.
+- search_repair_works(fault) - работы ТОиР по типу отказа.
+- search_maintenance_schedule(pump_id) - плановый график ТО по агрегату.
 """
 
 import sys

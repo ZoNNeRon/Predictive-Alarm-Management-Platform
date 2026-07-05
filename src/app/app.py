@@ -414,7 +414,7 @@ def _on_escalation(pump_id, stage):
     except Exception:
         pass
     # ОДНА запись истории на это возникновение (incident_id, stage). Guard выше
-    # (`stage in inc.symptom_vectors`) гарантирует ровно один заход → дублей нет.
+    # (stage in inc.symptom_vectors) гарантирует ровно один заход → дублей нет.
     _log_event(inc, stage)
     _launch_generation(ss.backend, sv, pump_id, stage)
     ss.pinned[pump_id] = inc # ссылка удерживается - переживёт закрытие в FSM
