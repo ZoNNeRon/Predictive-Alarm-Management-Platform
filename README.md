@@ -35,7 +35,7 @@
 ```mermaid
 flowchart LR
     A[Телеметрия<br/>вибрация / темп / ток / давление] --> B[Препроцессор<br/>rolling-признаки 15/30/60 мин]
-    B --> C[Модель ТЯЖЕСТИ<br/>XGBoost (0/1/2)]
+    B --> C[Модель ТЯЖЕСТИ<br/>XGBoost 0/1/2]
     C --> D{AlarmManager<br/>Alarm Shelving}
     D -->|штатный режим| E[Классификатор ТИПА<br/>overheat / cavitation / electrical]
     D -->|пуск/простой| X[подавлено → архив ФЗ-116]
