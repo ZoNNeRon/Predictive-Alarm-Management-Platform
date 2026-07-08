@@ -4,3 +4,4 @@ from .ml_visualisation import *
 from .xai_visualisation import *
 from .ai_visualisation import *
 from .realtime_val_visualisation import *
+from .cmapss_visualisation import *

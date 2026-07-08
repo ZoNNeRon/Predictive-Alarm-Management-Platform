@@ -89,7 +89,7 @@ class XAIExplainer:
     Промпты, RAG, форматирование для UI - в агентном модуле.
     """
 
-    def __init__(self, model_path: str, fault_model_path: str):
+    def __init__(self, model_path: str, fault_model_path: Optional[str]):
         """
         Args:
             model_path:       путь к модели ТЯЖЕСТИ (severity_xgboost_model.joblib).

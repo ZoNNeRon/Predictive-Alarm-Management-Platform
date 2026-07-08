@@ -37,13 +37,16 @@ predictive_alarm_platform/
 │   ├── __init__.py
 │   ├── data/
 │   │   ├── data_generator.py        # ГОТОВО — AR(1) + State Machine + 3 типа отказа (A/Б/В)
-│   │   └── data_preprocessor.py     # ГОТОВО — rolling features, build_fault_dataset()
+│   │   ├── data_preprocessor.py     # ГОТОВО — rolling features, build_fault_dataset()
+│   │   └── cmapss_dataset.py        # ГОТОВО — загрузка NASA C-MAPSS из сети, RUL-метки, CmapssPreprocessor
 │   ├── ml/
 │   │   ├── severity_classifier_pipeline.py # ГОТОВО — модель ТЯЖЕСТИ: LR/RF/XGBoost, AlarmManager (бывш. ml_pipeline.py)
 │   │   ├── fault_classifier_pipeline.py    # ГОТОВО — модель ТИПА отказа: overheat/cavitation/electrical
-│   │   └── fault_recall_analysis.py        # ГОТОВО — recall по типам отказа, доказательство 3 сигнатур
+│   │   ├── fault_recall_analysis.py        # ГОТОВО — recall по типам отказа, доказательство 3 сигнатур
+│   │   └── cmapss_ml_pipeline.py           # ГОТОВО — валидация ядра на C-MAPSS: 4 сабсета × 2 сплита × 3 модели
 │   ├── xai/
-│   │   └── xai_module.py            # ГОТОВО — SHAP TreeExplainer, SymptomVector, SHAP-эвристика
+│   │   ├── xai_module.py            # ГОТОВО — SHAP TreeExplainer, SymptomVector, SHAP-эвристика
+│   │   └── cmapss_xai_module.py     # ГОТОВО — XAI-прогон C-MAPSS (XAIExplainer без fault-модели)
 │   ├── rag/
 │   │   └── rag_database.py          # ГОТОВО — ChromaDB + multilingual-e5-large, структурный чанкинг SOP
 │   ├── agent/
@@ -61,7 +64,8 @@ predictive_alarm_platform/
 │       ├── rag_visualisation.py         # Графики RAG (состав базы, чанки, качество поиска)
 │       ├── xai_visualisation.py         # Графики XAI (waterfall, beeswarm — severity + fault)
 │       ├── ai_visualisation.py          # Графики бенчмарка LLM-агента
-│       └── realtime_val_visualisation.py # ГОТОВО — ValidationCollector + графики real-time валидации (лавина тревог)
+│       ├── realtime_val_visualisation.py # ГОТОВО — ValidationCollector + графики real-time валидации (лавина тревог)
+│       └── cmapss_visualisation.py      # ГОТОВО — сводный слой C-MAPSS (mean±std, PR-кривые, наложенный beeswarm)
 │
 ├── experiments/                     # (бывш. scripts/) — исследования и регрессионные тесты
 │   ├── data_stream/
@@ -86,14 +90,16 @@ predictive_alarm_platform/
 │   │   └── diagnostic_agent.md  # Системный промпт LLM-агента (anti-hallucination)
 │   └── settings/
 │       ├── __init__.py
-│       └── settings.py          # Централизованная конфигурация (пороги, seeds, RAG, LLM)
+│       ├── settings.py          # Централизованная конфигурация (пороги, seeds, RAG, LLM)
+│       └── settings_cmapss.py   # Константы ветки C-MAPSS (URL, сенсоры, RUL-границы, окна)
 │
 ├── data/
 │   ├── raw/
 │   │   └── industrial_pumps_dataset.csv        # 648 000 строк, 5 насосов, 90 дней, шаг 1 мин
-│   └── processed/
-│       ├── preprocessed_pumps_dataset.csv      # 40 rolling-признаков, target 0/1/2, fault_type
-│       └── fault_type_pumps_dataset.csv        # выборка для классификатора типа (target=1&2)
+│   ├── processed/
+│   │   ├── preprocessed_pumps_dataset.csv      # 40 rolling-признаков, target 0/1/2, fault_type
+│   │   └── fault_type_pumps_dataset.csv        # выборка для классификатора типа (target=1&2)
+│   └── cmapss_dataset/                         # NASA C-MAPSS (12 txt) — НЕ в git, автозагрузка из сети
 │
 ├── artifacts/                                   # (бывш. data/graphs + data/tables + chroma_db) — всё, что генерится прогоном
 │   ├── chroma_db/                               # Локальная векторная БД ChromaDB
@@ -129,23 +135,35 @@ predictive_alarm_platform/
 │   │   ├── validation_alarm_rate.png            # Темп тревог во времени (норматив ISA 18.2)
 │   │   ├── validation_detection_latency.png     # Латентность обнаружения отказа
 │   │   ├── validation_confusion.png             # Матрица ошибок детектирования (истина генератора)
-│   │   └── validation_timeline.png              # Таймлайн состояний парка
+│   │   ├── validation_timeline.png              # Таймлайн состояний парка
+│   │   ├── cmapss_summary_plot1_generalisation.png # C-MAPSS: сравнение моделей mean±std (holdout/official)
+│   │   ├── cmapss_summary_plot2_pr_curves.png   # C-MAPSS: усреднённые PR-кривые класса «Авария»
+│   │   ├── cmapss_summary_plot3_lead_time.png   # C-MAPSS: упреждение обнаружения (боксплоты по сабсетам)
+│   │   ├── cmapss_summary_plot4_shap_importance.png # C-MAPSS: SHAP-важность mean±std по сабсетам
+│   │   ├── cmapss_summary_plot5_shap_beeswarm.png   # C-MAPSS: наложенный beeswarm всех сабсетов
+│   │   └── cmapss_summary_plot6_confusion.png       # C-MAPSS: матрицы ошибок сплит×модель (сумма по сабсетам)
 │   └── tables/                                  # CSV-таблицы результатов
 │       ├── ML_fault_recall_table.csv
 │       ├── ML_fault_classifier_summary.csv
 │       ├── agent_benchmark_multi.csv            # Все прогоны бенчмарка (сырые данные)
 │       ├── agent_summary_table.csv              # Сводка по моделям (index=model)
-│       └── agent_summary_by_stage.csv           # Сводка model × stage
+│       ├── agent_summary_by_stage.csv           # Сводка model × stage
+│       ├── cmapss_ml_summary.csv                # C-MAPSS: сводка сабсет × сплит × модель (merge-update)
+│       ├── cmapss_pr_curves.csv                 # C-MAPSS: точки PR-кривых на единой сетке recall
+│       ├── cmapss_confusion.csv                 # C-MAPSS: счётчики матриц ошибок (merge-update)
+│       └── cmapss_{fd001..fd004}_lead_time.csv  # C-MAPSS: упреждение по двигателям holdout-теста
 │
 ├── models/
 │   ├── severity/                                # Модель ТЯЖЕСТИ
 │   │   ├── severity_lr_model.joblib             # LR
 │   │   ├── severity_rf_model.joblib             # RF
 │   │   └── severity_xgboost_model.joblib        # XGBoost (основная)
-│   └── fault_type/                              # Классификатор ТИПА отказа
-│       ├── fault_lr_model.joblib                # LR
-│       ├── fault_rf_model.joblib                # RF
-│       └── fault_xgboost_model.joblib           # XGBoost
+│   ├── fault_type/                              # Классификатор ТИПА отказа
+│   │   ├── fault_lr_model.joblib                # LR
+│   │   ├── fault_rf_model.joblib                # RF
+│   │   └── fault_xgboost_model.joblib           # XGBoost
+│   └── cmapss/                                  # C-MAPSS: 4 сабсета × {lr,rf,xgboost} (official-сплит)
+│       └── cmapss_{fd00X}_{lr,rf,xgboost}_model.joblib
 │
 ├── knowledge_base/
 │   ├── gosts/
@@ -177,6 +195,8 @@ predictive_alarm_platform/
 > `models/fault_type/fault_xgboost_model.joblib`; ChromaDB — из `artifacts/chroma_db`;
 > графики/таблицы пишутся в `artifacts/graphs` и `artifacts/tables`. Эти же пути
 > использует боевой `PlatformBackend` (`src/runtime/platform_backend.py`).
+> Ветка C-MAPSS: модели — `models/cmapss/`, данные — `data/cmapss_dataset/`
+> (автозагрузка из сети, в git не публикуются).
 
 ---
 
@@ -424,6 +444,72 @@ predictive_alarm_platform/
 - **Headless:** `app.py` не импортируется (там `st.set_page_config` на верхнем уровне) — контракт закодирован явными списками
 - Запуск: `pytest experiments/validation/protobackend_smoke_test.py -v` или `python experiments/validation/protobackend_smoke_test.py`
 
+### 24. Ветка C-MAPSS — валидация ядра на реальных данных NASA
+
+**Цель:** доказать переносимость пайплайна `preprocessing → ML → XAI` на реальный
+run-to-failure датасет другого класса оборудования (турбовентиляторные двигатели,
+NASA PCoE, 4 подмножества FD001–FD004). Ядро переиспользуется, а не переписывается:
+новые модули строго ОТДЕЛЕНЫ от насосных (свои файлы, свой конфиг), существующий
+код не тронут.
+
+**`src/data/cmapss_dataset.py`** — данные:
+- `download_cmapss()` — идемпотентная загрузка с официального зеркала NASA (S3) +
+  рекурсивная распаковка вложенных zip; датасет НЕ в git (`.gitignore`:
+  `data/cmapss_dataset/`), оркестратор скачивает его сам при первом запуске
+- `compute_rul()` — RUL: train `max(cycle) - cycle`; test — финальный RUL из
+  `RUL_FD00X.txt` + смещение; `add_severity_target()` — piecewise-метки тяжести:
+  RUL > 50 → 0, 20–50 → 1, ≤ 20 → 2 (границы `RUL_WARNING`/`RUL_CRITICAL`)
+- Режимная нормализация FD002/FD004 (6 полётных режимов): id режима по ближайшему
+  якорю op1 (`CMAPSS_REGIME_OP1_ANCHORS`), per-режимный z-score, статистики
+  ТОЛЬКО по train
+- **`CmapssPreprocessor(DataPreprocessor)`** — наследник насосного препроцессора:
+  переопределены только список признаков (14 информативных сенсоров, окна
+  [5, 10, 20] циклов, diff-лаг 10) — механика `shift(1)` / `groupby('pump_id')` /
+  `min_periods=w` не тронута; 140 признаков, `ENGINE_ID_FMT` = `FD001_E001`
+
+**`src/ml/cmapss_ml_pipeline.py`** — ML (запуск: `python -m src.ml.cmapss_ml_pipeline`, по умолчанию `all`):
+- Переиспользует `evaluate_model()` из `severity_classifier_pipeline` и тройку
+  моделей с теми же гиперпараметрами; отличие (задокументированное): LR в
+  `make_pipeline(StandardScaler(), ...)` — сенсоры C-MAPSS различаются на 3 порядка
+- **Два режима оценки:** `official` (train/test бенчмарка NASA; test обрезан до
+  отказа — классы 1/2 редки, реалистичный продакшн-профиль) и `holdout`
+  (группированный сплит по двигателям внутри train — контроль, что official-метрики
+  не артефакт дисбаланса)
+- `compute_lead_times()` — RUL при первом срабатывании стадии по каждому двигателю
+  holdout-теста (все дожиты до отказа)
+- Таблицы обновляются **слиянием** (`merge_update_csv` по ключу subset×split×model),
+  а не перезаписью; PR-кривые интерполируются на единую сетку recall
+  (`PR_RECALL_GRID`, 201 точка) и копятся в `cmapss_pr_curves.csv`
+- **Результаты (XGBoost, mean±std по 4 сабсетам):** holdout PR-AUC(Авария)
+  **0.95±0.02**, F1-Macro 0.84±0.02; official PR-AUC 0.77±0.12 (FD004 честно
+  труднейший — 0.63); LogReg не уступает ансамблям. Медианное упреждение:
+  Предупреждение за ~48–50, Авария за ~16–20 циклов до отказа; из 142 двигателей
+  не пропущен ни один
+
+**`src/xai/cmapss_xai_module.py`** — XAI (запуск: `python -m src.xai.cmapss_xai_module`, по умолчанию `all`):
+- `XAIExplainer` переиспользуется БЕЗ изменений (`fault_model_path=None` — C-MAPSS
+  не даёт метку типа); консольный `SymptomVector` по предотказной строке с
+  физической расшифровкой сенсоров (`CMAPSS_SENSOR_DESC`)
+- SHAP по предотказным строкам считается ОДИН раз на сабсет (`MAX_SHAP_ROWS=1200`);
+  из него — и важность признаков, и блок точек наложенного beeswarm
+- Топ-признаки физически осмысленны: Ps30, T50, phi, NRc — классические индикаторы
+  деградации HPC
+
+**`src/visualisation/cmapss_visualisation.py`** — визуализация:
+- Философия «сводной подтверждённой картины»: по умолчанию строится ТОЛЬКО сводный
+  слой из 6 фигур (`cmapss_summary_plot1–6`); пер-сабсетная детализация — по флагам
+  `--detail-plots` / `--detail` (автоматически при прогоне одного сабсета)
+- Сводные матрицы ошибок (`plot_summary_confusion`, plot6): сетка сплит × модель,
+  агрегация СУММОЙ абсолютных счётчиков по сабсетам (не «средняя матрица») —
+  нормировка по строке после суммирования даёт recall на объединении всех тестов
+- `display_feature_name()`: `s11_mean_5` → `Ps30 | mean_5` — подписи SHAP-графиков
+  в физических кодах сенсоров
+- **Наложенный beeswarm** (`plot_summary_shap_beeswarm`): SHAP-матрицы всех сабсетов
+  конкатенируются; значения признаков переведены в ПЕРЦЕНТИЛЬНЫЕ РАНГИ внутри своего
+  сабсета — сырые (FD001/FD003) и z-нормированные (FD002/FD004) шкалы не смешиваются,
+  цветовая семантика «high/low» остаётся честной
+- `__main__` пересобирает сводные фигуры 1–3 из сохранённых CSV без переобучения
+
 ---
 
 ## Централизованная конфигурация (`config/`)
@@ -463,6 +549,22 @@ predictive_alarm_platform/
 > локальные имена `REFRESH`/`RENAG_MIN`/… сохранены). `RealtimeConfig`
 > (тайминги/вероятности симуляции) остаётся отдельным конфиг-датаклассом.
 
+### `config/settings/settings_cmapss.py`
+Источник истины констант ветки C-MAPSS. Отделён от `settings.py` намеренно —
+константы насосного пайплайна и валидации на реальных данных не смешиваются:
+
+| Константа | Содержание |
+|---|---|
+| `CMAPSS_URLS`, `CMAPSS_DATA_SUBDIR` | Зеркало NASA (S3) и папка данных (не в git) |
+| `CMAPSS_SUBSETS`, `CMAPSS_SUBSET_INFO` | 4 подмножества: число режимов/типов отказа, подписи |
+| `CMAPSS_RAW_COLUMNS`, `ENGINE_ID_FMT` | Схема сырых txt (26 колонок) и id двигателя |
+| `CMAPSS_SENSORS` | 14 информативных сенсоров (константные исключены) |
+| `CMAPSS_SENSOR_SHORT`, `CMAPSS_SENSOR_DESC` | Физические коды (Ps30, phi...) и расшифровки для SHAP/консоли |
+| `RUL_WARNING=50`, `RUL_CRITICAL=20` | Piecewise-границы меток тяжести из RUL |
+| `CMAPSS_WINDOW_SIZES=[5,10,20]`, `CMAPSS_DIFF_LAG=10` | Окна признаков в ЦИКЛАХ (не минутах) |
+| `CMAPSS_MULTI_REGIME_SUBSETS`, `CMAPSS_REGIME_OP1_ANCHORS` | Режимная нормализация FD002/FD004 |
+| `CMAPSS_MODELS_SUBDIR`, `CMAPSS_GRAPHS_PREFIX`, `CMAPSS_TABLES_PREFIX` | Пути/префиксы выходов |
+
 ### `config/prompts/diagnostic_agent.md`
 Системный промпт `DiagnosticAgent`. Загружается при импорте `src/agent/ai_agent.py`. Редактируется без изменения Python-кода.
 - 8 строгих правил: только из КОНТЕКСТА, источник по имени, разделение 4 каналов (справочный/оператор/ТОиР/график), стадийный тон (Авария vs Предупреждение), краткость
@@ -483,6 +585,7 @@ predictive_alarm_platform/
 | `xai_visualisation.py` | `plot_severity_waterfall()`, `plot_severity_summary_by_fault_type()` — severity; `plot_fault_waterfall()`, `plot_fault_summary_by_type()` — fault classifier | `xai_module.py`, `platform_backend.py` |
 | `ai_visualisation.py` | `plot_performance(df, save_dir)`, `plot_quality_auto(df, save_dir)`, `plot_summary_heatmap(summary_df, directions, fmt, save_dir)`, `plot_expert_radar(expert_scores, save_dir)`, `plot_stage_breakdown(df, save_dir)` | `experiments/llm_benchmark/ai_agent_benchmark.py`, автономно |
 | `realtime_val_visualisation.py` | `ValidationCollector`, `summarize(log)`, `render_all(log, outdir)` → `plot_avalanche`, `plot_alarm_rate`, `plot_detection_latency`, `plot_confusion`, `plot_state_timeline_all` | `app.py` (real-time режим), автономно (самотест) |
+| `cmapss_visualisation.py` | Сводный слой: `plot_summary_generalisation`, `plot_summary_pr_curves`, `plot_summary_lead_time`, `plot_summary_shap_importance`, `plot_summary_shap_beeswarm`; пер-сабсетные (detail): confusion, PR, lead time, beeswarm, waterfall; `display_feature_name()` | `cmapss_ml_pipeline.py`, `cmapss_xai_module.py`, автономно (пересборка из CSV) |
 
 ---
 
@@ -497,10 +600,19 @@ runtime-слой, двухуровневый Streamlit UI с двумя исто
 `__init__.py`, регрессионные тесты (`online_parity_test.py`,
 `protobackend_smoke_test.py`) проходят.
 
+**Дополнительный ключевой результат — валидация на реальных данных:** пайплайн
+`preprocessing → ML → XAI` без изменения механики прогнан на run-to-failure датасете
+NASA C-MAPSS (все 4 подмножества, два режима оценки, 3 модели) — см. раздел 24.
+Holdout PR-AUC(Авария) 0.95±0.02, ни один из 142 тестовых двигателей не пропущен,
+SHAP опирается на физику компрессора. Итоговый вывод — 6 сводных фигур
+`cmapss_summary_plot1–6` в парадигме «усреднённая картина с отклонениями».
+
 Возможные направления развития за рамками дипломной работы:
 
 1. Подключение реального источника ТОиР-истории вместо демо-данных в инженерной вкладке.
-2. Валидация на реальных промышленных данных (текущая — на физически достоверном синтетическом датасете и живом генераторе).
+2. Валидация на промышленных данных конкретного предприятия — насосный парк
+   (переносимость методологии на реальные данные уже доказана на C-MAPSS;
+   открытых промышленных датасетов насосов с разметкой отказов нет).
 
 **Режим инференса в UI (по одной строке):**
 ```python
@@ -574,6 +686,15 @@ if trigger is not None:                             # подтверждённа
 | `RealtimePlayer` повторяет интерфейс `ScenarioPlayer` | Живой режим встаёт на место демо-плеера без переписывания UI (advance_stream/тосты/графики как есть) |
 | Мёртвая зона после пуска (`_deadzone`) + сброс окна на OFF/STARTUP | Пусковой ток/гидроудар не попадают в скоринг — переходник любой длины вырезан, а не первые 5 строк |
 | Путь к CSV резолвится от `_PROJECT_ROOT` | Сборка демо-сценария не зависит от рабочей директории, из которой запущен `streamlit run` |
+| Ветка C-MAPSS в ОТДЕЛЬНЫХ модулях (`cmapss_*`) + `settings_cmapss.py` | Насосный код не тронут; переработка = новый модуль, а не сотни строк в существующем |
+| `CmapssPreprocessor` наследует `DataPreprocessor` | Переиспользование механики `shift(1)`/`groupby`/`min_periods` буквально: доказательство переносимости, а не переписывание |
+| Piecewise-метки тяжести из RUL (50/20 циклов) | Стандартный подход литературы C-MAPSS; ровно та же трёхклассовая постановка, что у насосов |
+| Два режима оценки: official + holdout по двигателям | Official сравним с литературой, но test обрезан (классы 1/2 редки); holdout доказывает, что метрики не артефакт дисбаланса |
+| Per-режимный z-score для FD002/FD004 (статистики только по train) | 6 полётных режимов маскируют тренд деградации; нормализация внутри режима восстанавливает сигнал без утечки из test |
+| Датасет C-MAPSS не в git, загрузка из сети в оркестраторе | Репозиторий не тяжелеет; прогон воспроизводим с чистого клона без ручной подготовки |
+| Сводный слой по умолчанию, детализация по `--detail` | «Брать качеством, а не числом»: комиссии — 5 фигур mean±std, россыпь пер-сабсетных графиков — материал приложения |
+| Таблицы C-MAPSS обновляются слиянием (`merge_update_csv`) | Прогон одного сабсета заменяет только свои строки — частный перезапуск не затирает общую картину |
+| Наложенный beeswarm через перцентильные ранги внутри сабсета | Сырые (FD001/003) и z-нормированные (FD002/004) шкалы признаков нельзя смешивать в цветовой кодировке SHAP |
 
 ---
 
@@ -582,6 +703,7 @@ if trigger is not None:                             # подтверждённа
 1. Все 5 насосов имеют **идентичные номинальные параметры** — исследование разнотипного оборудования выходит за рамки работы
 2. ГОСТ 32601-2013 (307 стр.) и мануал МНХВ **не загружаются как PDF** — заменены вручную подготовленными `gost_extract.md` и `mnhv_extract.md`
 3. LLM работает **локально на M2** (Ollama) — зависимости от внешних API нет; сравниваются три модели: `qwen3.5:9b`, `phi4:14b`, `second_constantine/yandex-gpt-5-lite:8b`
+4. Валидация на реальных данных выполнена на **NASA C-MAPSS** (турбовентиляторные двигатели) — доказана переносимость методологии на другой класс оборудования; открытых промышленных датасетов насосов с размеченными run-to-failure отказами не существует, данные конкретного предприятия — за рамками работы
 
 ---
 

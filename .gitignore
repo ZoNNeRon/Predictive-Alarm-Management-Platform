@@ -6,3 +6,7 @@ venv/
 *.pt
 *.onnx
 data/processed/*.csv
+data/cmapss_dataset/
+
+# CMAPSS RF-модели: 34-116 МБ, GitHub отклоняет файлы >100 МБ (воспроизводятся прогоном)
+models/cmapss/*_rf_model.joblib
